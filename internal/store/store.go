@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -357,8 +358,10 @@ func (s *Store) DocsByIDs(collection string, ids []string) []*Doc {
 }
 
 // Matches evaluates a filter object against a document.
-// Supported: {"field": value} exact, {"field": {"$gt":v}}, {"$lt":v}.
-// Numbers compare numerically, strings lexicographically.
+// Supported: {"field": value} exact, {"field": {"$gt":v}}, {"$lt":v},
+// {"$gte":v}, {"$lte":v}, {"$ne":v}, {"$in":[...]}, {"$exists":bool},
+// {"$regex":"pattern"} (string fields). Multiple conditions on one
+// field AND together; multiple fields AND together.
 func Matches(d *Doc, filter map[string]interface{}) bool {
 	for field, cond := range filter {
 		v := d.Fields[field]
@@ -377,6 +380,52 @@ func Matches(d *Doc, filter map[string]interface{}) bool {
 				}
 			case "$lt":
 				if !cmp(v, operand, func(c int) bool { return c < 0 }) {
+					return false
+				}
+			case "$gte":
+				if !cmp(v, operand, func(c int) bool { return c >= 0 }) {
+					return false
+				}
+			case "$lte":
+				if !cmp(v, operand, func(c int) bool { return c <= 0 }) {
+					return false
+				}
+			case "$ne":
+				if jsonEq(v, operand) {
+					return false
+				}
+			case "$in":
+				list, ok := operand.([]interface{})
+				if !ok {
+					return false
+				}
+				found := false
+				for _, cand := range list {
+					if jsonEq(v, cand) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return false
+				}
+			case "$exists":
+				want, _ := operand.(bool)
+				_, have := d.Fields[field]
+				if want != have {
+					return false
+				}
+			case "$regex":
+				pat, ok := operand.(string)
+				if !ok {
+					return false
+				}
+				re, err := regexp.Compile(pat)
+				if err != nil {
+					return false
+				}
+				sv, ok := v.(string)
+				if !ok || !re.MatchString(sv) {
 					return false
 				}
 			default:

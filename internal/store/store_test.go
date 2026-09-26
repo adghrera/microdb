@@ -103,6 +103,45 @@ func TestCompactTombstoneGC(t *testing.T) {
 	}
 }
 
+func TestMatchesOperators(t *testing.T) {
+	d := &Doc{Fields: map[string]interface{}{
+		"age":   float64(30),
+		"name":  "alice",
+		"tags":  []interface{}{"a"},
+		"score": float64(9.5),
+	}}
+	cases := []struct {
+		filter map[string]interface{}
+		want   bool
+	}{
+		{map[string]interface{}{"age": map[string]interface{}{"$gte": float64(30)}}, true},
+		{map[string]interface{}{"age": map[string]interface{}{"$gte": float64(31)}}, false},
+		{map[string]interface{}{"age": map[string]interface{}{"$lte": float64(30)}}, true},
+		{map[string]interface{}{"age": map[string]interface{}{"$lte": float64(29)}}, false},
+		{map[string]interface{}{"name": map[string]interface{}{"$ne": "bob"}}, true},
+		{map[string]interface{}{"name": map[string]interface{}{"$ne": "alice"}}, false},
+		{map[string]interface{}{"name": map[string]interface{}{"$in": []interface{}{"x", "alice"}}}, true},
+		{map[string]interface{}{"name": map[string]interface{}{"$in": []interface{}{"x", "y"}}}, false},
+		{map[string]interface{}{"score": map[string]interface{}{"$in": []interface{}{float64(9.5)}}}, true},
+		{map[string]interface{}{"name": map[string]interface{}{"$exists": true}}, true},
+		{map[string]interface{}{"missing": map[string]interface{}{"$exists": false}}, true},
+		{map[string]interface{}{"missing": map[string]interface{}{"$exists": true}}, false},
+		{map[string]interface{}{"name": map[string]interface{}{"$regex": "^a[lc]"}}, true},
+		{map[string]interface{}{"name": map[string]interface{}{"$regex": "^b"}}, false},
+		{map[string]interface{}{"age": map[string]interface{}{"$regex": "x"}}, false}, // non-string
+		{map[string]interface{}{"name": map[string]interface{}{"$regex": "["}}, false}, // bad pattern
+		// compound: both conditions must hold
+		{map[string]interface{}{"age": map[string]interface{}{"$gte": float64(20), "$lte": float64(30)}}, true},
+		{map[string]interface{}{"age": map[string]interface{}{"$gte": float64(20), "$lte": float64(29)}}, false},
+		{map[string]interface{}{"unknown_op": map[string]interface{}{"$bogus": 1}}, false},
+	}
+	for i, c := range cases {
+		if got := Matches(d, c.filter); got != c.want {
+			t.Errorf("case %d: filter %v got %v want %v", i, c.filter, got, c.want)
+		}
+	}
+}
+
 func TestScanIndexedFastPathMatchesFullScan(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)
