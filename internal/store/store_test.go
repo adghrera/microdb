@@ -103,6 +103,39 @@ func TestCompactTombstoneGC(t *testing.T) {
 	}
 }
 
+func TestScanIndexedFastPathMatchesFullScan(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Apply("u", "a", map[string]interface{}{"city": "Lisbon"})
+	s.Apply("u", "b", map[string]interface{}{"city": "Berlin"})
+	s.Apply("u", "c", map[string]interface{}{"city": "Lisbon"})
+	s.Delete("u", "c") // tombstoned — must not appear via index
+
+	fast := s.ScanIndexed("u", map[string]interface{}{"city": "Lisbon"})
+	if len(fast) != 1 || fast[0].ID != "a" {
+		t.Fatalf("index fast path wrong: %v", fast)
+	}
+	// Comparison filter falls back to scan and still works.
+	fb := s.ScanIndexed("u", map[string]interface{}{"city": map[string]interface{}{"$gt": "A"}})
+	if len(fb) != 2 {
+		t.Fatalf("fallback scan wrong: %v", fb)
+	}
+	// Index survives replay: reopen and query again.
+	s.Close()
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	fast2 := s2.ScanIndexed("u", map[string]interface{}{"city": "Lisbon"})
+	if len(fast2) != 1 || fast2[0].ID != "a" {
+		t.Fatalf("index not rebuilt on replay: %v", fast2)
+	}
+}
+
 func TestFsyncModePersistsWrite(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)

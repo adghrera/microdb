@@ -274,9 +274,7 @@ func (s *Server) handleInternalScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	docs := s.st.Scan(col, func(d *store.Doc) bool {
-		return len(filter) == 0 || store.Matches(d, filter)
-	})
+	docs := s.st.ScanIndexed(col, filter)
 	writeJSON(w, 200, map[string]interface{}{"docs": docs})
 }
 

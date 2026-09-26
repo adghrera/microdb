@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"microdb/internal/index"
 	"microdb/internal/merkle"
 )
 
@@ -31,7 +32,11 @@ type Store struct {
 	docs   map[string]*Doc // key = collection + "\x00" + id
 	f      *os.File
 	fsync  bool // sync to disk on every write (durability over throughput)
+	idx    *index.IndexSet // inverted field indexes (fast exact-match lookups)
 }
+
+// Indexes exposes the index set (enabled by default; pass false to OpenOpts to disable).
+func (s *Store) Indexes() *index.IndexSet { return s.idx }
 
 // SetFsync enables fsync-on-write. With it enabled every Apply/Delete
 // blocks until the record is durable on disk; without it the OS page
@@ -53,7 +58,7 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{docs: map[string]*Doc{}}
+	s := &Store{docs: map[string]*Doc{}, idx: index.NewSet(true)}
 	path := filepath.Join(dir, "data.jsonl")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -76,7 +81,12 @@ func Open(dir string) (*Store, error) {
 		}
 		var d Doc
 		if json.Unmarshal([]byte(line), &d) == nil {
-			s.merge(&d)
+			if s.merge(&d) {
+				s.idx.For(d.Collection).Remove(d.ID)
+				if !d.Deleted {
+					s.idx.For(d.Collection).Add(d.ID, d.Fields)
+				}
+			}
 		}
 	}
 	if _, err := f.Seek(0, 2); err != nil {
@@ -113,6 +123,8 @@ func (s *Store) Apply(collection, id string, fields map[string]interface{}) (*Do
 	if !s.merge(d) {
 		return d, nil // concurrent newer write already applied
 	}
+	s.idx.For(collection).Remove(id)
+	s.idx.For(collection).Add(id, fields)
 	b, _ := json.Marshal(d)
 	if _, err := s.f.Write(append(b, '\n')); err != nil {
 		return nil, err
@@ -129,6 +141,10 @@ func (s *Store) ApplyRemote(d *Doc) bool {
 	defer s.mu.Unlock()
 	if !s.merge(d) {
 		return false
+	}
+	s.idx.For(d.Collection).Remove(d.ID)
+	if !d.Deleted {
+		s.idx.For(d.Collection).Add(d.ID, d.Fields)
 	}
 	b, _ := json.Marshal(d)
 	if _, err := s.f.Write(append(b, '\n')); err != nil {
@@ -159,6 +175,7 @@ func (s *Store) Delete(collection, id string) error {
 	if !s.merge(d) {
 		return nil
 	}
+	s.idx.For(collection).Remove(id)
 	b, _ := json.Marshal(d)
 	if _, err := s.f.Write(append(b, '\n')); err != nil {
 		return err
@@ -181,6 +198,35 @@ func (s *Store) Scan(collection string, keep func(*Doc) bool) []*Doc {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// ScanIndexed is Scan with an index fast path: if the filter is a single
+// exact-match condition on an indexed field, resolve candidate ids via
+// the inverted index instead of scanning the whole collection. Falls
+// back to a full scan for compound/comparison filters.
+func (s *Store) ScanIndexed(collection string, filter map[string]interface{}) []*Doc {
+	if len(filter) == 1 {
+		for field, cond := range filter {
+			if _, isCmp := cond.(map[string]interface{}); !isCmp {
+				// Capture the index set under the store lock: Compact
+				// swaps s.idx atomically and we must not read a torn ref.
+				s.mu.RLock()
+				idx := s.idx
+				out := make([]*Doc, 0, 8)
+				for _, id := range idx.For(collection).Lookup(field, cond) {
+					if d, ok := s.docs[key(collection, id)]; ok && !d.Deleted {
+						out = append(out, d)
+					}
+				}
+				s.mu.RUnlock()
+				sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+				return out
+			}
+		}
+	}
+	return s.Scan(collection, func(d *Doc) bool {
+		return len(filter) == 0 || Matches(d, filter)
+	})
 }
 
 func (s *Store) Close() error { return s.f.Close() }
@@ -206,6 +252,13 @@ func (s *Store) Compact(gcWindow time.Duration) (int, error) {
 			continue
 		}
 		live = append(live, d)
+	}
+	// Rebuild indexes from scratch: cheap and guarantees no stale entries.
+	s.idx = index.NewSet(s.idx.Enabled())
+	for _, d := range live {
+		if !d.Deleted {
+			s.idx.For(d.Collection).Add(d.ID, d.Fields)
+		}
 	}
 	sort.Slice(live, func(i, j int) bool {
 		if live[i].Collection != live[j].Collection {
