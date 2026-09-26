@@ -10,14 +10,22 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"fmt"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"microdb/internal/merkle"
 	"microdb/internal/store"
 )
+
+// MerkleMeta is a peer tree's root + depth.
+type MerkleMeta struct {
+	Root  string `json:"root"`
+	Depth int    `json:"depth"`
+}
 
 type Member struct {
 	Addr string `json:"addr"` // http://host:port
@@ -189,46 +197,90 @@ func (c *Cluster) fetchCollectionsList(peer string) ([]string, error) {
 	return out.Collections, err
 }
 
-// syncCollection runs one Merkle round against a peer for one collection:
-//  1. ask peer for its leaves (sending our root so it can answer "same" cheaply)
-//  2. diff the trees -> divergent ids
-//  3. pull their docs for those ids, push our docs for those ids
-//  4. both sides merge by (ver, ts)
+// syncCollection runs one anti-entropy round against a peer for one
+// collection using a subtree diff:
+//  1. probe the peer's root+depth (tiny)
+//  2. roots equal -> done
+//  3. depths equal -> descend our tree against the remote, fetching
+//     only hashes along divergent paths (O(k*depth) small requests)
+//     depths differ -> fall back to full leaf exchange
+//  4. for each divergent leaf: pull their doc, push ours if newer
+//  5. both sides merge by (ver, ts)
 func (c *Cluster) syncCollection(peer, col string) error {
 	ourLeaves := c.st.Leaves(col)
 	ourTree := merkle.Build(ourLeaves)
 
-	// Step 1: fetch their leaves (cheap root check happens server-side too,
-	// but we need their leaves anyway when roots differ, so just fetch).
-	resp, err := c.client.Get(peer + "/internal/merkle/" + col)
+	// Step 1: cheap root probe.
+	meta, err := c.fetchMerkleMeta(peer, col)
 	if err != nil {
 		return err
 	}
-	var their struct {
-		Collection string        `json:"collection"`
-		Root       string        `json:"root"`
-		Leaves     []merkle.Leaf `json:"leaves"`
+	if ourTree.Root() == meta.Root {
+		return nil // healthy
 	}
-	decErr := json.NewDecoder(resp.Body).Decode(&their)
-	resp.Body.Close()
-	if decErr != nil {
-		return decErr
-	}
-	theirTree := merkle.Build(their.Leaves)
 
-	// Healthy case: roots equal, nothing to do.
-	if ourTree.Root() == theirTree.Root() {
+	var divergent []merkle.Divergence
+	if ourTree.Depth() == meta.Depth {
+		// Step 3a: subtree descent — fetch only divergent hashes.
+		rt := merkle.NewRemoteTree(meta.Root, meta.Depth,
+			func(level, index int) (string, error) {
+				return c.fetchMerkleNode(peer, col, level, index)
+			},
+			func(index int) (merkle.Leaf, bool, error) {
+				return c.fetchMerkleLeaf(peer, col, index)
+			})
+		divergent, err = merkle.DiffAgainstRemote(ourTree, rt)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Step 3b: depth mismatch fallback — full leaf exchange.
+		theirLeaves, err := c.fetchMerkleLeaves(peer, col)
+		if err != nil {
+			return err
+		}
+		theirTree := merkle.Build(theirLeaves)
+		theirHash := make(map[string]string, len(theirLeaves))
+		for _, l := range theirLeaves {
+			theirHash[l.ID] = l.Hash
+		}
+		ourHash := make(map[string]string, len(ourLeaves))
+		for _, l := range ourLeaves {
+			ourHash[l.ID] = l.Hash
+		}
+		for _, id := range merkle.DiffIDsByMap(ourTree, theirTree) {
+			d := merkle.Divergence{}
+			if h, ok := ourHash[id]; ok {
+				d.Local = merkle.Leaf{ID: id, Hash: h}
+				d.HasLoc = true
+			}
+			if h, ok := theirHash[id]; ok {
+				d.Remote = merkle.Leaf{ID: id, Hash: h}
+				d.HasRem = true
+			}
+			divergent = append(divergent, d)
+		}
+	}
+	if len(divergent) == 0 {
 		return nil
 	}
 
-	// Step 2: find divergent ids.
-	diff := merkle.DiffIDsAuto(ourTree, theirTree)
-	if len(diff) == 0 {
-		return nil
+	// Step 4: exchange docs for divergent ids.
+	ids := make([]string, 0, len(divergent))
+	seen := map[string]bool{}
+	for _, d := range divergent {
+		if d.HasLoc && !seen[d.Local.ID] {
+			seen[d.Local.ID] = true
+			ids = append(ids, d.Local.ID)
+		}
+		if d.HasRem && !seen[d.Remote.ID] {
+			seen[d.Remote.ID] = true
+			ids = append(ids, d.Remote.ID)
+		}
 	}
 
-	// Step 3a: pull their versions of the divergent docs.
-	body, _ := json.Marshal(map[string]interface{}{"collection": col, "ids": diff})
+	// Pull their versions.
+	body, _ := json.Marshal(map[string]interface{}{"collection": col, "ids": ids})
 	presp, err := c.client.Post(peer+"/internal/antientropy", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -236,7 +288,7 @@ func (c *Cluster) syncCollection(peer, col string) error {
 	var pulled struct {
 		Docs []*store.Doc `json:"docs"`
 	}
-	decErr = json.NewDecoder(presp.Body).Decode(&pulled)
+	decErr := json.NewDecoder(presp.Body).Decode(&pulled)
 	presp.Body.Close()
 	if decErr != nil {
 		return decErr
@@ -248,14 +300,15 @@ func (c *Cluster) syncCollection(peer, col string) error {
 		}
 	}
 
-	// Step 3b: push our versions of the divergent docs that they still lack
-	// or hold stale copies of (recompute against their leaf map).
-	theirHash := make(map[string]string, len(their.Leaves))
-	for _, l := range their.Leaves {
-		theirHash[l.ID] = l.Hash
+	// Push our versions they lack or hold stale.
+	theirHash := make(map[string]string)
+	for _, d := range divergent {
+		if d.HasRem {
+			theirHash[d.Remote.ID] = d.Remote.Hash
+		}
 	}
 	var toPush []*store.Doc
-	for _, d := range c.st.DocsByIDs(col, diff) {
+	for _, d := range c.st.DocsByIDs(col, ids) {
 		if theirHash[d.ID] != merkle.HashDoc(d) {
 			toPush = append(toPush, d)
 		}
@@ -268,9 +321,67 @@ func (c *Cluster) syncCollection(peer, col string) error {
 		}
 		sresp.Body.Close()
 	}
-	log.Printf("anti-entropy %s with %s: %d divergent ids, pulled %d, pushed %d",
-		col, peer, len(diff), applied, len(toPush))
+	log.Printf("anti-entropy %s with %s: %d divergent leaves, pulled %d, pushed %d",
+		col, peer, len(divergent), applied, len(toPush))
 	return nil
+}
+
+func (c *Cluster) fetchMerkleMeta(peer, col string) (MerkleMeta, error) {
+	var out struct {
+		Root  string `json:"root"`
+		Depth int    `json:"depth"`
+	}
+	resp, err := c.client.Get(peer + "/internal/merkle/" + col + "/meta")
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out, err
+}
+
+func (c *Cluster) fetchMerkleNode(peer, col string, level, index int) (string, error) {
+	u := fmt.Sprintf("%s/internal/merkle/%s/node?level=%d&index=%d", peer, col, level, index)
+	resp, err := c.client.Get(u)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Hash string `json:"hash"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out.Hash, err
+}
+
+func (c *Cluster) fetchMerkleLeaf(peer, col string, index int) (merkle.Leaf, bool, error) {
+	u := fmt.Sprintf("%s/internal/merkle/%s/leaf?index=%d", peer, col, index)
+	resp, err := c.client.Get(u)
+	if err != nil {
+		return merkle.Leaf{}, false, err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Leaf merkle.Leaf `json:"leaf"`
+		OK   bool        `json:"ok"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return merkle.Leaf{}, false, err
+	}
+	return out.Leaf, out.OK, nil
+}
+
+func (c *Cluster) fetchMerkleLeaves(peer, col string) ([]merkle.Leaf, error) {
+	resp, err := c.client.Get(peer + "/internal/merkle/" + col)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Leaves []merkle.Leaf `json:"leaves"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	return out.Leaves, err
 }
 
 func (c *Cluster) Stop() { close(c.stop) }
@@ -411,6 +522,45 @@ func (c *Cluster) HandleMerkle(w http.ResponseWriter, r *http.Request) {
 		"root":       tree.Root(),
 		"leaves":     leaves,
 	})
+}
+
+// HandleMerkleMeta returns just the root and depth — the cheap probe
+// that starts a subtree-diff sync without shipping any leaves.
+func (c *Cluster) HandleMerkleMeta(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	tree := merkle.Build(c.st.Leaves(col))
+	writeJSON(w, 200, map[string]interface{}{"root": tree.Root(), "depth": tree.Depth()})
+}
+
+// HandleMerkleNode returns the hash at (level, index) of the tree.
+func (c *Cluster) HandleMerkleNode(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	level, err1 := strconv.Atoi(r.URL.Query().Get("level"))
+	index, err2 := strconv.Atoi(r.URL.Query().Get("index"))
+	if err1 != nil || err2 != nil {
+		writeJSON(w, 400, map[string]string{"error": "level and index required"})
+		return
+	}
+	tree := merkle.Build(c.st.Leaves(col))
+	if level < 0 || level > tree.Depth() || index < 0 || index >= 1<<(tree.Depth()-level) {
+		writeJSON(w, 404, map[string]string{"error": "node out of range"})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"hash": tree.HashAt(level, index)})
+}
+
+// HandleMerkleLeaf returns the leaf at padded index (deleted docs
+// included; padding returns ok=false).
+func (c *Cluster) HandleMerkleLeaf(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	index, err := strconv.Atoi(r.URL.Query().Get("index"))
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "index required"})
+		return
+	}
+	tree := merkle.Build(c.st.Leaves(col))
+	leaf, ok := tree.LeafAt(index)
+	writeJSON(w, 200, map[string]interface{}{"leaf": leaf, "ok": ok})
 }
 
 // HandleAntiEntropy returns our docs for the requested divergent ids.

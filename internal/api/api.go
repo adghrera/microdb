@@ -52,6 +52,9 @@ func New(self string, st *store.Store, cl *cluster.Cluster) *Server {
 	s.mux.HandleFunc("POST /internal/replicate_bulk", cl.HandleReplicateBulk)
 	s.mux.HandleFunc("GET /internal/collections", cl.HandleCollections)
 	s.mux.HandleFunc("GET /internal/merkle/{col}", cl.HandleMerkle)
+	s.mux.HandleFunc("GET /internal/merkle/{col}/meta", cl.HandleMerkleMeta)
+	s.mux.HandleFunc("GET /internal/merkle/{col}/node", cl.HandleMerkleNode)
+	s.mux.HandleFunc("GET /internal/merkle/{col}/leaf", cl.HandleMerkleLeaf)
 	s.mux.HandleFunc("POST /internal/antientropy", cl.HandleAntiEntropy)
 	s.mux.HandleFunc("GET /internal/scan/{col}", s.handleInternalScan)
 

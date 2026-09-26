@@ -86,6 +86,69 @@ func TestEmptyTree(t *testing.T) {
 	}
 }
 
+func TestDiffAgainstRemote(t *testing.T) {
+	a := Build(leaves([2]string{"a", "1"}, [2]string{"b", "2"}, [2]string{"c", "3"}, [2]string{"d", "4"}))
+	b := Build(leaves([2]string{"a", "1"}, [2]string{"b", "X"}, [2]string{"c", "3"}, [2]string{"d", "4"}))
+
+	fetchCount := 0
+	rt := NewRemoteTree(b.Root(), b.Depth(),
+		func(level, index int) (string, error) {
+			fetchCount++
+			return b.HashAt(level, index), nil
+		},
+		func(index int) (Leaf, bool, error) {
+			l, ok := b.LeafAt(index)
+			return l, ok, nil
+		})
+
+	divs, err := DiffAgainstRemote(a, rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(divs) != 1 {
+		t.Fatalf("expected 1 divergence, got %d: %+v", len(divs), divs)
+	}
+	if divs[0].Local.ID != "b" || divs[0].Remote.ID != "b" {
+		t.Fatalf("wrong divergence: %+v", divs[0])
+	}
+	// Descent must fetch far fewer hashes than the full tree size.
+	// Tree of 4 leaves, depth 2: divergent path costs 1+2+1=4 fetches;
+	// the full tree has 7 nodes.
+	if fetchCount >= 7 {
+		t.Fatalf("subtree diff fetched %d hashes — not bounded to divergent paths", fetchCount)
+	}
+}
+
+func TestDiffAgainstRemoteEqualRootsNoFetch(t *testing.T) {
+	a := Build(leaves([2]string{"a", "1"}, [2]string{"b", "2"}))
+	b := Build(leaves([2]string{"a", "1"}, [2]string{"b", "2"}))
+	fetches := 0
+	rt := NewRemoteTree(b.Root(), b.Depth(),
+		func(level, index int) (string, error) { fetches++; return b.HashAt(level, index), nil },
+		func(index int) (Leaf, bool, error) { l, ok := b.LeafAt(index); return l, ok, nil })
+	divs, err := DiffAgainstRemote(a, rt)
+	if err != nil || len(divs) != 0 || fetches != 0 {
+		t.Fatalf("equal roots must short-circuit with zero fetches: divs=%v fetches=%d err=%v", divs, fetches, err)
+	}
+}
+
+func TestDiffAgainstRemoteMissingRemoteDoc(t *testing.T) {
+	// We have 4 docs, remote has 3 (pads to 4, same depth).
+	a := Build(leaves([2]string{"a", "1"}, [2]string{"b", "2"}, [2]string{"c", "3"}, [2]string{"d", "4"}))
+	b := Build(leaves([2]string{"a", "1"}, [2]string{"b", "2"}, [2]string{"c", "3"}))
+	rt := NewRemoteTree(b.Root(), b.Depth(),
+		func(level, index int) (string, error) { return b.HashAt(level, index), nil },
+		func(index int) (Leaf, bool, error) { l, ok := b.LeafAt(index); return l, ok, nil })
+	divs, err := DiffAgainstRemote(a, rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The 'd' leaf diverges: we have it, remote is padding.
+	if len(divs) != 1 || !divs[0].HasLoc || divs[0].Local.ID != "d" || divs[0].HasRem {
+		t.Fatalf("expected d-only divergence, got %+v", divs)
+	}
+}
+
 func TestHashDocDeterministic(t *testing.T) {
 	type doc struct {
 		A string `json:"a"`

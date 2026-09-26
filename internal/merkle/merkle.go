@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 )
 
@@ -165,4 +166,81 @@ func DiffIDsAuto(a, b *Tree) []string {
 		return DiffIDs(a, b)
 	}
 	return DiffIDsByMap(a, b)
+}
+
+// RemoteTree is the client-side view of a peer's tree: we know its root
+// and depth, and can ask the peer for any node's hash by (level, index)
+// or the leaf (id, hash) at a divergent leaf position — without the
+// peer ever shipping its whole leaf list.
+type RemoteTree struct {
+	root      string
+	depth     int
+	fetchHash func(level, index int) (string, error)
+	fetchLeaf func(index int) (Leaf, bool, error) // ok=false => padding
+}
+
+func NewRemoteTree(root string, depth int,
+	fetchHash func(level, index int) (string, error),
+	fetchLeaf func(index int) (Leaf, bool, error)) *RemoteTree {
+	return &RemoteTree{root: root, depth: depth, fetchHash: fetchHash, fetchLeaf: fetchLeaf}
+}
+
+func (r *RemoteTree) Root() string { return r.root }
+func (r *RemoteTree) Depth() int   { return r.depth }
+func (r *RemoteTree) Hash(level, index int) (string, error) { return r.fetchHash(level, index) }
+func (r *RemoteTree) Leaf(index int) (Leaf, bool, error)    { return r.fetchLeaf(index) }
+
+// Divergence is one divergent leaf position: what we have and what the
+// remote has (ok=false means that side is padding/absent).
+type Divergence struct {
+	Index  int
+	Local  Leaf
+	HasLoc bool
+	Remote Leaf
+	HasRem bool
+}
+
+// DiffAgainstRemote descends our local tree against a remote tree,
+// fetching hashes only along divergent paths. Cost is O(k * depth)
+// hash fetches for k divergent leaves instead of O(n) leaf shipping.
+//
+// Requires equal depth; callers fall back to full-leaf diff otherwise.
+func DiffAgainstRemote(local *Tree, remote *RemoteTree) ([]Divergence, error) {
+	if local.depth != remote.depth {
+		return nil, fmt.Errorf("depth mismatch: local %d remote %d", local.depth, remote.depth)
+	}
+	if local.Root() == remote.Root() {
+		return nil, nil
+	}
+	var out []Divergence
+	var walk func(level, index int) error
+	walk = func(level, index int) error {
+		localH := local.HashAt(level, index)
+		remoteH, err := remote.Hash(level, index)
+		if err != nil {
+			return err
+		}
+		if localH == remoteH {
+			return nil
+		}
+		if level == local.depth {
+			d := Divergence{Index: index}
+			d.Local, d.HasLoc = local.LeafAt(index)
+			rl, rok, err := remote.Leaf(index)
+			if err != nil {
+				return err
+			}
+			d.Remote, d.HasRem = rl, rok
+			out = append(out, d)
+			return nil
+		}
+		if err := walk(level+1, index<<1); err != nil {
+			return err
+		}
+		return walk(level+1, index<<1|1)
+	}
+	if err := walk(0, 0); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
