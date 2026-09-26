@@ -1,0 +1,38 @@
+version: "3.8"
+
+# One-command 3-node microdb cluster:
+#   docker compose up -d
+# Seeds: node1 is the seed; node2 joins node1; node3 joins node2.
+# Any node accepts any write; all converge via gossip + anti-entropy.
+
+services:
+  node1:
+    build: .
+    ports: ["8001:8001"]
+    volumes: ["node1-data:/data"]
+    healthcheck:
+      test: ["CMD", "microctl", "status", "--url", "http://localhost:8001"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  node2:
+    build: .
+    command: ["--addr", ":8001", "--dir", "/data", "--join", "http://node1:8001"]
+    ports: ["8002:8001"]
+    volumes: ["node2-data:/data"]
+    depends_on:
+      node1: { condition: service_healthy }
+
+  node3:
+    build: .
+    command: ["--addr", ":8001", "--dir", "/data", "--join", "http://node2:8001"]
+    ports: ["8003:8001"]
+    volumes: ["node3-data:/data"]
+    depends_on:
+      node2: { condition: service_started }
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
