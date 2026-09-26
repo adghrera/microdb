@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -440,6 +441,63 @@ func (s *Store) DocsByIDs(collection string, ids []string) []*Doc {
 		}
 	}
 	return out
+}
+
+// Backup writes a snapshot of the current in-memory state to w as
+// JSONL (one doc per line, current versions only — no history).
+// Safe to take while writes continue: the snapshot is taken under the
+// read lock.
+func (s *Store) Backup(w io.Writer) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	docs := make([]*Doc, 0, len(s.docs))
+	for _, d := range s.docs {
+		docs = append(docs, d)
+	}
+	sort.Slice(docs, func(i, j int) bool {
+		if docs[i].Collection != docs[j].Collection {
+			return docs[i].Collection < docs[j].Collection
+		}
+		return docs[i].ID < docs[j].ID
+	})
+	bw := bufio.NewWriterSize(w, 1<<20)
+	enc := json.NewEncoder(bw)
+	for _, d := range docs {
+		if err := enc.Encode(d); err != nil {
+			return err
+		}
+	}
+	return bw.Flush()
+}
+
+// Restore reads a JSONL backup (as produced by Backup) and applies
+// every record through the normal merge path, so restoring into a
+// non-empty store is safe (LWW decides) and indexes stay consistent.
+func (s *Store) Restore(r io.Reader) (int, error) {
+	br := bufio.NewReaderSize(r, 1<<20)
+	applied := 0
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			trimmed := strings.TrimSpace(string(line))
+			if trimmed != "" {
+				var d Doc
+				if json.Unmarshal([]byte(trimmed), &d) != nil {
+					return applied, fmt.Errorf("bad backup line: %.80s", trimmed)
+				}
+				if s.ApplyRemote(&d) {
+					applied++
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return applied, err
+		}
+	}
+	return applied, nil
 }
 
 // Matches evaluates a filter object against a document.

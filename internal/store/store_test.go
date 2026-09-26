@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -216,6 +217,50 @@ func TestApplyBatchAtomicAndReplay(t *testing.T) {
 	docs2, _ := s2.ApplyBatch("b", map[string]map[string]interface{}{"x": {"v": 10}})
 	if docs2[0].Ver != 2 {
 		t.Fatalf("batch update should bump ver to 2, got %d", docs2[0].Ver)
+	}
+}
+
+func TestBackupRestoreRoundTrip(t *testing.T) {
+	src := t.TempDir()
+	s, err := Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Apply("a", "1", map[string]interface{}{"v": "one"})
+	s.Apply("a", "2", map[string]interface{}{"v": "two"})
+	s.Apply("b", "1", map[string]interface{}{"v": "bee"})
+	s.Apply("a", "2", map[string]interface{}{"v": "TWO"}) // v2 wins
+	s.Delete("b", "1")                                    // tombstone in backup
+
+	var buf bytes.Buffer
+	if err := s.Backup(&buf); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Restore into a fresh store.
+	dst := t.TempDir()
+	s2, err := Open(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	n, err := s2.Restore(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("expected 3 records applied (2 live + 1 tombstone), got %d", n)
+	}
+	if d, ok := s2.Get("a", "2"); !ok || d.Fields["v"] != "TWO" {
+		t.Fatalf("latest version not restored: %+v", d)
+	}
+	if _, ok := s2.Get("b", "1"); ok {
+		t.Fatal("deleted doc should not be readable after restore")
+	}
+	// Index works post-restore.
+	if ids := s2.ScanIndexed("a", map[string]interface{}{"v": "one"}); len(ids) != 1 {
+		t.Fatalf("index broken after restore: %v", ids)
 	}
 }
 
