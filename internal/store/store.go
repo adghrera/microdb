@@ -4,6 +4,7 @@
 package store
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -162,6 +163,79 @@ func (s *Store) Scan(collection string, keep func(*Doc) bool) []*Doc {
 }
 
 func (s *Store) Close() error { return s.f.Close() }
+
+// Compact rewrites the JSONL log keeping only the current version of
+// each live document. Tombstones older than gcWindow are dropped
+// entirely; tombstones newer than the window are kept so deletes
+// cannot be resurrected by a lagging replica during anti-entropy.
+//
+// The rewrite is crash-safe: new log is written to data.jsonl.tmp,
+// fsynced, then atomically renamed over the old log.
+func (s *Store) Compact(gcWindow time.Duration) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := time.Now().Add(-gcWindow).UnixMilli()
+	live := make([]*Doc, 0, len(s.docs))
+	dropped := 0
+	for k, d := range s.docs {
+		if d.Deleted && d.TS <= cutoff {
+			delete(s.docs, k)
+			dropped++
+			continue
+		}
+		live = append(live, d)
+	}
+	sort.Slice(live, func(i, j int) bool {
+		if live[i].Collection != live[j].Collection {
+			return live[i].Collection < live[j].Collection
+		}
+		return live[i].ID < live[j].ID
+	})
+
+	tmpPath := s.f.Name() + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return 0, err
+	}
+	w := bufio.NewWriterSize(f, 1<<20)
+	for _, d := range live {
+		b, _ := json.Marshal(d)
+		if _, err := w.Write(append(b, '\n')); err != nil {
+			f.Close()
+			os.Remove(tmpPath)
+			return 0, err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return 0, err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return 0, err
+	}
+	if err := f.Close(); err != nil {
+		return 0, err
+	}
+	oldName := s.f.Name()
+	// Windows cannot rename over an open handle — close first (lock held,
+	// so no writes can slip through), rename, then reopen for appending.
+	if err := s.f.Close(); err != nil {
+		return 0, err
+	}
+	if err := os.Rename(tmpPath, oldName); err != nil {
+		return 0, err
+	}
+	nf, err := os.OpenFile(oldName, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	s.f = nf
+	return dropped, nil
+}
 
 // Collections lists all collection names present in the store
 // (including ones containing only tombstones).

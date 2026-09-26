@@ -124,6 +124,25 @@ func (c *Cluster) Start() {
 			}
 		}
 	}()
+	// Compaction: hourly, dropping tombstones older than 24h. The GC
+	// window must exceed max expected replica downtime or a very late
+	// replica could resurrect a deleted doc from its own old log.
+	go func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-c.stop:
+				return
+			case <-t.C:
+				if dropped, err := c.st.Compact(24 * time.Hour); err != nil {
+					log.Printf("compaction failed: %v", err)
+				} else if dropped > 0 {
+					log.Printf("compaction dropped %d expired tombstones", dropped)
+				}
+			}
+		}
+	}()
 }
 
 // antiEntropyAll syncs every collection with every live peer.
