@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -192,9 +193,12 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 }
 
 // handleQuery: GET /api/collections/{col}/docs?filter=<url-encoded JSON>
+//   &sort=<field>&desc=true&limit=N&offset=M
+//
 // Scatter-gather: the receiving node fans the query out to every live
 // cluster member (including itself), merges results by doc id keeping
-// the highest (ver, ts), and returns the union.
+// the highest (ver, ts), then applies sort and pagination to the
+// merged set.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	var filter map[string]interface{}
@@ -204,8 +208,25 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	keep := func(d *store.Doc) bool {
-		return len(filter) == 0 || store.Matches(d, filter)
+	sortField := r.URL.Query().Get("sort")
+	desc := r.URL.Query().Get("desc") == "true"
+	limit := -1
+	if l := r.URL.Query().Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil || n < 0 {
+			writeJSON(w, 400, map[string]string{"error": "bad limit"})
+			return
+		}
+		limit = n
+	}
+	offset := 0
+	if o := r.URL.Query().Get("offset"); o != "" {
+		n, err := strconv.Atoi(o)
+		if err != nil || n < 0 {
+			writeJSON(w, 400, map[string]string{"error": "bad offset"})
+			return
+		}
+		offset = n
 	}
 
 	// Gather from every member: self + peers.
@@ -215,7 +236,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	for _, m := range members {
 		var docs []*store.Doc
 		if m == s.self {
-			docs = s.st.Scan(col, keep)
+			docs = s.st.ScanIndexed(col, filter)
 		} else {
 			got, err := s.gatherFrom(m, col, r.URL.Query().Get("filter"))
 			if err != nil {
@@ -234,8 +255,34 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	for _, d := range merged {
 		out = append(out, d)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	resp := map[string]interface{}{"count": len(out), "docs": out, "nodes_queried": len(members)}
+	if sortField != "" {
+		sort.SliceStable(out, func(i, j int) bool {
+			c := store.CompareValues(out[i].Fields[sortField], out[j].Fields[sortField])
+			if desc {
+				return c > 0
+			}
+			return c < 0
+		})
+	} else {
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	}
+	total := len(out)
+	if offset > 0 {
+		if offset >= len(out) {
+			out = nil
+		} else {
+			out = out[offset:]
+		}
+	}
+	if limit >= 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	resp := map[string]interface{}{
+		"count":         len(out),
+		"total":       total,
+		"docs":        out,
+		"nodes_queried": len(members),
+	}
 	if len(errs) > 0 {
 		resp["partial"] = true
 		resp["errors"] = errs

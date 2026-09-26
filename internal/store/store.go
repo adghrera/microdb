@@ -442,6 +442,43 @@ func jsonEq(a, b interface{}) bool {
 	return string(ja) == string(jb)
 }
 
+// CompareValues orders two JSON-decoded values: numbers numerically,
+// strings lexicographically, missing values sort last. Mixed or
+// unorderable types compare equal (stable sort keeps insertion order).
+func CompareValues(a, b interface{}) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return 1
+	}
+	if b == nil {
+		return -1
+	}
+	switch av := a.(type) {
+	case float64:
+		if bv, ok := b.(float64); ok {
+			return sign(av - bv)
+		}
+	case string:
+		if bv, ok := b.(string); ok {
+			return strings.Compare(av, bv)
+		}
+	case bool:
+		if bv, ok := b.(bool); ok {
+			ab, bb := 0, 0
+			if av {
+				ab = 1
+			}
+			if bv {
+				bb = 1
+			}
+			return ab - bb
+		}
+	}
+	return 0
+}
+
 func cmp(a, b interface{}, pred func(int) bool) bool {
 	switch av := a.(type) {
 	case float64:
