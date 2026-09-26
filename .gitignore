@@ -1,4 +1,3 @@
-/bin
-/data*
-data.jsonl
-*.log
+bin/
+data*/
+n[123].log
