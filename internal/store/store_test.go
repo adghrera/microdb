@@ -103,6 +103,28 @@ func TestCompactTombstoneGC(t *testing.T) {
 	}
 }
 
+func TestFsyncModePersistsWrite(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetFsync(true)
+	if _, err := s.Apply("c", "dur", map[string]interface{}{"v": 1}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	// After close+reopen the fsynced write must be present.
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if _, ok := s2.Get("c", "dur"); !ok {
+		t.Fatal("fsynced write lost across reopen")
+	}
+}
+
 func TestCompactKeepsFreshTombstones(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)

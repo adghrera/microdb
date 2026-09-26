@@ -31,12 +31,14 @@ func main() {
 	addr := flag.String("addr", ":8001", "listen address")
 	dir := flag.String("dir", "./data", "data directory")
 	join := flag.String("join", "", "comma-separated seed nodes, e.g. http://127.0.0.1:8002")
+	fsync := flag.Bool("fsync", false, "fsync every write to disk (durable, slower)")
 	flag.Parse()
 
 	st, err := store.Open(*dir)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
+	st.SetFsync(*fsync)
 	defer st.Close()
 
 	self := selfURL(*addr)

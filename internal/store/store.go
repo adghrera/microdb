@@ -27,9 +27,23 @@ type Doc struct {
 }
 
 type Store struct {
-	mu   sync.RWMutex
-	docs map[string]*Doc // key = collection + "\x00" + id
-	f    *os.File
+	mu     sync.RWMutex
+	docs   map[string]*Doc // key = collection + "\x00" + id
+	f      *os.File
+	fsync  bool // sync to disk on every write (durability over throughput)
+}
+
+// SetFsync enables fsync-on-write. With it enabled every Apply/Delete
+// blocks until the record is durable on disk; without it the OS page
+// cache decides (fast, but a power loss can lose the log tail).
+func (s *Store) SetFsync(on bool) { s.fsync = on }
+
+// sync flushes the log to stable storage if fsync is enabled.
+func (s *Store) sync() error {
+	if s.fsync {
+		return s.f.Sync()
+	}
+	return nil
 }
 
 func key(col, id string) string { return col + "\x00" + id }
@@ -103,6 +117,9 @@ func (s *Store) Apply(collection, id string, fields map[string]interface{}) (*Do
 	if _, err := s.f.Write(append(b, '\n')); err != nil {
 		return nil, err
 	}
+	if err := s.sync(); err != nil {
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -114,8 +131,10 @@ func (s *Store) ApplyRemote(d *Doc) bool {
 		return false
 	}
 	b, _ := json.Marshal(d)
-	_, err := s.f.Write(append(b, '\n'))
-	return err == nil
+	if _, err := s.f.Write(append(b, '\n')); err != nil {
+		return false
+	}
+	return s.sync() == nil
 }
 
 func (s *Store) Get(collection, id string) (*Doc, bool) {
@@ -141,8 +160,10 @@ func (s *Store) Delete(collection, id string) error {
 		return nil
 	}
 	b, _ := json.Marshal(d)
-	_, err := s.f.Write(append(b, '\n'))
-	return err
+	if _, err := s.f.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	return s.sync()
 }
 
 // Scan walks a collection applying a filter.
