@@ -218,7 +218,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Docs map[string]map[string]interface{} `json:"docs"`
 	}
-	if err := json.Unmarshal(body, &in.Docs); err != nil || len(in.Docs) == 0 {
+	if err := json.Unmarshal(body, &in); err != nil || len(in.Docs) == 0 {
 		writeJSON(w, 400, map[string]string{"error": `body must be {"docs": {id: fields, ...}}`})
 		return
 	}
