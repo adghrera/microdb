@@ -42,6 +42,7 @@ func New(self string, st *store.Store, cl *cluster.Cluster) *Server {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("GET /api/collections/{col}/docs/{id}", s.handleGet)
 	s.mux.HandleFunc("PUT /api/collections/{col}/docs/{id}", s.handlePut)
+	s.mux.HandleFunc("POST /api/collections/{col}/docs/batch", s.handleBatch)
 	s.mux.HandleFunc("DELETE /api/collections/{col}/docs/{id}", s.handleDelete)
 	s.mux.HandleFunc("GET /api/collections/{col}/docs", s.handleQuery)
 	s.mux.HandleFunc("GET /api/cluster", s.handleCluster)
@@ -144,6 +145,35 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 	s.fanout(d)
 	writeJSON(w, 200, d)
+}
+
+// handleBatch: POST /api/collections/{col}/docs/batch
+// Body: {"docs": {"id1": {fields}, "id2": {fields}, ...}}
+// Applies all docs in one atomic log record, then fans each changed
+// doc out to its ring owners. One round-trip for bulk imports.
+func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20)) // 32 MiB cap
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "read body"})
+		return
+	}
+	var in struct {
+		Docs map[string]map[string]interface{} `json:"docs"`
+	}
+	if err := json.Unmarshal(body, &in.Docs); err != nil || len(in.Docs) == 0 {
+		writeJSON(w, 400, map[string]string{"error": `body must be {"docs": {id: fields, ...}}`})
+		return
+	}
+	docs, err := s.st.ApplyBatch(col, in.Docs)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	for _, d := range docs {
+		s.fanout(d)
+	}
+	writeJSON(w, 200, map[string]interface{}{"applied": len(docs), "docs": docs})
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {

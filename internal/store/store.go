@@ -80,6 +80,23 @@ func Open(dir string) (*Store, error) {
 		if line == "" {
 			continue
 		}
+		// Batch records: {"batch":[{doc},{doc},...]}.
+		if strings.HasPrefix(line, `{"batch":`) {
+			var rec struct {
+				Batch []*Doc `json:"batch"`
+			}
+			if json.Unmarshal([]byte(line), &rec) == nil {
+				for _, d := range rec.Batch {
+					if s.merge(d) {
+						s.idx.For(d.Collection).Remove(d.ID)
+						if !d.Deleted {
+							s.idx.For(d.Collection).Add(d.ID, d.Fields)
+						}
+					}
+				}
+			}
+			continue
+		}
 		var d Doc
 		if json.Unmarshal([]byte(line), &d) == nil {
 			if s.merge(&d) {
@@ -134,6 +151,41 @@ func (s *Store) Apply(collection, id string, fields map[string]interface{}) (*Do
 		return nil, err
 	}
 	return d, nil
+}
+
+// ApplyBatch upserts many documents in one call: one log write (one
+// fsync when enabled) and one fanout pass. All docs land or none do —
+// the batch is written as a single atomic log record.
+func (s *Store) ApplyBatch(collection string, docs map[string]map[string]interface{}) ([]*Doc, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*Doc, 0, len(docs))
+	changed := make([]*Doc, 0, len(docs))
+	for id, fields := range docs {
+		ver := int64(1)
+		if cur, ok := s.docs[key(collection, id)]; ok {
+			ver = cur.Ver + 1
+		}
+		d := &Doc{ID: id, Ver: ver, TS: time.Now().UnixMilli(), Collection: collection, Fields: fields}
+		out = append(out, d)
+		if s.merge(d) {
+			s.idx.For(collection).Remove(id)
+			s.idx.For(collection).Add(id, fields)
+			changed = append(changed, d)
+		}
+	}
+	if len(changed) == 0 {
+		return out, nil
+	}
+	rec := map[string]interface{}{"batch": changed}
+	b, _ := json.Marshal(rec)
+	if _, err := s.f.Write(append(b, '\n')); err != nil {
+		return nil, err
+	}
+	if err := s.sync(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ApplyRemote merges a replicated doc from a peer without re-propagating.

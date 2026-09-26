@@ -175,6 +175,50 @@ func TestScanIndexedFastPathMatchesFullScan(t *testing.T) {
 	}
 }
 
+func TestApplyBatchAtomicAndReplay(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs, err := s.ApplyBatch("b", map[string]map[string]interface{}{
+		"x": {"v": 1},
+		"y": {"v": 2},
+		"z": {"v": 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 3 {
+		t.Fatalf("expected 3 docs, got %d", len(docs))
+	}
+	// One log line for the whole batch.
+	if got := countLines(t, filepath.Join(dir, "data.jsonl")); got != 1 {
+		t.Fatalf("batch should be 1 log line, got %d", got)
+	}
+	// Index sees all three.
+	if ids := s.ScanIndexed("b", map[string]interface{}{"v": 2}); len(ids) != 1 || ids[0].ID != "y" {
+		t.Fatalf("batch index miss: %v", ids)
+	}
+	// Replay restores all three.
+	s.Close()
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	for _, id := range []string{"x", "y", "z"} {
+		if _, ok := s2.Get("b", id); !ok {
+			t.Fatalf("batch doc %s lost on replay", id)
+		}
+	}
+	// Batch update bumps versions.
+	docs2, _ := s2.ApplyBatch("b", map[string]map[string]interface{}{"x": {"v": 10}})
+	if docs2[0].Ver != 2 {
+		t.Fatalf("batch update should bump ver to 2, got %d", docs2[0].Ver)
+	}
+}
+
 func TestFsyncModePersistsWrite(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)
