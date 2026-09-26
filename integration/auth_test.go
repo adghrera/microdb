@@ -38,6 +38,13 @@ func TestRequireAPIAuth(t *testing.T) {
 	if c := do("/health", ""); c != 200 {
 		t.Fatalf("/health must stay open, got %d", c)
 	}
+	// /v1/api is gated exactly like /api.
+	if c := do("/v1/api/collections/x/docs", ""); c != 401 {
+		t.Fatalf("/v1/api without token should be 401, got %d", c)
+	}
+	if c := do("/v1/api/collections/x/docs", "Bearer s3cret"); c != 200 {
+		t.Fatalf("/v1/api with token should be 200, got %d", c)
+	}
 	if c := do("/internal/scan/x", ""); c != 200 {
 		t.Fatalf("auth middleware should not gate /internal (TLS middleware does), got %d", c)
 	}

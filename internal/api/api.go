@@ -56,13 +56,17 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	cl.OnPeersChanged = s.rebuildRing
 
 	s.mux.HandleFunc("GET /health", s.handleHealth)
-	s.mux.HandleFunc("GET /api/collections/{col}/docs/{id}", s.handleGet)
-	s.mux.HandleFunc("PUT /api/collections/{col}/docs/{id}", s.handlePut)
-	s.mux.HandleFunc("POST /api/collections/{col}/docs/batch", s.handleBatch)
-	s.mux.HandleFunc("DELETE /api/collections/{col}/docs/{id}", s.handleDelete)
-	s.mux.HandleFunc("GET /api/collections/{col}/docs", s.handleQuery)
-	s.mux.HandleFunc("GET /api/collections/{col}/watch", s.handleWatch)
-	s.mux.HandleFunc("GET /api/cluster", s.handleCluster)
+	// Public API is registered twice: unversioned (canonical) and
+	// under /v1 for clients that pin a version.
+	for _, prefix := range []string{"/api", "/v1/api"} {
+		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/docs/{id}", s.handleGet)
+		s.mux.HandleFunc("PUT "+prefix+"/collections/{col}/docs/{id}", s.handlePut)
+		s.mux.HandleFunc("POST "+prefix+"/collections/{col}/docs/batch", s.handleBatch)
+		s.mux.HandleFunc("DELETE "+prefix+"/collections/{col}/docs/{id}", s.handleDelete)
+		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/docs", s.handleQuery)
+		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/watch", s.handleWatch)
+		s.mux.HandleFunc("GET "+prefix+"/cluster", s.handleCluster)
+	}
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	// internal replication + membership endpoints
@@ -105,7 +109,7 @@ func RequireInternalTLS(next http.Handler) http.Handler {
 // disables the check entirely.
 func RequireAPIAuth(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if token == "" || !strings.HasPrefix(r.URL.Path, "/api/") {
+		if token == "" || !(strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/v1/api/")) {
 			next.ServeHTTP(w, r)
 			return
 		}
