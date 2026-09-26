@@ -13,9 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"microdb/internal/cluster"
+	"microdb/internal/metrics"
 	"microdb/internal/ring"
 	"microdb/internal/store"
 )
@@ -49,6 +51,7 @@ func New(self string, st *store.Store, cl *cluster.Cluster) *Server {
 	s.mux.HandleFunc("GET /api/collections/{col}/docs", s.handleQuery)
 	s.mux.HandleFunc("GET /api/collections/{col}/watch", s.handleWatch)
 	s.mux.HandleFunc("GET /api/cluster", s.handleCluster)
+	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	// internal replication + membership endpoints
 	s.mux.HandleFunc("POST /internal/join", cl.HandleJoin)
@@ -444,6 +447,16 @@ func (s *Server) handleInternalScan(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"self": s.self, "peers": s.cl.Peers()})
+}
+
+// handleMetrics renders Prometheus text format with live gauges
+// refreshed from current state before rendering.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	atomic.StoreInt64(metrics.Default.Gauge("microdb_docs", "Documents currently held (incl. tombstones)"), int64(s.st.DocCount()))
+	atomic.StoreInt64(metrics.Default.Gauge("microdb_collections", "Collections currently held"), int64(len(s.st.Collections())))
+	atomic.StoreInt64(metrics.Default.Gauge("microdb_peers", "Live cluster peers"), int64(len(s.cl.Peers())))
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	w.Write([]byte(metrics.Default.Render()))
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {

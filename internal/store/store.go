@@ -13,10 +13,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"microdb/internal/changelog"
 	"microdb/internal/index"
+	"microdb/internal/metrics"
 	"microdb/internal/merkle"
 )
 
@@ -156,6 +158,7 @@ func (s *Store) Apply(collection, id string, fields map[string]interface{}) (*Do
 		return nil, err
 	}
 	s.log.Append(collection, id, "upsert", d)
+	atomic.AddInt64(metrics.Default.Counter("microdb_writes_total", "Client writes applied"), 1)
 	return d, nil
 }
 
@@ -220,6 +223,7 @@ func (s *Store) ApplyRemote(d *Doc) bool {
 		kind = "delete"
 	}
 	s.log.Append(d.Collection, d.ID, kind, d)
+	atomic.AddInt64(metrics.Default.Counter("microdb_replicated_applies_total", "Docs applied from replication/anti-entropy"), 1)
 	return true
 }
 
@@ -254,6 +258,7 @@ func (s *Store) Delete(collection, id string) error {
 		return err
 	}
 	s.log.Append(collection, id, "delete", nil)
+	atomic.AddInt64(metrics.Default.Counter("microdb_deletes_total", "Client deletes applied"), 1)
 	return nil
 }
 
@@ -383,6 +388,13 @@ func (s *Store) Compact(gcWindow time.Duration) (int, error) {
 	}
 	s.f = nf
 	return dropped, nil
+}
+
+// DocCount returns the number of docs held (including tombstones).
+func (s *Store) DocCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.docs)
 }
 
 // Collections lists all collection names present in the store

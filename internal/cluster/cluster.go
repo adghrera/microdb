@@ -18,9 +18,11 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"microdb/internal/merkle"
+	"microdb/internal/metrics"
 	"microdb/internal/store"
 )
 
@@ -512,6 +514,7 @@ func (c *Cluster) evict() {
 
 // Replicate sends a doc to a peer; fire-and-forget with one retry.
 func (c *Cluster) Replicate(peer string, d *store.Doc) error {
+	atomic.AddInt64(metrics.Default.Counter("microdb_replication_sends_total", "Replication push attempts"), 1)
 	b, _ := json.Marshal(d)
 	for attempt := 0; attempt < 2; attempt++ {
 		resp, err := c.client.Post(peer+"/internal/replicate", "application/json", bytes.NewReader(b))
