@@ -15,6 +15,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"log"
 	"net"
@@ -32,6 +33,9 @@ func main() {
 	dir := flag.String("dir", "./data", "data directory")
 	join := flag.String("join", "", "comma-separated seed nodes, e.g. http://127.0.0.1:8002")
 	fsync := flag.Bool("fsync", false, "fsync every write to disk (durable, slower)")
+	tlsCert := flag.String("tls-cert", "", "PEM cert for TLS (enables https)")
+	tlsKey := flag.String("tls-key", "", "PEM key for TLS")
+	tlsCA := flag.String("tls-ca", "", "PEM CA bundle to verify peer certs (mutual TLS)")
 	flag.Parse()
 
 	st, err := store.Open(*dir)
@@ -41,8 +45,19 @@ func main() {
 	st.SetFsync(*fsync)
 	defer st.Close()
 
-	self := selfURL(*addr)
-	cl := cluster.New(self, st)
+	var tlsOpts *cluster.TLSOptions
+	if *tlsCert != "" {
+		if *tlsKey == "" || *tlsCA == "" {
+			log.Fatal("--tls-cert requires --tls-key and --tls-ca")
+		}
+		tlsOpts = &cluster.TLSOptions{CertFile: *tlsCert, KeyFile: *tlsKey, CAFile: *tlsCA}
+	}
+
+	self := selfURLWithTLS(*addr, tlsOpts != nil)
+	cl, err := cluster.New(self, st, tlsOpts)
+	if err != nil {
+		log.Fatalf("cluster init: %v", err)
+	}
 	srv := api.New(self, st, cl)
 	cl.Start()
 	defer cl.Stop()
@@ -68,14 +83,35 @@ func main() {
 		}()
 	}
 
-	log.Printf("microdb node %s listening on %s (data: %s)", self, *addr, *dir)
-	if err := http.ListenAndServe(*addr, srv); err != nil {
+	log.Printf("microdb node %s listening on %s (data: %s, tls=%v)", self, *addr, *dir, tlsOpts != nil)
+	var handler http.Handler = srv
+	if tlsOpts != nil {
+		handler = api.RequireInternalTLS(srv)
+		srvTLS, err := tlsOpts.ServerTLS()
+		if err != nil {
+			log.Fatalf("tls server config: %v", err)
+		}
+		// VerifyClientCertIfGiven: public API allows anonymous clients,
+		// RequireInternalTLS enforces certs on /internal/*.
+		srvTLS.ClientAuth = tls.VerifyClientCertIfGiven
+		s := &http.Server{Addr: *addr, Handler: handler, TLSConfig: srvTLS}
+		log.Fatal(s.ListenAndServeTLS("", ""))
+	}
+	if err := http.ListenAndServe(*addr, handler); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// selfURL builds the canonical http URL other nodes use to reach us.
-func selfURL(addr string) string {
+// selfURLWithTLS builds the canonical URL other nodes use to reach us.
+func selfURLWithTLS(addr string, secure bool) string {
+	scheme := "http"
+	if secure {
+		scheme = "https"
+	}
+	return selfURLInner(addr, scheme)
+}
+
+func selfURLInner(addr, scheme string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr

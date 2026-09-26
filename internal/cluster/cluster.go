@@ -7,12 +7,15 @@ package cluster
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"io"
 	"log"
 	"fmt"
 	"math/rand"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -25,6 +28,61 @@ import (
 type MerkleMeta struct {
 	Root  string `json:"root"`
 	Depth int    `json:"depth"`
+}
+
+// TLSOptions configures mutual-TLS for internal (gossip/replication)
+// traffic. All three files are PEM: server cert + key, and a CA bundle
+// used to verify peers.
+type TLSOptions struct {
+	CertFile string
+	KeyFile  string
+	CAFile   string
+}
+
+// ClientTLS builds the tls.Config used for peer-to-peer calls:
+// verifies peer certs against the CA and presents our cert so peers
+// can verify us back (mutual TLS).
+func (o *TLSOptions) ClientTLS() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(o.CertFile, o.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("client cert/key: %w", err)
+	}
+	caPEM, err := os.ReadFile(o.CAFile)
+	if err != nil {
+		return nil, fmt.Errorf("ca file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("no certs in CA bundle")
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+// ServerTLS builds the tls.Config for serving internal endpoints:
+// requires and verifies client certs against the CA.
+func (o *TLSOptions) ServerTLS() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(o.CertFile, o.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("server cert/key: %w", err)
+	}
+	caPEM, err := os.ReadFile(o.CAFile)
+	if err != nil {
+		return nil, fmt.Errorf("ca file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("no certs in CA bundle")
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 type Member struct {
@@ -43,14 +101,22 @@ type Cluster struct {
 	OnPeersChanged func(addrs []string)
 }
 
-func New(self string, st *store.Store) *Cluster {
+func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
+	transport := &http.Transport{}
+	if tlsOpts != nil {
+		tlsCfg, err := tlsOpts.ClientTLS()
+		if err != nil {
+			return nil, err
+		}
+		transport.TLSClientConfig = tlsCfg
+	}
 	return &Cluster{
 		self:   self,
 		peers:  map[string]time.Time{},
 		st:     st,
-		client: &http.Client{Timeout: 3 * time.Second},
+		client: &http.Client{Timeout: 3 * time.Second, Transport: transport},
 		stop:   make(chan struct{}),
-	}
+	}, nil
 }
 
 // Join contacts a known seed node and asks for its member list.

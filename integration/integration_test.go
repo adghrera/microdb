@@ -33,7 +33,10 @@ func startNode(t *testing.T, dir string) *node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cl := cluster.New(addr, st)
+	cl, err := cluster.New(addr, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := api.New(addr, st, cl)
 	cl.Start()
 	httpSrv := &http.Server{Handler: srv}

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"strconv"
 	"sync"
 	"time"
@@ -66,6 +67,22 @@ func New(self string, st *store.Store, cl *cluster.Cluster) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+
+// RequireInternalTLS wraps a handler so that /internal/* paths must
+// present a verified client certificate (mutual TLS). Public API
+// paths are unaffected. Use when serving with TLS; without TLS the
+// internal endpoints remain open (dev mode).
+func RequireInternalTLS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/internal/") {
+			if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+				writeJSON(w, 403, map[string]string{"error": "internal endpoints require a client certificate"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 func (s *Server) rebuildRing(addrs []string) {
 	nodes := append([]string{s.self}, addrs...)
