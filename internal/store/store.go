@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"microdb/internal/changelog"
 	"microdb/internal/index"
 	"microdb/internal/merkle"
 )
@@ -34,7 +35,11 @@ type Store struct {
 	f      *os.File
 	fsync  bool // sync to disk on every write (durability over throughput)
 	idx    *index.IndexSet // inverted field indexes (fast exact-match lookups)
+	log    *changelog.Log  // bounded mutation feed for watchers
 }
+
+// ChangeLog exposes the mutation feed (nil-safe: watchers just see no events).
+func (s *Store) ChangeLog() *changelog.Log { return s.log }
 
 // Indexes exposes the index set (enabled by default; pass false to OpenOpts to disable).
 func (s *Store) Indexes() *index.IndexSet { return s.idx }
@@ -59,7 +64,7 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{docs: map[string]*Doc{}, idx: index.NewSet(true)}
+	s := &Store{docs: map[string]*Doc{}, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute)}
 	path := filepath.Join(dir, "data.jsonl")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -150,6 +155,7 @@ func (s *Store) Apply(collection, id string, fields map[string]interface{}) (*Do
 	if err := s.sync(); err != nil {
 		return nil, err
 	}
+	s.log.Append(collection, id, "upsert", d)
 	return d, nil
 }
 
@@ -185,6 +191,9 @@ func (s *Store) ApplyBatch(collection string, docs map[string]map[string]interfa
 	if err := s.sync(); err != nil {
 		return nil, err
 	}
+	for _, d := range changed {
+		s.log.Append(d.Collection, d.ID, "upsert", d)
+	}
 	return out, nil
 }
 
@@ -203,7 +212,15 @@ func (s *Store) ApplyRemote(d *Doc) bool {
 	if _, err := s.f.Write(append(b, '\n')); err != nil {
 		return false
 	}
-	return s.sync() == nil
+	if s.sync() != nil {
+		return false
+	}
+	kind := "upsert"
+	if d.Deleted {
+		kind = "delete"
+	}
+	s.log.Append(d.Collection, d.ID, kind, d)
+	return true
 }
 
 func (s *Store) Get(collection, id string) (*Doc, bool) {
@@ -233,7 +250,11 @@ func (s *Store) Delete(collection, id string) error {
 	if _, err := s.f.Write(append(b, '\n')); err != nil {
 		return err
 	}
-	return s.sync()
+	if err := s.sync(); err != nil {
+		return err
+	}
+	s.log.Append(collection, id, "delete", nil)
+	return nil
 }
 
 // Scan walks a collection applying a filter.

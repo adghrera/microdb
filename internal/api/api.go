@@ -45,6 +45,7 @@ func New(self string, st *store.Store, cl *cluster.Cluster) *Server {
 	s.mux.HandleFunc("POST /api/collections/{col}/docs/batch", s.handleBatch)
 	s.mux.HandleFunc("DELETE /api/collections/{col}/docs/{id}", s.handleDelete)
 	s.mux.HandleFunc("GET /api/collections/{col}/docs", s.handleQuery)
+	s.mux.HandleFunc("GET /api/collections/{col}/watch", s.handleWatch)
 	s.mux.HandleFunc("GET /api/cluster", s.handleCluster)
 
 	// internal replication + membership endpoints
@@ -338,6 +339,56 @@ func (s *Server) gatherFrom(peer, col, filter string) ([]*store.Doc, error) {
 		return nil, err
 	}
 	return out.Docs, nil
+}
+
+// handleWatch: GET /api/collections/{col}/watch?since=<seq>&wait=30
+// Long-poll feed of local mutations (direct writes + replicated
+// applies observed by this node). Returns events with seq > since as
+// NDJSON, flushing as they arrive until the wait window closes.
+// Clients pass the last seq they saw; first call: since=0.
+func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	since := int64(0)
+	if v := r.URL.Query().Get("since"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad since"})
+			return
+		}
+		since = n
+	}
+	wait := 30 * time.Second
+	if v := r.URL.Query().Get("wait"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 300 {
+			writeJSON(w, 400, map[string]string{"error": "wait must be 1..300 seconds"})
+			return
+		}
+		wait = time.Duration(n) * time.Second
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, 500, map[string]string{"error": "streaming unsupported"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(200)
+	flusher.Flush() // send headers immediately so the client can start reading
+
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		evs := s.st.ChangeLog().WaitFiltered(col, since, remaining)
+		if len(evs) == 0 {
+			continue
+		}
+		for _, e := range evs {
+			b, _ := json.Marshal(e)
+			w.Write(append(b, '\n'))
+			since = e.Seq
+		}
+		flusher.Flush()
+	}
 }
 
 // handleInternalScan serves one shard of a scatter-gather query:
