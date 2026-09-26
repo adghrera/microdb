@@ -37,6 +37,7 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "PEM key for TLS")
 	tlsCA := flag.String("tls-ca", "", "PEM CA bundle to verify peer certs (mutual TLS)")
 	authToken := flag.String("auth-token", "", "require this bearer token on /api/* (empty = open)")
+	rf := flag.Int("rf", 3, "replication factor (ring owners per key)")
 	flag.Parse()
 
 	st, err := store.Open(*dir)
@@ -59,7 +60,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("cluster init: %v", err)
 	}
-	srv := api.New(self, st, cl)
+	srv := api.NewWithRF(self, st, cl, *rf)
 	cl.Start()
 	defer cl.Stop()
 
@@ -84,7 +85,7 @@ func main() {
 		}()
 	}
 
-	log.Printf("microdb node %s listening on %s (data: %s, tls=%v)", self, *addr, *dir, tlsOpts != nil)
+	log.Printf("microdb node %s listening on %s (data: %s, tls=%v, rf=%d)", self, *addr, *dir, tlsOpts != nil, *rf)
 	var handler http.Handler = srv
 	handler = api.RequireAPIAuth(*authToken, handler)
 	if tlsOpts != nil {

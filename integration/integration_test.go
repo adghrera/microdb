@@ -16,13 +16,18 @@ import (
 )
 
 type node struct {
-	addr string
-	st   *store.Store
-	cl   *cluster.Cluster
-	srv  *http.Server
+	addr    string
+	st      *store.Store
+	cl      *cluster.Cluster
+	srv     *http.Server
+	apiSrv  *api.Server
 }
 
 func startNode(t *testing.T, dir string) *node {
+	return startNodeRF(t, dir, 3)
+}
+
+func startNodeRF(t *testing.T, dir string, rf int) *node {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -37,11 +42,11 @@ func startNode(t *testing.T, dir string) *node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := api.New(addr, st, cl)
+	apiSrv := api.NewWithRF(addr, st, cl, rf)
 	cl.Start()
-	httpSrv := &http.Server{Handler: srv}
+	httpSrv := &http.Server{Handler: apiSrv}
 	go httpSrv.Serve(ln)
-	n := &node{addr: addr, st: st, cl: cl, srv: httpSrv}
+	n := &node{addr: addr, st: st, cl: cl, srv: httpSrv, apiSrv: apiSrv}
 	t.Cleanup(func() { cl.Stop(); httpSrv.Close(); st.Close() })
 	return n
 }

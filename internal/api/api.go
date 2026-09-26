@@ -31,7 +31,11 @@ type Server struct {
 	repl    chan replTask
 	mux     *http.ServeMux
 	fwdClient *http.Client
+	rf      int // replication factor (ring owners consulted per write)
 }
+
+// ReplicationFactor returns the configured RF.
+func (s *Server) ReplicationFactor() int { return s.rf }
 
 type replTask struct {
 	peer string
@@ -39,7 +43,15 @@ type replTask struct {
 }
 
 func New(self string, st *store.Store, cl *cluster.Cluster) *Server {
-	s := &Server{st: st, cl: cl, self: self, repl: make(chan replTask, 256), mux: http.NewServeMux(), fwdClient: &http.Client{Timeout: 5 * time.Second}}
+	return NewWithRF(self, st, cl, 3)
+}
+
+// NewWithRF builds a server with an explicit replication factor.
+func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Server {
+	if rf < 1 {
+		rf = 1
+	}
+	s := &Server{st: st, cl: cl, self: self, repl: make(chan replTask, 256), mux: http.NewServeMux(), fwdClient: &http.Client{Timeout: 5 * time.Second}, rf: rf}
 	s.ring = ring.Build([]string{self})
 	cl.OnPeersChanged = s.rebuildRing
 
@@ -127,6 +139,11 @@ func (s *Server) replicationWorker() {
 	}
 }
 
+// Owns reports whether this node is the primary owner of col/id.
+func (s *Server) Owns(col, id string) bool {
+	return s.owns(col + "/" + id)
+}
+
 // owns returns true if this node is the primary owner of the key.
 func (s *Server) owns(key string) bool {
 	owners := s.currentRing().Owners(key, 1)
@@ -135,7 +152,7 @@ func (s *Server) owns(key string) bool {
 
 func (s *Server) fanout(d *store.Doc) {
 	key := d.Collection + "/" + d.ID
-	for _, peer := range s.currentRing().Owners(key, 3) {
+	for _, peer := range s.currentRing().Owners(key, s.rf) {
 		if peer != s.self {
 			select {
 			case s.repl <- replTask{peer: peer, doc: d}:
