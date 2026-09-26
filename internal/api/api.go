@@ -4,13 +4,14 @@ package api
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"sort"
-	"strings"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,6 +80,24 @@ func RequireInternalTLS(next http.Handler) http.Handler {
 				writeJSON(w, 403, map[string]string{"error": "internal endpoints require a client certificate"})
 				return
 			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// RequireAPIAuth protects /api/* with a bearer token (constant-time
+// compared). /health stays open for load balancers. Empty token
+// disables the check entirely.
+func RequireAPIAuth(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token == "" || !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			writeJSON(w, 401, map[string]string{"error": "missing or invalid bearer token"})
+			return
 		}
 		next.ServeHTTP(w, r)
 	})

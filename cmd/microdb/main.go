@@ -36,6 +36,7 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "PEM cert for TLS (enables https)")
 	tlsKey := flag.String("tls-key", "", "PEM key for TLS")
 	tlsCA := flag.String("tls-ca", "", "PEM CA bundle to verify peer certs (mutual TLS)")
+	authToken := flag.String("auth-token", "", "require this bearer token on /api/* (empty = open)")
 	flag.Parse()
 
 	st, err := store.Open(*dir)
@@ -85,8 +86,9 @@ func main() {
 
 	log.Printf("microdb node %s listening on %s (data: %s, tls=%v)", self, *addr, *dir, tlsOpts != nil)
 	var handler http.Handler = srv
+	handler = api.RequireAPIAuth(*authToken, handler)
 	if tlsOpts != nil {
-		handler = api.RequireInternalTLS(srv)
+		handler = api.RequireInternalTLS(handler)
 		srvTLS, err := tlsOpts.ServerTLS()
 		if err != nil {
 			log.Fatalf("tls server config: %v", err)
