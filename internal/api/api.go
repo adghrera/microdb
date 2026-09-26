@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -52,6 +53,7 @@ func New(self string, st *store.Store, cl *cluster.Cluster) *Server {
 	s.mux.HandleFunc("GET /internal/collections", cl.HandleCollections)
 	s.mux.HandleFunc("GET /internal/merkle/{col}", cl.HandleMerkle)
 	s.mux.HandleFunc("POST /internal/antientropy", cl.HandleAntiEntropy)
+	s.mux.HandleFunc("GET /internal/scan/{col}", s.handleInternalScan)
 
 	go s.replicationWorker()
 	return s
@@ -187,9 +189,80 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 }
 
 // handleQuery: GET /api/collections/{col}/docs?filter=<url-encoded JSON>
-// Local scan on this node. In a sharded deployment a full-collection query
-// would scatter-gather across owners; kept local for simplicity.
+// Scatter-gather: the receiving node fans the query out to every live
+// cluster member (including itself), merges results by doc id keeping
+// the highest (ver, ts), and returns the union.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	var filter map[string]interface{}
+	if f := r.URL.Query().Get("filter"); f != "" {
+		if err := json.Unmarshal([]byte(f), &filter); err != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad filter JSON"})
+			return
+		}
+	}
+	keep := func(d *store.Doc) bool {
+		return len(filter) == 0 || store.Matches(d, filter)
+	}
+
+	// Gather from every member: self + peers.
+	members := append([]string{s.self}, s.cl.Peers()...)
+	merged := map[string]*store.Doc{}
+	var errs []string
+	for _, m := range members {
+		var docs []*store.Doc
+		if m == s.self {
+			docs = s.st.Scan(col, keep)
+		} else {
+			got, err := s.gatherFrom(m, col, r.URL.Query().Get("filter"))
+			if err != nil {
+				errs = append(errs, m+": "+err.Error())
+				continue
+			}
+			docs = got
+		}
+		for _, d := range docs {
+			if cur, ok := merged[d.ID]; !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS) {
+				merged[d.ID] = d
+			}
+		}
+	}
+	out := make([]*store.Doc, 0, len(merged))
+	for _, d := range merged {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	resp := map[string]interface{}{"count": len(out), "docs": out, "nodes_queried": len(members)}
+	if len(errs) > 0 {
+		resp["partial"] = true
+		resp["errors"] = errs
+	}
+	writeJSON(w, 200, resp)
+}
+
+// gatherFrom asks one peer for its local matching docs for a collection.
+func (s *Server) gatherFrom(peer, col, filter string) ([]*store.Doc, error) {
+	u := peer + "/internal/scan/" + col
+	if filter != "" {
+		u += "?filter=" + filter
+	}
+	resp, err := s.fwdClient.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Docs []*store.Doc `json:"docs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Docs, nil
+}
+
+// handleInternalScan serves one shard of a scatter-gather query:
+// local matching docs only, no further fanout.
+func (s *Server) handleInternalScan(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	var filter map[string]interface{}
 	if f := r.URL.Query().Get("filter"); f != "" {
@@ -201,7 +274,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	docs := s.st.Scan(col, func(d *store.Doc) bool {
 		return len(filter) == 0 || store.Matches(d, filter)
 	})
-	writeJSON(w, 200, map[string]interface{}{"count": len(docs), "docs": docs})
+	writeJSON(w, 200, map[string]interface{}{"docs": docs})
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
