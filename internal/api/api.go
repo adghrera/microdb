@@ -802,15 +802,40 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type gatherResult struct {
-		docs []*store.Doc
-		err  error
+		docs      []*store.Doc
+		truncated bool
+		err       error
+	}
+	// Pushdown: when the client asked for a bounded window, each shard
+	// returns only its top (offset+limit) docs in the requested order.
+	// The global top window is always contained in that union, so we
+	// transfer O(shards * window) instead of O(all docs).
+	pushdown := limit >= 0
+	capN := -1
+	if pushdown {
+		capN = offset + limit
 	}
 	gatherOne := func(m string) gatherResult {
 		if m == s.self {
-			return gatherResult{docs: s.st.ScanIndexed(col, filter)}
+			docs := s.st.ScanIndexed(col, filter)
+			trunc := false
+			if pushdown {
+				sort.SliceStable(docs, func(i, j int) bool {
+					c := store.CompareValues(docs[i].Fields[sortField], docs[j].Fields[sortField])
+					if desc {
+						return c > 0
+					}
+					return c < 0
+				})
+				if len(docs) > capN {
+					docs = docs[:capN]
+					trunc = true
+				}
+			}
+			return gatherResult{docs: docs, truncated: trunc}
 		}
-		docs, err := s.gatherFrom(m, col, r.URL.Query().Get("filter"))
-		return gatherResult{docs: docs, err: err}
+		docs, trunc, err := s.gatherFrom(m, col, r.URL.Query().Get("filter"), sortField, desc, capN)
+		return gatherResult{docs: docs, truncated: trunc, err: err}
 	}
 	hedged := hedgeMs > 0 && len(members) >= 2
 	results := make(chan gatherResult, len(members)*2)
@@ -858,10 +883,14 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	merged := map[string]*store.Doc{}
 	var errs []string
+	anyTruncated := false
 	for res := range results {
 		if res.err != nil {
 			errs = append(errs, res.err.Error())
 			continue
+		}
+		if res.truncated {
+			anyTruncated = true
 		}
 		for _, d := range res.docs {
 			if cur, ok := merged[d.ID]; !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS) {
@@ -901,6 +930,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		"docs":        out,
 		"nodes_queried": len(members),
 	}
+	// With pushdown the merged set may be a truncated view, so the
+	// pre-pagination total is a lower bound, not exact.
+	if anyTruncated {
+		resp["total_exact"] = false
+	} else {
+		resp["total_exact"] = true
+	}
 	if len(errs) > 0 {
 		resp["partial"] = true
 		resp["errors"] = errs
@@ -909,23 +945,38 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 // gatherFrom asks one peer for its local matching docs for a collection.
-func (s *Server) gatherFrom(peer, col, filter string) ([]*store.Doc, error) {
+// When cap >= 0 the peer sorts by sortField (desc per desc) and returns
+// only its top `cap` docs plus whether it truncated — the global
+// top-K always fits inside the union of per-shard top-K sets.
+func (s *Server) gatherFrom(peer, col, filter string, sortField string, desc bool, cap int) ([]*store.Doc, bool, error) {
 	u := peer + "/internal/scan/" + col
+	sep := "?"
 	if filter != "" {
-		u += "?filter=" + filter
+		u += sep + "filter=" + filter
+		sep = "&"
+	}
+	if cap >= 0 {
+		u += sep + "cap=" + strconv.Itoa(cap)
+		if sortField != "" {
+			u += "&sort=" + sortField
+		}
+		if desc {
+			u += "&desc=true"
+		}
 	}
 	resp, err := s.fwdClient.Get(u)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Docs []*store.Doc `json:"docs"`
+		Docs      []*store.Doc `json:"docs"`
+		Truncated bool       `json:"truncated"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return out.Docs, nil
+	return out.Docs, out.Truncated, nil
 }
 
 // handleWatch: GET /api/collections/{col}/watch?since=<seq>&wait=30
@@ -1005,6 +1056,14 @@ func (s *Server) handleInternalDoc(w http.ResponseWriter, r *http.Request) {
 
 // handleInternalScan serves one shard of a scatter-gather query:
 // local matching docs only, no further fanout.
+//
+// Pushdown: when the coordinator passes sort/desc/cap, this shard
+// sorts locally and returns only its top `cap` docs — the global
+// top-(offset+limit) is always contained in the union of the
+// per-shard top-(offset+limit), so the coordinator can merge a
+// small set instead of full shards. `total` reports the shard's FULL
+// match count (before truncation) so the coordinator's global total
+// stays exact.
 func (s *Server) handleInternalScan(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	var filter map[string]interface{}
@@ -1015,7 +1074,35 @@ func (s *Server) handleInternalScan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	docs := s.st.ScanIndexed(col, filter)
-	writeJSON(w, 200, map[string]interface{}{"docs": docs})
+	sortField := r.URL.Query().Get("sort")
+	desc := r.URL.Query().Get("desc") == "true"
+	capN := -1
+	if c := r.URL.Query().Get("cap"); c != "" {
+		n, err := strconv.Atoi(c)
+		if err != nil || n < 0 {
+			writeJSON(w, 400, map[string]string{"error": "bad cap"})
+			return
+		}
+		capN = n
+	}
+	total := len(docs)
+	truncated := false
+	if sortField != "" {
+		sort.SliceStable(docs, func(i, j int) bool {
+			c := store.CompareValues(docs[i].Fields[sortField], docs[j].Fields[sortField])
+			if desc {
+				return c > 0
+			}
+			return c < 0
+		})
+	} else {
+		sort.Slice(docs, func(i, j int) bool { return docs[i].ID < docs[j].ID })
+	}
+	if capN >= 0 && len(docs) > capN {
+		docs = docs[:capN]
+		truncated = true
+	}
+	writeJSON(w, 200, map[string]interface{}{"docs": docs, "total": total, "truncated": truncated})
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
