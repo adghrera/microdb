@@ -75,6 +75,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	s.mux.HandleFunc("POST /internal/replicate", cl.HandleReplicate)
 	s.mux.HandleFunc("POST /internal/replicate_bulk", cl.HandleReplicateBulk)
 	s.mux.HandleFunc("GET /internal/collections", cl.HandleCollections)
+	s.mux.HandleFunc("GET /internal/doc/{col}/{id}", s.handleInternalDoc)
 	s.mux.HandleFunc("GET /internal/merkle/{col}", cl.HandleMerkle)
 	s.mux.HandleFunc("GET /internal/merkle/{col}/meta", cl.HandleMerkleMeta)
 	s.mux.HandleFunc("GET /internal/merkle/{col}/node", cl.HandleMerkleNode)
@@ -126,7 +127,7 @@ func (s *Server) rebuildRing(addrs []string) {
 	nodes := append([]string{s.self}, addrs...)
 	s.ringMu.Lock()
 	defer s.ringMu.Unlock()
-	s.ring = ring.Build(nodes)
+	s.ring = ring.BuildWithEpoch(nodes, s.cl.Epoch())
 }
 
 func (s *Server) currentRing() *ring.Ring {
@@ -173,12 +174,92 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	id := r.PathValue("id")
+	consistency := r.URL.Query().Get("consistency")
+	if consistency == "quorum" || consistency == "all" {
+		s.quorumGet(w, col, id, consistency == "all")
+		return
+	}
 	d, ok := s.st.Get(col, id)
 	if !ok {
 		writeJSON(w, 404, map[string]string{"error": "not found"})
 		return
 	}
 	writeJSON(w, 200, d)
+}
+
+// quorumGet reads a doc from self + all live peers, merges by
+// (ver, ts), and returns the newest only if enough replicas answered.
+// Any replica seen to lag gets the newest version pushed to it
+// (read-repair) so the next read is consistent everywhere.
+func (s *Server) quorumGet(w http.ResponseWriter, col, id string, readAll bool) {
+	members := append([]string{s.self}, s.cl.Peers()...)
+	need := len(members)/2 + 1
+	if readAll {
+		need = len(members)
+	}
+	var newest *store.Doc
+	answered := 0
+	var errs []string
+	got := make(map[string]*store.Doc, len(members)) // member -> doc (nil = not found)
+	for _, m := range members {
+		d, err := s.fetchDocFrom(m, col, id)
+		if err != nil {
+			errs = append(errs, m+": "+err.Error())
+			continue
+		}
+		answered++
+		got[m] = d
+		if d != nil && (newest == nil || d.Ver > newest.Ver || (d.Ver == newest.Ver && d.TS > newest.TS)) {
+			newest = d
+		}
+	}
+	if answered < need {
+		writeJSON(w, 503, map[string]interface{}{
+			"error":    "quorum not reached",
+			"answered": answered,
+			"need":     need,
+			"errors":   errs,
+		})
+		return
+	}
+	if newest == nil {
+		writeJSON(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	// Read-repair: push the newest version to any replica that lacks it
+	// or holds a stale copy (using results already fetched — no re-reads).
+	for _, m := range members {
+		d := got[m]
+		if d == nil || d.Ver < newest.Ver || (d.Ver == newest.Ver && d.TS < newest.TS) {
+			go func(peer string) { _ = s.cl.Replicate(peer, newest) }(m)
+		}
+	}
+	writeJSON(w, 200, newest)
+}
+
+// fetchDocFrom reads one doc from a member (self or peer) without
+// forwarding — direct local read via the internal scan-by-id endpoint.
+func (s *Server) fetchDocFrom(member, col, id string) (*store.Doc, error) {
+	if member == s.self {
+		if d, ok := s.st.Get(col, id); ok {
+			return d, nil
+		}
+		return nil, nil
+	}
+	u := member + "/internal/doc/" + col + "/" + id
+	resp, err := s.fwdClient.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		return nil, nil
+	}
+	var d store.Doc
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		return nil, err
+	}
+	return &d, nil
 }
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
@@ -196,13 +277,51 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 	key := col + "/" + id
 	if !s.owns(key) {
-		s.forwardBytes(w, r, "PUT", "/api/collections/"+col+"/docs/"+id, body)
+		s.forwardBytes(w, r, "PUT", "/api/collections/"+col+"/docs/"+id, body, 0)
 		return
+	}
+	// Fencing: reject writes from a forwarder whose ring epoch is
+	// behind ours — its ownership view is stale and it must refresh.
+	if h := r.Header.Get("X-Microdb-Epoch"); h != "" {
+		if fwdEpoch, err := strconv.ParseInt(h, 10, 64); err == nil && fwdEpoch < s.currentRing().Epoch() {
+			writeJSON(w, 409, map[string]interface{}{"error": "stale ring epoch", "epoch": s.currentRing().Epoch()})
+			return
+		}
 	}
 	d, err := s.st.Apply(col, id, fields)
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
+	}
+	// Tunable write consistency: quorum writes block until W replicas
+	// (including this node's local apply) have acked.
+	if r.URL.Query().Get("consistency") == "quorum" {
+		members := s.currentRing().Owners(key, s.rf)
+		need := len(members)/2 + 1 // W = majority of the RF-owner set
+		acked := 1                 // local apply counts
+		var werrs []string
+		for _, peer := range members {
+			if peer == s.self || acked >= need {
+				continue
+			}
+			if err := s.cl.Replicate(peer, d); err != nil {
+				werrs = append(werrs, err.Error())
+				continue
+			}
+			acked++
+		}
+		if acked < need {
+			// The write IS applied locally and will converge via
+			// anti-entropy, but we cannot promise durability — say so.
+			writeJSON(w, 503, map[string]interface{}{
+				"error":    "write quorum not reached",
+				"acked":    acked,
+				"need":     need,
+				"applied":  true,
+				"errors":   werrs,
+			})
+			return
+		}
 	}
 	s.fanout(d)
 	writeJSON(w, 200, d)
@@ -242,7 +361,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	key := col + "/" + id
 	if !s.owns(key) {
-		s.forwardBytes(w, r, "DELETE", "/api/collections/"+col+"/docs/"+id, nil)
+		s.forwardBytes(w, r, "DELETE", "/api/collections/"+col+"/docs/"+id, nil, 0)
 		return
 	}
 	if err := s.st.Delete(col, id); err != nil {
@@ -254,8 +373,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 // forwardBytes proxies a write to the current ring-owner so any node can
 // accept any write. The body is passed as bytes (already read) so it can
-// be replayed to the owner. Bounded to one hop to avoid loops.
-func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, path string, body []byte) {
+// be replayed to the owner. The forwarder's ring epoch travels in a
+// header; if the owner is on a newer epoch it answers 409 + its epoch,
+// we adopt the epoch, rebuild our ring, and retry once. Bounded to one
+// hop otherwise to avoid loops.
+func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, path string, body []byte, attempt int) {
 	if r.Header.Get("X-Microdb-Hop") != "" {
 		writeJSON(w, 503, map[string]string{"error": "ownership unstable, retry"})
 		return
@@ -265,16 +387,39 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 		writeJSON(w, 503, map[string]string{"error": "no owner known"})
 		return
 	}
-	req, err := http.NewRequest(method, owner[0]+path, bytes.NewReader(body))
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, owner[0]+path, rdr)
 	if err != nil {
 		writeJSON(w, 502, map[string]string{"error": err.Error()})
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Microdb-Hop", "1")
+	req.Header.Set("X-Microdb-Epoch", strconv.FormatInt(s.currentRing().Epoch(), 10))
 	resp, err := s.fwdClient.Do(req)
 	if err != nil {
 		writeJSON(w, 502, map[string]string{"error": "forward failed: " + err.Error()})
+		return
+	}
+	// Fencing: the owner says our ownership view is stale.
+	if resp.StatusCode == 409 {
+		var fence struct {
+			Epoch int64 `json:"epoch"`
+		}
+		json.NewDecoder(resp.Body).Decode(&fence)
+		resp.Body.Close()
+		// Retry with a small budget: gossip can bump the epoch again
+		// between our adopt and our retry, so one shot isn't enough.
+		if fence.Epoch > s.currentRing().Epoch() && attempt < 3 {
+			s.cl.AdoptEpoch(fence.Epoch) // rebuilds ring via callback
+			time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
+			s.forwardBytes(w, r, method, path, body, attempt+1)
+			return
+		}
+		writeJSON(w, 503, map[string]interface{}{"error": "ownership unstable, retry", "epoch": fence.Epoch})
 		return
 	}
 	defer resp.Body.Close()
@@ -449,6 +594,19 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 		}
 		flusher.Flush()
 	}
+}
+
+// handleInternalDoc serves a single local doc for quorum reads by
+// peers. 404 when absent or tombstoned.
+func (s *Server) handleInternalDoc(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	id := r.PathValue("id")
+	d, ok := s.st.Get(col, id)
+	if !ok {
+		writeJSON(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSON(w, 200, d)
 }
 
 // handleInternalScan serves one shard of a scatter-gather query:

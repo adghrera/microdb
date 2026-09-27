@@ -96,6 +96,7 @@ type Cluster struct {
 	self    string
 	peers   map[string]time.Time // addr -> last seen (alive)
 	mu      sync.RWMutex
+	epoch   int64 // membership epoch; bumped on every membership change
 	st      *store.Store
 	client  *http.Client
 	stop    chan struct{}
@@ -131,10 +132,14 @@ func (c *Cluster) Join(seed string) error {
 	defer resp.Body.Close()
 	var out struct {
 		Members []Member `json:"members"`
+		Epoch   int64    `json:"epoch"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return err
 	}
+	c.mu.Lock()
+	c.adoptEpochLocked(out.Epoch)
+	c.mu.Unlock()
 	for _, m := range out.Members {
 		if m.Addr != c.self && m.TTL > time.Now().UnixMilli() {
 			c.seen(m.Addr)
@@ -152,7 +157,28 @@ func (c *Cluster) seen(addr string) bool {
 	defer c.mu.Unlock()
 	_, had := c.peers[addr]
 	c.peers[addr] = time.Now()
+	if !had {
+		c.epoch++ // membership changed — new fencing epoch
+	}
 	return !had
+}
+
+// Epoch returns the current membership epoch. Writes carry it so a node
+// whose view is behind can be fenced (EPOCH_MISMATCH) by the owner.
+func (c *Cluster) Epoch() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.epoch
+}
+
+// adoptEpochLocked raises our epoch to at least the peer's, returning
+// whether our view changed (caller may need to rebuild its ring).
+func (c *Cluster) adoptEpochLocked(peerEpoch int64) bool {
+	if peerEpoch > c.epoch {
+		c.epoch = peerEpoch
+		return true
+	}
+	return false
 }
 
 // Peers returns currently-alive peer addresses (excluding self).
@@ -464,9 +490,9 @@ func (c *Cluster) gossipRound() {
 	if c.seen(peer) {
 		changed = true
 	}
-	// Push our view, pull theirs.
+	// Push our view + epoch, pull theirs.
 	members := c.memberList()
-	body, _ := json.Marshal(map[string]interface{}{"addr": c.self, "members": members})
+	body, _ := json.Marshal(map[string]interface{}{"addr": c.self, "members": members, "epoch": c.Epoch()})
 	resp, err := c.client.Post(peer+"/internal/gossip", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return
@@ -474,6 +500,7 @@ func (c *Cluster) gossipRound() {
 	defer resp.Body.Close()
 	var out struct {
 		Members []Member `json:"members"`
+		Epoch   int64    `json:"epoch"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&out) != nil {
 		return
@@ -486,6 +513,13 @@ func (c *Cluster) gossipRound() {
 			}
 		}
 	}
+	// Adopt a higher epoch even if the member set looks identical to ours:
+	// a peer that saw a join/eviction we missed must pull us forward.
+	c.mu.Lock()
+	if c.adoptEpochLocked(out.Epoch) {
+		changed = true
+	}
+	c.mu.Unlock()
 	if changed && c.OnPeersChanged != nil {
 		c.OnPeersChanged(c.Peers())
 	}
@@ -501,15 +535,73 @@ func (c *Cluster) memberList() []Member {
 	return out
 }
 
+// Eviction also bumps the epoch and notifies: a node leaving is a
+// membership change exactly like one joining.
 func (c *Cluster) evict() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	changed := false
 	now := time.Now()
 	for a, t := range c.peers {
 		if now.Sub(t) > 15*time.Second {
 			delete(c.peers, a)
+			c.epoch++
+			changed = true
 		}
 	}
+	cb := c.OnPeersChanged
+	peers := c.peersLocked()
+	c.mu.Unlock()
+	if changed && cb != nil {
+		cb(peers)
+	}
+}
+
+// AdoptEpoch raises our epoch to at least n (never lowers) and fires
+// the membership callback so the ring is rebuilt with the new epoch.
+func (c *Cluster) AdoptEpoch(n int64) {
+	c.mu.Lock()
+	changed := c.adoptEpochLocked(n)
+	cb := c.OnPeersChanged
+	peers := c.peersLocked()
+	c.mu.Unlock()
+	if changed && cb != nil {
+		cb(peers)
+	}
+}
+
+// ForcePeer injects a peer address into the live set (test hook for
+// simulating unreachable members in quorum scenarios).
+func (c *Cluster) ForcePeer(addr string) {
+	c.mu.Lock()
+	c.peers[addr] = time.Now()
+	c.epoch++
+	c.mu.Unlock()
+}
+
+// BumpEpoch raises the membership epoch without changing the member
+// set (test hook: simulates having observed a membership change that
+// a peer hasn't seen yet). Fires the ring-rebuild callback.
+func (c *Cluster) BumpEpoch() {
+	c.mu.Lock()
+	c.epoch++
+	cb := c.OnPeersChanged
+	peers := c.peersLocked()
+	c.mu.Unlock()
+	if cb != nil {
+		cb(peers)
+	}
+}
+
+// peersLocked returns alive peers; caller holds c.mu (any mode).
+func (c *Cluster) peersLocked() []string {
+	now := time.Now()
+	out := make([]string, 0, len(c.peers))
+	for a, t := range c.peers {
+		if now.Sub(t) < 15*time.Second {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // Replicate sends a doc to a peer; fire-and-forget with one retry.
@@ -537,9 +629,13 @@ func (e *PeerError) Error() string { return "replicate failed: " + e.peer }
 // HandleJoin / HandleGossip / HandleReplicate wire into the HTTP mux.
 func (c *Cluster) HandleJoin(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Addr string `json:"addr"`
+		Addr  string `json:"addr"`
+		Epoch int64  `json:"epoch"`
 	}
 	json.NewDecoder(r.Body).Decode(&in)
+	c.mu.Lock()
+	c.adoptEpochLocked(in.Epoch)
+	c.mu.Unlock()
 	if in.Addr != "" && in.Addr != c.self {
 		if c.seen(in.Addr) && c.OnPeersChanged != nil {
 			// A new node joined us directly — our ring must learn it now,
@@ -547,22 +643,26 @@ func (c *Cluster) HandleJoin(w http.ResponseWriter, r *http.Request) {
 			c.OnPeersChanged(c.Peers())
 		}
 	}
-	writeJSON(w, 200, map[string]interface{}{"members": c.memberList()})
+	writeJSON(w, 200, map[string]interface{}{"members": c.memberList(), "epoch": c.Epoch()})
 }
 
 func (c *Cluster) HandleGossip(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Addr    string   `json:"addr"`
 		Members []Member `json:"members"`
+		Epoch   int64    `json:"epoch"`
 	}
 	json.NewDecoder(r.Body).Decode(&in)
+	c.mu.Lock()
+	c.adoptEpochLocked(in.Epoch)
+	c.mu.Unlock()
 	now := time.Now().UnixMilli()
 	for _, m := range in.Members {
 		if m.Addr != c.self && m.TTL > now {
 			c.seen(m.Addr)
 		}
 	}
-	writeJSON(w, 200, map[string]interface{}{"members": c.memberList()})
+	writeJSON(w, 200, map[string]interface{}{"members": c.memberList(), "epoch": c.Epoch()})
 }
 
 func (c *Cluster) HandleReplicate(w http.ResponseWriter, r *http.Request) {
