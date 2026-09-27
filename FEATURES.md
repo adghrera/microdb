@@ -40,7 +40,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [x] | **HTTP API versioning** `/v1/api/...` (Tier 4) | 2 | Dual-registered routes; auth parity tested |
 | [x] | **Docker + compose** 3-node cluster (Tier 4) | 4 | ⚠️ files shipped; no Docker daemon in build env to run them |
 | [x] | **README + architecture doc** (Tier 4) | 4 | `README.md` |
-| [x] | **`-race` clean test runs** (Tier 4) | 4 | ⚠️ requires mingw64 toolchain: `CC='C:\w\msys64\mingw64\bin\gcc.exe' CGO_ENABLED=1 go test -race ./...` (MSYS gcc can't build Go's cgo shim) |
+| [x] | **`-race` clean test runs** (Tier 4) | 4 | ✅ verified race-clean at 40 features: `CC='C:\w\msys64\mingw64\bin\gcc.exe' CGO_ENABLED=1 go test -race ./...` (MSYS gcc can't build Go's cgo shim — use mingw64) |
 | [x] | **Ring epochs + write fencing** (Roadmap A2) | 9 | Epoch bumped on join/evict, gossiped + adopted monotonically; forwarded writes carry `X-Microdb-Epoch`, stale forwarders get 409 → adopt → retry. `TestFencingStaleEpoch`, `TestEpochPropagation` |
 | [x] | **Quorum reads + read-repair** (Roadmap D1/D4) | 8 | `?consistency=quorum|all` merges replicas by (ver,ts), 503 if quorum unreachable, async repair pushes newest to lagging replicas. `TestQuorumRead`, `TestQuorumReadNotReached` |
 | [x] | **Quorum writes** (Roadmap D1) | 8 | `?consistency=quorum` blocks until W=majority of RF-owner set acked; honest 503 (`applied:true`) when not reached |
@@ -191,6 +191,18 @@ e4fe4f1     api: /v1 versioned routes alongside unversioned
 9566790     api+cluster+ring: quorum reads/writes, ring epochs, write fencing
 b2f9c64     hints: durable hinted handoff for failed replication
 bcd684c     cluster+api: graceful decommission with leave tombstones
+b37b9c6     api: full tunable consistency + hedged scatter-gather
+2f03c76     store+cli: point-in-time recovery (PITR)
+39f1785     cluster+store: bootstrap streaming on join + admission control
+8bbea73     client+api: shard-map aware routing (B4)
+6d7f850     api: backpressure (E2) + request tracing (E5)
+001c511     store+api: per-collection replication factor (E3)
+47f43f7     store: AES-256-GCM encryption at rest (E4)
 ```
 
-**Coverage:** 29 shipped; roadmap items A2, A3, D1 (quorum), D3, D4 now done.
+**Coverage:** 40 shipped. Roadmap done: A1, A2, A3, A6, B4, B5, D1–D5, E2–E5.
+Remaining roadmap items (A4/A5, B1–B3, C1–C7, D6, E1, E6) are the
+storage/compute disaggregation and tenancy layers that FEATURES.md's scope
+note flags as a rewrite of the ownership/data-placement core — deliberately
+out of scope for "tiny". All shipped features verified: full suite green +
+`-race` clean + live 3-node cluster runs (decommission, PITR, encryption).
