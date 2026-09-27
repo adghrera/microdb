@@ -168,3 +168,44 @@ func TestArchiveNaming(t *testing.T) {
 		t.Fatalf("archive naming wrong: %v", entries)
 	}
 }
+
+func TestDurableFeedSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnableDurableFeed(); err != nil {
+		t.Fatal(err)
+	}
+	st.Apply("c", "a", map[string]interface{}{"v": 1})
+	st.Apply("c", "b", map[string]interface{}{"v": 2})
+	st.Delete("c", "a")
+	head := st.ChangeLog().Head()
+	if head != 3 {
+		t.Fatalf("head=%d want 3", head)
+	}
+	st.Close()
+
+	// Reopen: docs replay from data.jsonl, feed events from feed.jsonl.
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	if err := st2.EnableDurableFeed(); err != nil {
+		t.Fatal(err)
+	}
+	evs := st2.ChangeLog().Since(0)
+	if len(evs) != 3 {
+		t.Fatalf("feed events lost across restart: %v", evs)
+	}
+	if evs[0].ID != "a" || evs[0].Kind != "upsert" || evs[2].Kind != "delete" {
+		t.Fatalf("feed order/kind wrong: %v", evs)
+	}
+	// New writes continue the sequence.
+	st2.Apply("c", "c", map[string]interface{}{"v": 3})
+	if st2.ChangeLog().Head() != 4 {
+		t.Fatalf("post-restart seq: %d want 4", st2.ChangeLog().Head())
+	}
+}

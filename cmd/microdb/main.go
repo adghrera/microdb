@@ -50,6 +50,7 @@ func main() {
 	clusterName := flag.String("cluster-name", "", "cluster identity guard: nodes only join peers with the same name")
 	jsonLog := flag.Bool("json-log", false, "emit structured JSON logs")
 	idemTTL := flag.Duration("idempotency-ttl", 10*time.Minute, "dedupe window for Idempotency-Key retries (0 disables)")
+	durableFeed := flag.Bool("durable-feed", false, "persist the watch change feed to disk (cursors survive restart, 24h retention)")
 	flag.Parse()
 
 	if *jsonLog {
@@ -60,6 +61,11 @@ func main() {
 	st, err := store.OpenWithKey(*dir, *encKey)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
+	}
+	if *durableFeed {
+		if err := st.EnableDurableFeed(); err != nil {
+			log.Fatalf("enable durable feed: %v", err)
+		}
 	}
 	st.SetFsync(*fsync)
 	defer st.Close()

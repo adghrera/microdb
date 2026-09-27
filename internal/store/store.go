@@ -50,6 +50,21 @@ type Store struct {
 // ChangeLog exposes the mutation feed (nil-safe: watchers just see no events).
 func (s *Store) ChangeLog() *changelog.Log { return s.log }
 
+// EnableDurableFeed switches the mutation feed from the in-memory
+// window to a durable JSONL-backed feed at <dir>/feed.jsonl. Must be
+// called right after Open, before any writes (events already recorded
+// in this process would not be on disk). Once enabled, watcher
+// cursors survive node restarts within the retention window.
+func (s *Store) EnableDurableFeed() error {
+	d := filepath.Dir(s.path)
+	dl, err := changelog.Open(filepath.Join(d, "feed.jsonl"), 10000, 24*time.Hour)
+	if err != nil {
+		return err
+	}
+	s.log = dl
+	return nil
+}
+
 // Indexes exposes the index set (enabled by default; pass false to OpenOpts to disable).
 func (s *Store) Indexes() *index.IndexSet { return s.idx }
 
@@ -445,7 +460,12 @@ func (s *Store) ScanIndexed(collection string, filter map[string]interface{}) []
 	})
 }
 
-func (s *Store) Close() error { return s.f.Close() }
+func (s *Store) Close() error {
+	if s.log != nil {
+		s.log.Close()
+	}
+	return s.f.Close()
+}
 
 // Compact rewrites the JSONL log keeping only the current version of
 // each live document. Tombstones older than gcWindow are dropped
