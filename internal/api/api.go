@@ -152,6 +152,12 @@ func (s *Server) Owns(col, id string) bool {
 	return s.owns(col + "/" + id)
 }
 
+// OwnerSet returns the RF-owner set for col/id under the current ring
+// (exposed for tests and admin tooling).
+func (s *Server) OwnerSet(col, id string) []string {
+	return s.currentRing().Owners(col+"/"+id, s.rf)
+}
+
 // owns returns true if this node is the primary owner of the key.
 func (s *Server) owns(key string) bool {
 	owners := s.currentRing().Owners(key, 1)
@@ -178,8 +184,17 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	id := r.PathValue("id")
 	consistency := r.URL.Query().Get("consistency")
-	if consistency == "quorum" || consistency == "all" {
+	switch consistency {
+	case "quorum", "all":
 		s.quorumGet(w, col, id, consistency == "all")
+		return
+	case "one", "local_quorum", "local_one", "":
+		// 'one' / 'local_quorum' on a read both mean: answer from the
+		// local replica, no cross-node round-trips. (Cassandra's
+		// LOCAL_QUORUM read differs from ONE only across replicas of
+		// the local DC; single-DC microdb collapses them.)
+	default:
+		writeJSON(w, 400, map[string]string{"error": "unknown consistency: use one|quorum|all|local_quorum"})
 		return
 	}
 	d, ok := s.st.Get(col, id)
@@ -300,12 +315,19 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	// Tunable write consistency: quorum writes block until W replicas
-	// (including this node's local apply) have acked.
-	if r.URL.Query().Get("consistency") == "quorum" {
+	// Tunable write consistency:
+	//   one          — local apply only; replicas converge async (default)
+	//   quorum       — block until W = majority of the RF-owner set acked
+	//   local_quorum — same as quorum in single-DC microdb
+	//   all          — block until every RF owner acked
+	consistency := r.URL.Query().Get("consistency")
+	if consistency == "quorum" || consistency == "all" || consistency == "local_quorum" {
 		members := s.currentRing().Owners(key, s.rf)
 		need := len(members)/2 + 1 // W = majority of the RF-owner set
-		acked := 1                 // local apply counts
+		if consistency == "all" {
+			need = len(members)
+		}
+		acked := 1 // local apply counts
 		var werrs []string
 		for _, peer := range members {
 			if peer == s.self || acked >= need {
@@ -319,7 +341,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		}
 		if acked < need {
 			// The write IS applied locally and will converge via
-			// anti-entropy, but we cannot promise durability — say so.
+			// anti-entropy/hints, but we cannot promise durability — say so.
 			writeJSON(w, 503, map[string]interface{}{
 				"error":    "write quorum not reached",
 				"acked":    acked,
@@ -329,6 +351,9 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+	} else if consistency != "" && consistency != "one" {
+		writeJSON(w, 400, map[string]string{"error": "unknown consistency: use one|quorum|all|local_quorum"})
+		return
 	}
 	s.fanout(d)
 	writeJSON(w, 200, d)
@@ -485,23 +510,85 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		offset = n
 	}
 
-	// Gather from every member: self + peers.
+	// Gather from every member concurrently: self + peers. Peer
+	// gathers run in parallel; if a peer hasn't answered within the
+	// hedge window we fire a duplicate gather at another member and
+	// take whichever response arrives first (hedged reads — the
+	// standard tail-latency trick for cross-shard scans).
 	members := append([]string{s.self}, s.cl.Peers()...)
+	hedgeMs := 0
+	if h := r.URL.Query().Get("hedge_ms"); h != "" {
+		n, err := strconv.Atoi(h)
+		if err != nil || n < 10 {
+			writeJSON(w, 400, map[string]string{"error": "bad hedge_ms (min 10)"})
+			return
+		}
+		hedgeMs = n
+	}
+
+	type gatherResult struct {
+		docs []*store.Doc
+		err  error
+	}
+	gatherOne := func(m string) gatherResult {
+		if m == s.self {
+			return gatherResult{docs: s.st.ScanIndexed(col, filter)}
+		}
+		docs, err := s.gatherFrom(m, col, r.URL.Query().Get("filter"))
+		return gatherResult{docs: docs, err: err}
+	}
+	hedged := hedgeMs > 0 && len(members) >= 2
+	results := make(chan gatherResult, len(members)*2)
+	var wg sync.WaitGroup
+	for i, m := range members {
+		wg.Add(1)
+		go func(m string, idx int) {
+			defer wg.Done()
+			if !hedged {
+				results <- gatherOne(m)
+				return
+			}
+			// Primary with a hedge timer.
+			primary := make(chan gatherResult, 1)
+			go func() { primary <- gatherOne(m) }()
+			timer := time.NewTimer(time.Duration(hedgeMs) * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case res := <-primary:
+				results <- res
+			case <-timer.C:
+				// Slow tail: duplicate the gather at another member.
+				hedgeTarget := members[(idx+1)%len(members)]
+				secondary := make(chan gatherResult, 1)
+				go func() {
+					res := gatherOne(hedgeTarget)
+					// A failed hedge must not mark the whole response
+					// partial — the primary still reports its own
+					// outcome, and the hedge target's own primary
+					// gather covers its shard.
+					if res.err == nil {
+						secondary <- res
+					}
+				}()
+				select {
+				case res := <-primary:
+					results <- res
+				case res := <-secondary:
+					results <- res
+				}
+			}
+		}(m, i)
+	}
+	go func() { wg.Wait(); close(results) }()
+
 	merged := map[string]*store.Doc{}
 	var errs []string
-	for _, m := range members {
-		var docs []*store.Doc
-		if m == s.self {
-			docs = s.st.ScanIndexed(col, filter)
-		} else {
-			got, err := s.gatherFrom(m, col, r.URL.Query().Get("filter"))
-			if err != nil {
-				errs = append(errs, m+": "+err.Error())
-				continue
-			}
-			docs = got
+	for res := range results {
+		if res.err != nil {
+			errs = append(errs, res.err.Error())
+			continue
 		}
-		for _, d := range docs {
+		for _, d := range res.docs {
 			if cur, ok := merged[d.ID]; !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS) {
 				merged[d.ID] = d
 			}
