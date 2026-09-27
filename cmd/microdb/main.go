@@ -42,6 +42,8 @@ func main() {
 	rf := flag.Int("rf", 3, "replication factor (ring owners per key)")
 	archiveDir := flag.String("archive-dir", "", "continuously archive the raw commit log here (PITR)")
 	archiveInterval := flag.Duration("archive-interval", 60*time.Second, "how often to write a raw-log archive (with --archive-dir)")
+	maxInflight := flag.Int64("max-inflight", 0, "shed load with 429 above this many concurrent requests (0 = unlimited)")
+	traceSlowMs := flag.Int64("trace-slow-ms", 500, "log requests slower than this with their trace id")
 	flag.Parse()
 
 	st, err := store.Open(*dir)
@@ -133,6 +135,10 @@ func main() {
 	log.Printf("microdb node %s listening on %s (data: %s, tls=%v, rf=%d)", self, *addr, *dir, tlsOpts != nil, *rf)
 	var handler http.Handler = srv
 	handler = api.RequireAPIAuth(*authToken, handler)
+	if *maxInflight > 0 {
+		handler = api.Backpressure(*maxInflight, handler)
+	}
+	handler = api.Tracing(*traceSlowMs, handler) // outermost: every request gets a trace id
 	if tlsOpts != nil {
 		handler = api.RequireInternalTLS(handler)
 		srvTLS, err := tlsOpts.ServerTLS()

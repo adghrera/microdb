@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -109,6 +110,76 @@ func RequireInternalTLS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// Backpressure sheds load before the cluster melts: at most maxInflight
+// requests are processed concurrently; over-cap requests get an
+// immediate 429 + Retry-After instead of queueing until everything
+// times out. /health is never shed (load balancers must see the node).
+func Backpressure(maxInflight int64, next http.Handler) http.Handler {
+	var inflight atomic.Int64
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		cur := inflight.Add(1)
+		if cur > maxInflight {
+			inflight.Add(-1)
+			atomic.AddInt64(metrics.Default.Counter("microdb_shed_total", "Requests shed by backpressure"), 1)
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, 429, map[string]interface{}{
+				"error":    "server busy, retry later",
+				"inflight": cur - 1,
+				"limit":    maxInflight,
+			})
+			return
+		}
+		atomic.StoreInt64(metrics.Default.Gauge("microdb_inflight", "Requests currently in flight"), inflight.Load())
+		defer func() {
+			inflight.Add(-1)
+			atomic.StoreInt64(metrics.Default.Gauge("microdb_inflight", "Requests currently in flight"), inflight.Load())
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Tracing assigns a trace ID to every request (honoring an incoming
+// X-Trace-Id from the client for cross-service correlation), times the
+// request, logs slow requests, and echoes the ID back. Latency is
+// bucketed into metrics so tail causes are findable.
+func Tracing(slowMs int64, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		traceID := r.Header.Get("X-Trace-Id")
+		if traceID == "" {
+			traceID = newTraceID()
+		}
+		w.Header().Set("X-Trace-Id", traceID)
+		next.ServeHTTP(w, r)
+		elapsed := time.Since(start)
+		atomic.AddInt64(metrics.Default.Counter("microdb_requests_total", "Requests served"), 1)
+		// Rough latency buckets: fast (<50ms), slow (<500ms), very slow.
+		switch {
+		case elapsed < 50*time.Millisecond:
+			atomic.AddInt64(metrics.Default.Counter("microdb_latency_fast_total", "Requests under 50ms"), 1)
+		case elapsed < 500*time.Millisecond:
+			atomic.AddInt64(metrics.Default.Counter("microdb_latency_slow_total", "Requests 50-500ms"), 1)
+		default:
+			atomic.AddInt64(metrics.Default.Counter("microdb_latency_very_slow_total", "Requests over 500ms"), 1)
+			log.Printf("slow request trace=%s %s %s took %s", traceID, r.Method, r.URL.Path, elapsed)
+		}
+		if elapsed > time.Duration(slowMs)*time.Millisecond {
+			log.Printf("trace=%s SLOW-MARK %s %s %s", traceID, r.Method, r.URL.Path, elapsed)
+		}
+	})
+}
+
+var traceCounter atomic.Int64
+
+func newTraceID() string {
+	n := traceCounter.Add(1)
+	return fmt.Sprintf("%x-%x", time.Now().UnixNano(), n)
 }
 
 // RequireAPIAuth protects /api/* with a bearer token (constant-time
