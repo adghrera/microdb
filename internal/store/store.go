@@ -35,6 +35,7 @@ type Doc struct {
 type Store struct {
 	mu     sync.RWMutex
 	docs   map[string]*Doc // key = collection + "\x00" + id
+	path   string          // absolute path of the JSONL commit log
 	f      *os.File
 	fsync  bool // sync to disk on every write (durability over throughput)
 	idx    *index.IndexSet // inverted field indexes (fast exact-match lookups)
@@ -67,8 +68,8 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{docs: map[string]*Doc{}, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute)}
 	path := filepath.Join(dir, "data.jsonl")
+	s := &Store{docs: map[string]*Doc{}, path: path, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute)}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -464,6 +465,126 @@ func (s *Store) AllDocs() []*Doc {
 		return docs[i].ID < docs[j].ID
 	})
 	return docs
+}
+
+// ArchiveRaw copies the raw commit log (full version history, not the
+// current-state snapshot) to w. Because the log is append-only, any
+// copy taken at any instant is a valid prefix of history — i.e. a
+// point-in-time snapshot. Safe under concurrent writes (read lock).
+func (s *Store) ArchiveRaw(w io.Writer) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// Re-read the log from the start: s.f is positioned at the tail
+	// for appending, so use a separate handle.
+	f, err := os.Open(s.path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(w, f)
+	return err
+}
+
+// ReplayUntil replays a commit log (as produced by ArchiveRaw) into a
+// fresh store, applying only records whose TS is <= until. Returns the
+// new store and the number of records applied. The target dir must be
+// empty or new. This is the point-in-time recovery primitive: the
+// state at time T = replay of every log record with TS <= T.
+//
+// NOTE: the recoverable window is bounded by compaction — compaction
+// rewrites the log keeping only current versions, so history older
+// than the last compaction is gone. Archive frequently to widen it.
+func ReplayUntil(r io.Reader, until int64, dir string) (*Store, int, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, 0, err
+	}
+	s := &Store{docs: map[string]*Doc{}, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute), path: filepath.Join(dir, "data.jsonl")}
+	// Fresh log file for the recovered store.
+	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.f = f
+	bw := bufio.NewWriterSize(f, 1<<20)
+	br := bufio.NewReaderSize(r, 1<<20)
+	applied := 0
+	for {
+		line, rerr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			trimmed := strings.TrimSpace(string(line))
+			if trimmed != "" {
+				// Batch record or single doc — filter each doc by TS.
+				if strings.HasPrefix(trimmed, `{"batch":`) {
+					var rec struct {
+						Batch []*Doc `json:"batch"`
+					}
+					if json.Unmarshal([]byte(trimmed), &rec) == nil {
+						for _, d := range rec.Batch {
+							if d.TS > until {
+								continue
+							}
+							if s.merge(d) {
+								s.idx.For(d.Collection).Remove(d.ID)
+								if !d.Deleted {
+									s.idx.For(d.Collection).Add(d.ID, d.Fields)
+								}
+								kind := "put"
+								var fld map[string]interface{}
+								if d.Deleted {
+									kind = "delete"
+								} else {
+									fld = d.Fields
+								}
+								s.log.Append(d.Collection, d.ID, kind, fld)
+								// Persist the replayed record so the
+								// recovered store survives restart.
+								if b, err := json.Marshal(d); err == nil {
+									bw.Write(b)
+									bw.WriteByte('\n')
+								}
+								applied++
+							}
+						}
+					}
+				} else {
+					var d Doc
+					if json.Unmarshal([]byte(trimmed), &d) == nil && d.TS <= until {
+						if s.merge(&d) {
+							s.idx.For(d.Collection).Remove(d.ID)
+							if !d.Deleted {
+								s.idx.For(d.Collection).Add(d.ID, d.Fields)
+							}
+							kind := "put"
+							var fld map[string]interface{}
+							if d.Deleted {
+								kind = "delete"
+							} else {
+								fld = d.Fields
+							}
+							s.log.Append(d.Collection, d.ID, kind, fld)
+							if b, err := json.Marshal(d); err == nil {
+								bw.Write(b)
+								bw.WriteByte('\n')
+							}
+							applied++
+						}
+					}
+				}
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	return s, applied, nil
 }
 
 // Backup writes a snapshot of the current in-memory state to w as

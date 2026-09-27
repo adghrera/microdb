@@ -20,6 +20,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,6 +40,8 @@ func main() {
 	tlsCA := flag.String("tls-ca", "", "PEM CA bundle to verify peer certs (mutual TLS)")
 	authToken := flag.String("auth-token", "", "require this bearer token on /api/* (empty = open)")
 	rf := flag.Int("rf", 3, "replication factor (ring owners per key)")
+	archiveDir := flag.String("archive-dir", "", "continuously archive the raw commit log here (PITR)")
+	archiveInterval := flag.Duration("archive-interval", 60*time.Second, "how often to write a raw-log archive (with --archive-dir)")
 	flag.Parse()
 
 	st, err := store.Open(*dir)
@@ -68,6 +72,37 @@ func main() {
 	srv := api.NewWithRF(self, st, cl, *rf)
 	cl.Start()
 	defer cl.Stop()
+
+	// Continuous PITR archiving: every interval, copy the raw commit
+	// log (full history) to the archive dir under a timestamped name.
+	// Recovery: microctl pitr --in <archive> --until <ts> --dir <new>.
+	if *archiveDir != "" {
+		if err := os.MkdirAll(*archiveDir, 0o755); err != nil {
+			log.Fatalf("archive dir: %v", err)
+		}
+		go func() {
+			t := time.NewTicker(*archiveInterval)
+			defer t.Stop()
+			archiveOnce := func() {
+				name := time.Now().UTC().Format("20060102T150405.000") + ".jsonl"
+				f, err := os.Create(filepath.Join(*archiveDir, name))
+				if err != nil {
+					log.Printf("archive create: %v", err)
+					return
+				}
+				defer f.Close()
+				if err := st.ArchiveRaw(f); err != nil {
+					log.Printf("archive copy: %v", err)
+					return
+				}
+				log.Printf("archived commit log -> %s", name)
+			}
+			archiveOnce() // one immediately at startup
+			for range t.C {
+				archiveOnce()
+			}
+		}()
+	}
 
 	if *join != "" {
 		seeds := strings.Split(*join, ",")

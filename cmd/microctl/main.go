@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"microdb/internal/store"
@@ -25,7 +26,8 @@ func main() {
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	dir := fs.String("dir", "./data", "data directory")
 	out := fs.String("out", "", "output file (backup)")
-	in := fs.String("in", "", "input file (restore)")
+	in := fs.String("in", "", "input file (restore/pitr)")
+	until := fs.String("until", "", "recovery point: unix millis or RFC3339 (pitr)")
 	url := fs.String("url", "http://127.0.0.1:8001", "node base URL (status)")
 	fs.Parse(os.Args[2:])
 
@@ -98,6 +100,35 @@ func main() {
 		}
 		fmt.Printf("node drained: %s\n", body)
 		fmt.Println("safe to stop the microdb process now")
+	case "pitr":
+		// Point-in-time recovery: replay a raw commit-log archive
+		// (see --archive-dir on the server) into a NEW data dir,
+		// applying only records with TS <= --until.
+		if *in == "" || *until == "" {
+			fmt.Fprintln(os.Stderr, "pitr requires --in <raw-log> --until <RFC3339|unix-millis> --dir <new-dir>")
+			os.Exit(2)
+		}
+		var untilMs int64
+		if ms, err := strconv.ParseInt(*until, 10, 64); err == nil {
+			untilMs = ms
+		} else {
+			t, err := time.Parse(time.RFC3339, *until)
+			if err != nil {
+				fatal(fmt.Errorf("--until must be unix millis or RFC3339: %w", err))
+			}
+			untilMs = t.UnixMilli()
+		}
+		f, err := os.Open(*in)
+		if err != nil {
+			fatal(err)
+		}
+		defer f.Close()
+		st, n, err := store.ReplayUntil(f, untilMs, *dir)
+		if err != nil {
+			fatal(err)
+		}
+		defer st.Close()
+		fmt.Printf("PITR: replayed %d records (TS <= %d) into %s — %d docs live\n", n, untilMs, *dir, st.DocCount())
 	default:
 		usage()
 		os.Exit(2)
