@@ -83,6 +83,8 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	s.mux.HandleFunc("POST /internal/antientropy", cl.HandleAntiEntropy)
 	s.mux.HandleFunc("POST /internal/leave", cl.HandleLeave)
 	s.mux.HandleFunc("POST /internal/decommission", cl.HandleDecommission)
+	s.mux.HandleFunc("GET /internal/stream/{col}", cl.HandleStream)
+	s.mux.HandleFunc("GET /internal/bootstrap", cl.HandleBootstrapStatus)
 	s.mux.HandleFunc("GET /internal/hints", cl.HandleHints)
 	s.mux.HandleFunc("GET /internal/scan/{col}", s.handleInternalScan)
 

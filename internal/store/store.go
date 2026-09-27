@@ -416,6 +416,30 @@ func (s *Store) Collections() []string {
 	return out
 }
 
+// StreamCollection returns up to `limit` docs from a collection
+// (tombstones included) with ID > after, sorted by ID. Paginated
+// snapshot for bootstrap streaming; taken under the read lock so it
+// is consistent while writes continue.
+func (s *Store) StreamCollection(collection, after string, limit int) []*Doc {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	all := make([]*Doc, 0, 64)
+	for _, d := range s.docs {
+		if d.Collection != collection {
+			continue
+		}
+		if after != "" && d.ID <= after {
+			continue
+		}
+		all = append(all, d)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all
+}
+
 // Leaves returns (id, hash) pairs for every doc in a collection,
 // tombstones included so deletions participate in the Merkle tree.
 func (s *Store) Leaves(collection string) []merkle.Leaf {

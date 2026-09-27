@@ -109,6 +109,8 @@ func main() {
 		go func() {
 			// Retry seeds until one answers — gossip only spreads among
 			// known peers, so the first successful join is critical.
+			// Join now also streams the seed's data (bootstrap) before
+			// returning success.
 			for {
 				for _, seed := range seeds {
 					seed = strings.TrimSpace(seed)
@@ -123,6 +125,9 @@ func main() {
 				time.Sleep(time.Second)
 			}
 		}()
+	} else {
+		// No seed: standalone node, nothing to stream.
+		cl.MarkBootstrapped()
 	}
 
 	log.Printf("microdb node %s listening on %s (data: %s, tls=%v, rf=%d)", self, *addr, *dir, tlsOpts != nil, *rf)

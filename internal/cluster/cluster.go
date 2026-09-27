@@ -108,6 +108,15 @@ type Cluster struct {
 	// refuses new writes while its data is handed off to the remaining
 	// peers.
 	draining bool
+	// bootstrapped is false from process start until the first join
+	// has completed its immediate full sync ("streaming" phase).
+	// While false the node accepts writes but reports streaming=true
+	// so clients/ops know reads may be stale.
+	bootstrapped atomic.Bool
+	// activeBootstraps counts join requests we are currently serving
+	// with an immediate sync (admission control on the seed side).
+	activeBootstraps atomic.Int64
+	maxBootstraps    int64
 	// left holds addresses that gracefully departed, with the time of
 	// departure. Gossip must not resurrect them for the tombstone
 	// window (longer than gossip convergence), but an explicit Join
@@ -132,8 +141,12 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 		peers:  map[string]time.Time{},
 		left:   map[string]time.Time{},
 		st:     st,
-		client: &http.Client{Timeout: 3 * time.Second, Transport: transport},
+		client: &http.Client{Timeout: 30 * time.Second, Transport: transport},
 		stop:   make(chan struct{}),
+		// Bootstrap streams can be large; 30s client timeout covers
+		// them. Admission: serve at most 2 concurrent bootstrap
+		// streams as a seed.
+		maxBootstraps: 2,
 	}, nil
 }
 
@@ -168,6 +181,15 @@ func (c *Cluster) Join(seed string) error {
 	if c.OnPeersChanged != nil {
 		c.OnPeersChanged(c.Peers())
 	}
+	// Bootstrap streaming: pull the seed's data NOW instead of
+	// waiting for background anti-entropy rounds. The node stays in
+	// "streaming" state (accepts writes, reads may be stale) until
+	// the pull completes.
+	if err := c.bootstrapFrom(seed); err != nil {
+		log.Printf("bootstrap from %s incomplete: %v (anti-entropy will finish the job)", seed, err)
+		return err
+	}
+	c.bootstrapped.Store(true)
 	return nil
 }
 
@@ -850,6 +872,152 @@ func (c *Cluster) HandleLeave(w http.ResponseWriter, r *http.Request) {
 		cb(peers)
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "removed": had, "epoch": c.Epoch()})
+}
+
+// Streaming reports whether this node is still backfilling data from
+// the cluster after a join (bootstrap phase). While true, reads may
+// be stale — the node accepts writes but hasn't received the ranges
+// it owns yet.
+func (c *Cluster) Streaming() bool { return !c.bootstrapped.Load() }
+
+// MarkBootstrapped flips the node out of streaming state (used when
+// the node starts standalone with no seed to sync from).
+func (c *Cluster) MarkBootstrapped() { c.bootstrapped.Store(true) }
+
+// SetMaxBootstraps caps how many concurrent bootstrap streams this
+// node will serve as a seed (admission control; default 2).
+func (c *Cluster) SetMaxBootstraps(n int64) {
+	if n > 0 {
+		c.maxBootstraps = n
+	}
+}
+
+// bootstrapFrom streams ALL of the seed's data into the local store.
+// This is the fast path that replaces waiting for background
+// anti-entropy rounds after a join: the joiner pulls every
+// collection in paginated chunks and applies them locally. Retries
+// on 429 (seed admission full) with backoff.
+func (c *Cluster) bootstrapFrom(seed string) error {
+	cols, err := c.fetchCollectionsList(seed)
+	if err != nil {
+		return fmt.Errorf("bootstrap list collections: %w", err)
+	}
+	for _, col := range cols {
+		if err := c.bootstrapCollection(seed, col); err != nil {
+			return fmt.Errorf("bootstrap %s: %w", col, err)
+		}
+	}
+	return nil
+}
+
+func (c *Cluster) bootstrapCollection(seed, col string) error {
+	const page = 500
+	after := ""
+	for {
+		var docs []*store.Doc
+		err := c.withRetry(func() error {
+			u := fmt.Sprintf("%s/internal/stream/%s?limit=%d", seed, col, page)
+			if after != "" {
+				u += "&after=" + after
+			}
+			resp, err := c.client.Get(u)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == 429 {
+				return errBootstrapBusy
+			}
+			if resp.StatusCode != 200 {
+				return fmt.Errorf("stream status %d", resp.StatusCode)
+			}
+			var out struct {
+				Docs  []*store.Doc `json:"docs"`
+				After string       `json:"after"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+				return err
+			}
+			docs = out.Docs
+			after = out.After
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		applied := 0
+		for _, d := range docs {
+			if c.st.ApplyRemote(d) {
+				applied++
+			}
+		}
+		log.Printf("bootstrap %s: pulled %d docs (%d applied)", col, len(docs), applied)
+		if after == "" || len(docs) == 0 {
+			return nil
+		}
+	}
+}
+
+var errBootstrapBusy = fmt.Errorf("seed bootstrap admission full")
+
+func (c *Cluster) withRetry(fn func() error) error {
+	delay := 500 * time.Millisecond
+	for attempt := 0; attempt < 10; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if err != errBootstrapBusy {
+			// One retry for transient errors, then give up.
+			if attempt > 0 {
+				return err
+			}
+		}
+		time.Sleep(delay)
+		if delay < 8*time.Second {
+			delay *= 2
+		}
+	}
+	return fmt.Errorf("bootstrap retries exhausted")
+}
+
+// HandleStream serves one page of a collection's docs (tombstones
+// included) for bootstrap streaming. Admission-controlled: at most
+// maxBootstraps concurrent stream requests are served cluster-wide
+// per node; others get 429 so a stampede of joining nodes can't
+// melt the seed.
+func (c *Cluster) HandleStream(w http.ResponseWriter, r *http.Request) {
+	if c.activeBootstraps.Add(1) > c.maxBootstraps {
+		c.activeBootstraps.Add(-1)
+		w.Header().Set("Retry-After", "2")
+		writeJSON(w, 429, map[string]interface{}{"error": "bootstrap admission limit reached"})
+		return
+	}
+	defer c.activeBootstraps.Add(-1)
+	col := r.PathValue("col")
+	limit := 500
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 2000 {
+			limit = n
+		}
+	}
+	after := r.URL.Query().Get("after")
+	docs := c.st.StreamCollection(col, after, limit)
+	nextAfter := ""
+	if len(docs) == limit {
+		last := docs[len(docs)-1]
+		nextAfter = last.ID
+	}
+	writeJSON(w, 200, map[string]interface{}{"docs": docs, "after": nextAfter})
+}
+
+// HandleBootstrapStatus reports this node's bootstrap state.
+func (c *Cluster) HandleBootstrapStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{
+		"streaming":         c.Streaming(),
+		"active_serves":     c.activeBootstraps.Load(),
+		"max_bootstraps":    c.maxBootstraps,
+	})
 }
 
 // Replicate sends a doc to a peer; fire-and-forget with one retry.
