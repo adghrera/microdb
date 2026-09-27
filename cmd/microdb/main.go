@@ -44,9 +44,10 @@ func main() {
 	archiveInterval := flag.Duration("archive-interval", 60*time.Second, "how often to write a raw-log archive (with --archive-dir)")
 	maxInflight := flag.Int64("max-inflight", 0, "shed load with 429 above this many concurrent requests (0 = unlimited)")
 	traceSlowMs := flag.Int64("trace-slow-ms", 500, "log requests slower than this with their trace id")
+	encKey := flag.String("encryption-key", "", "64-hex-char (32-byte) AES-256-GCM key for encryption at rest")
 	flag.Parse()
 
-	st, err := store.Open(*dir)
+	st, err := store.OpenWithKey(*dir, *encKey)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}

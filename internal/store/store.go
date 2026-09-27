@@ -5,6 +5,10 @@ package store
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +41,7 @@ type Store struct {
 	docs   map[string]*Doc // key = collection + "\x00" + id
 	path   string          // absolute path of the JSONL commit log
 	f      *os.File
+	key    []byte // encryption-at-rest key (nil = plaintext log)
 	fsync  bool // sync to disk on every write (durability over throughput)
 	idx    *index.IndexSet // inverted field indexes (fast exact-match lookups)
 	log    *changelog.Log  // bounded mutation feed for watchers
@@ -63,13 +68,136 @@ func (s *Store) sync() error {
 
 func key(col, id string) string { return col + "\x00" + id }
 
+// --- encryption at rest ------------------------------------------
+//
+// When a key is set, every log record is written as
+//   ENC1:<base64(nonce || AES-256-GCM ciphertext)>
+// with a fresh random nonce per record. Plaintext records remain
+// readable, so enabling encryption on an existing db encrypts all
+// NEW records going forward (a rewrite happens naturally on the next
+// compaction). A key is 32 bytes, hex-encoded (64 hex chars).
+
+const encPrefix = "ENC1:"
+
+// SetEncryptionKey enables encryption-at-rest for all future log
+// records. keyHex is 64 hex characters (32 bytes). Must be called
+// right after Open, before any writes.
+func (s *Store) SetEncryptionKey(keyHex string) error {
+	k, err := decodeHexKey(keyHex)
+	if err != nil {
+		return err
+	}
+	s.key = k
+	return nil
+}
+
+func decodeHexKey(h string) ([]byte, error) {
+	if len(h) != 64 {
+		return nil, fmt.Errorf("encryption key must be 64 hex chars (32 bytes), got %d", len(h))
+	}
+	k := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		var b int
+		if _, err := fmt.Sscanf(h[i*2:i*2+2], "%02x", &b); err != nil {
+			return nil, fmt.Errorf("invalid hex at position %d", i*2)
+		}
+		k[i] = byte(b)
+	}
+	return k, nil
+}
+
+// encryptRecord seals one log line (without newline) into ENC1 form.
+func encryptRecord(key, plain []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	ct := gcm.Seal(nonce, nonce, plain, nil)
+	return []byte(encPrefix + base64.StdEncoding.EncodeToString(ct)), nil
+}
+
+// decryptRecord opens an ENC1 line back to plaintext JSON.
+func decryptRecord(key []byte, line string) ([]byte, error) {
+	if key == nil {
+		return nil, fmt.Errorf("log record is encrypted but no key configured")
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, encPrefix))
+	if err != nil {
+		return nil, fmt.Errorf("bad base64 in encrypted record: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) < gcm.NonceSize() {
+		return nil, fmt.Errorf("encrypted record too short")
+	}
+	plain, err := gcm.Open(nil, raw[:gcm.NonceSize()], raw[gcm.NonceSize():], nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt failed (wrong key?): %w", err)
+	}
+	return plain, nil
+}
+
+// appendRecord writes one log line, encrypting if a key is set.
+// Caller holds the write lock.
+func (s *Store) appendRecord(w io.Writer, plain []byte) error {
+	if s.key != nil {
+		enc, err := encryptRecord(s.key, plain)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(append(enc, '\n'))
+		return err
+	}
+	_, err := w.Write(append(plain, '\n'))
+	return err
+}
+
+// decodeLogLine turns one raw log line into plaintext JSON,
+// transparently decrypting ENC1 records.
+func (s *Store) decodeLogLine(line string) (string, error) {
+	if strings.HasPrefix(line, encPrefix) {
+		plain, err := decryptRecord(s.key, line)
+		if err != nil {
+			return "", err
+		}
+		return string(plain), nil
+	}
+	return line, nil
+}
+
 // Open loads any existing JSONL log into memory and appends future writes.
 func Open(dir string) (*Store, error) {
+	return OpenWithKey(dir, "")
+}
+
+// OpenWithKey opens a store with encryption-at-rest enabled: the key
+// (64 hex chars) is installed BEFORE the log replay so encrypted
+// records can be read back. Empty keyHex = plaintext store.
+func OpenWithKey(dir, keyHex string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 	path := filepath.Join(dir, "data.jsonl")
 	s := &Store{docs: map[string]*Doc{}, path: path, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute)}
+	if keyHex != "" {
+		if err := s.SetEncryptionKey(keyHex); err != nil {
+			return nil, err
+		}
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -84,10 +212,17 @@ func Open(dir string) (*Store, error) {
 			break
 		}
 	}
-	for _, line := range strings.Split(string(buf), "\n") {
-		line = strings.TrimSpace(line)
+	for _, raw := range strings.Split(string(buf), "\n") {
+		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
+		}
+		// Transparently decrypt ENC1 records (error = wrong/missing
+		// key: fail loudly rather than silently dropping data).
+		line, err := s.decodeLogLine(line)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("log replay: %w", err)
 		}
 		// Batch records: {"batch":[{doc},{doc},...]}.
 		if strings.HasPrefix(line, `{"batch":`) {
@@ -153,7 +288,7 @@ func (s *Store) Apply(collection, id string, fields map[string]interface{}) (*Do
 	s.idx.For(collection).Remove(id)
 	s.idx.For(collection).Add(id, fields)
 	b, _ := json.Marshal(d)
-	if _, err := s.f.Write(append(b, '\n')); err != nil {
+	if err := s.appendRecord(s.f, b); err != nil {
 		return nil, err
 	}
 	if err := s.sync(); err != nil {
@@ -190,7 +325,7 @@ func (s *Store) ApplyBatch(collection string, docs map[string]map[string]interfa
 	}
 	rec := map[string]interface{}{"batch": changed}
 	b, _ := json.Marshal(rec)
-	if _, err := s.f.Write(append(b, '\n')); err != nil {
+	if err := s.appendRecord(s.f, b); err != nil {
 		return nil, err
 	}
 	if err := s.sync(); err != nil {
@@ -214,7 +349,7 @@ func (s *Store) ApplyRemote(d *Doc) bool {
 		s.idx.For(d.Collection).Add(d.ID, d.Fields)
 	}
 	b, _ := json.Marshal(d)
-	if _, err := s.f.Write(append(b, '\n')); err != nil {
+	if err := s.appendRecord(s.f, b); err != nil {
 		return false
 	}
 	if s.sync() != nil {
@@ -253,7 +388,7 @@ func (s *Store) Delete(collection, id string) error {
 	}
 	s.idx.For(collection).Remove(id)
 	b, _ := json.Marshal(d)
-	if _, err := s.f.Write(append(b, '\n')); err != nil {
+	if err := s.appendRecord(s.f, b); err != nil {
 		return err
 	}
 	if err := s.sync(); err != nil {
@@ -356,7 +491,7 @@ func (s *Store) Compact(gcWindow time.Duration) (int, error) {
 	w := bufio.NewWriterSize(f, 1<<20)
 	for _, d := range live {
 		b, _ := json.Marshal(d)
-		if _, err := w.Write(append(b, '\n')); err != nil {
+		if err := s.appendRecord(w, b); err != nil {
 			f.Close()
 			os.Remove(tmpPath)
 			return 0, err
@@ -562,10 +697,22 @@ func (s *Store) ArchiveRaw(w io.Writer) error {
 // rewrites the log keeping only current versions, so history older
 // than the last compaction is gone. Archive frequently to widen it.
 func ReplayUntil(r io.Reader, until int64, dir string) (*Store, int, error) {
+	return ReplayUntilKey(r, until, dir, "")
+}
+
+// ReplayUntilKey is ReplayUntil with an encryption key (64 hex chars)
+// for archives taken from encrypted databases. The recovered store
+// inherits the key, so its new log is encrypted too.
+func ReplayUntilKey(r io.Reader, until int64, dir, keyHex string) (*Store, int, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, 0, err
 	}
 	s := &Store{docs: map[string]*Doc{}, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute), path: filepath.Join(dir, "data.jsonl")}
+	if keyHex != "" {
+		if err := s.SetEncryptionKey(keyHex); err != nil {
+			return nil, 0, err
+		}
+	}
 	// Fresh log file for the recovered store.
 	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -580,6 +727,11 @@ func ReplayUntil(r io.Reader, until int64, dir string) (*Store, int, error) {
 		if len(line) > 0 {
 			trimmed := strings.TrimSpace(string(line))
 			if trimmed != "" {
+				trimmed, derr := s.decodeLogLine(trimmed)
+				if derr != nil {
+					f.Close()
+					return nil, 0, fmt.Errorf("archive replay: %w", derr)
+				}
 				// Batch record or single doc — filter each doc by TS.
 				if strings.HasPrefix(trimmed, `{"batch":`) {
 					var rec struct {

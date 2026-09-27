@@ -28,6 +28,7 @@ func main() {
 	out := fs.String("out", "", "output file (backup)")
 	in := fs.String("in", "", "input file (restore/pitr)")
 	until := fs.String("until", "", "recovery point: unix millis or RFC3339 (pitr)")
+	encKey := fs.String("encryption-key", "", "64-hex-char key if the archive is encrypted (pitr)")
 	url := fs.String("url", "http://127.0.0.1:8001", "node base URL (status)")
 	fs.Parse(os.Args[2:])
 
@@ -123,7 +124,7 @@ func main() {
 			fatal(err)
 		}
 		defer f.Close()
-		st, n, err := store.ReplayUntil(f, untilMs, *dir)
+		st, n, err := store.ReplayUntilKey(f, untilMs, *dir, *encKey)
 		if err != nil {
 			fatal(err)
 		}
