@@ -5,6 +5,7 @@ package api
 import (
 	"bytes"
 	"crypto/subtle"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"microdb/internal/migrate"
 	"microdb/internal/readcache"
 	"microdb/internal/ring"
+	"microdb/internal/storage"
 	"microdb/internal/store"
 	"microdb/internal/tenants"
 )
@@ -41,6 +43,7 @@ type Server struct {
 	idem    *idempotencyCache
 	tenants *tenants.Registry
 	rcache  *readcache.Cache
+	rec     *storage.Local // storage-tier record boundary (fenced)
 }
 
 // EnableReadCache turns on a read-through cache for local (consistency
@@ -140,7 +143,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	if rf < 1 {
 		rf = 1
 	}
-	s := &Server{st: st, cl: cl, self: self, repl: make(chan replTask, 256), mux: http.NewServeMux(), fwdClient: &http.Client{Timeout: 5 * time.Second}, rf: rf, idem: newIdempotencyCache(10 * time.Minute)}
+	s := &Server{st: st, cl: cl, self: self, repl: make(chan replTask, 256), mux: http.NewServeMux(), fwdClient: &http.Client{Timeout: 5 * time.Second}, rf: rf, idem: newIdempotencyCache(10 * time.Minute), rec: storage.NewLocal(st)}
 	s.ring = ring.Build([]string{self})
 	cl.OnPeersChanged = s.rebuildRing
 
@@ -183,6 +186,16 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	s.mux.HandleFunc("GET /internal/owners/{col}/{id}", s.handleOwners)
 	s.mux.HandleFunc("GET /internal/hints", cl.HandleHints)
 	s.mux.HandleFunc("GET /internal/scan/{col}", s.handleInternalScan)
+
+	// Storage-tier record API: the disaggregation boundary. A
+	// compute node (or a peer) speaks these instead of touching the
+	// store directly. Fenced by X-Microdb-Epoch.
+	for _, prefix := range []string{"/internal"} {
+		s.mux.HandleFunc("PUT "+prefix+"/record/{col}/{id}", s.handleRecordPut)
+		s.mux.HandleFunc("GET "+prefix+"/record/{col}/{id}", s.handleRecordGet)
+		s.mux.HandleFunc("GET "+prefix+"/record/{col}/scan", s.handleRecordScan)
+		s.mux.HandleFunc("GET "+prefix+"/record/_epoch", s.handleRecordEpoch)
+	}
 
 	go s.replicationWorker()
 	return s
@@ -442,6 +455,8 @@ func (s *Server) rebuildRing(addrs []string) {
 	// share of the keyspace and a cold node a smaller one. With no
 	// load data (or equal loads) this is the uniform ring.
 	s.ring = ring.BuildWeighted(nodes, s.cl.Loads(), s.cl.Epoch())
+	// Keep the storage-tier fence at least as high as the ring epoch.
+	s.rec.ObserveEpoch(s.cl.Epoch())
 }
 
 // RingSnapshot exposes the current placement ring (for admin/CLI use).
@@ -1334,6 +1349,74 @@ func (s *Server) handleGetSchema(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, sch)
+}
+
+// --- storage-tier record API handlers --------------------------------
+//
+// These implement the storage side of storage.RecordStore. Writes are
+// fenced: a mutation carrying an epoch below the highest epoch this
+// node has accepted is rejected 409 (ErrStaleEpoch), so a compute
+// node with a stale ring view can never write to the wrong shard.
+
+func (s *Server) handleRecordPut(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	id := r.PathValue("id")
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "read body"})
+		return
+	}
+	var rec storage.Record
+	if err := json.Unmarshal(body, &rec); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "bad record JSON"})
+		return
+	}
+	rec.Collection, rec.ID = col, id
+	// Fence against the node's live ring epoch too: a writer behind
+	// the cluster's membership view is stale even if its own fence
+	// was fine.
+	if rec.Epoch < s.currentRing().Epoch() {
+		writeJSON(w, 409, map[string]interface{}{"error": "stale epoch", "epoch": s.currentRing().Epoch()})
+		return
+	}
+	if err := s.rec.Put(&rec); err != nil {
+		if errors.Is(err, storage.ErrStaleEpoch) {
+			writeJSON(w, 409, map[string]interface{}{"error": "stale epoch", "epoch": s.rec.Epoch()})
+			return
+		}
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleRecordGet(w http.ResponseWriter, r *http.Request) {
+	rec, ok := s.st.GetDoc(r.PathValue("col"), r.PathValue("id"))
+	if !ok {
+		writeJSON(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSON(w, 200, rec)
+}
+
+func (s *Server) handleRecordScan(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	after := r.URL.Query().Get("after")
+	limit := 1000
+	if l := r.URL.Query().Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil || n < 1 || n > 10000 {
+			writeJSON(w, 400, map[string]string{"error": "limit must be 1..10000"})
+			return
+		}
+		limit = n
+	}
+	recs := s.st.ScanPage(col, after, limit)
+	writeJSON(w, 200, map[string]interface{}{"records": recs, "epoch": s.currentRing().Epoch()})
+}
+
+func (s *Server) handleRecordEpoch(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{"epoch": s.currentRing().Epoch()})
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {

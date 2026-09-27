@@ -26,6 +26,7 @@ import (
 	"microdb/internal/metrics"
 	"microdb/internal/merkle"
 	"microdb/internal/migrate"
+	"microdb/internal/storage"
 )
 
 type Doc struct {
@@ -695,6 +696,68 @@ func (s *Store) EffectiveRF(col string, fallback int) int {
 		return cfg.RF
 	}
 	return fallback
+}
+
+// ApplyVersioned stores a record with an explicit (ver, ts) supplied
+// by the caller — the storage-tier write path. LWW merge semantics
+// match ApplyRemote: the record lands iff it's newer than what we
+// hold. Persists, indexes, and feeds the change log like any write.
+func (s *Store) ApplyVersioned(rec *storage.Record) error {
+	d := &Doc{
+		ID: rec.ID, Ver: rec.Ver, TS: rec.TS,
+		Deleted: rec.Deleted, Collection: rec.Collection, Fields: rec.Fields,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.merge(d) {
+		return nil // older or equal: idempotent no-op
+	}
+	s.idx.For(rec.Collection).Remove(rec.ID)
+	if !rec.Deleted {
+		s.idx.For(rec.Collection).Add(rec.ID, rec.Fields)
+	}
+	b, _ := json.Marshal(d)
+	if err := s.appendRecord(s.f, b); err != nil {
+		return err
+	}
+	if err := s.sync(); err != nil {
+		return err
+	}
+	kind := "upsert"
+	if rec.Deleted {
+		kind = "delete"
+	}
+	s.log.Append(rec.Collection, rec.ID, kind, d)
+	atomic.AddInt64(metrics.Default.Counter("microdb_storage_applies_total", "Records applied via the storage-tier API"), 1)
+	return nil
+}
+
+// GetDoc returns a live doc as a storage-tier Record.
+func (s *Store) GetDoc(collection, id string) (*storage.Record, bool) {
+	d, ok := s.Get(collection, id)
+	if !ok {
+		return nil, false
+	}
+	return &storage.Record{
+		Collection: d.Collection, ID: d.ID, Ver: d.Ver, TS: d.TS,
+		Deleted: d.Deleted, Fields: d.Fields,
+	}, true
+}
+
+// ScanPage returns live records in id order, resuming after afterID.
+func (s *Store) ScanPage(collection, afterID string, limit int) []*storage.Record {
+	docs := s.StreamCollection(collection, afterID, limit)
+	out := make([]*storage.Record, 0, len(docs))
+	for _, d := range docs {
+		if d.Deleted {
+			continue
+		}
+		out = append(out, &storage.Record{
+			Collection: d.Collection, ID: d.ID, Ver: d.Ver, TS: d.TS,
+			Fields: d.Fields,
+		})
+	}
+	return out
 }
 
 // CountUnder counts live (non-deleted) docs in every collection
