@@ -53,6 +53,7 @@ func main() {
 	idemTTL := flag.Duration("idempotency-ttl", 10*time.Minute, "dedupe window for Idempotency-Key retries (0 disables)")
 	durableFeed := flag.Bool("durable-feed", false, "persist the watch change feed to disk (cursors survive restart, 24h retention)")
 	tenantsFile := flag.String("tenants", "", "JSON file with tenant definitions (tokens, rate limits, quotas); enables multi-tenancy")
+	readCache := flag.Int("read-cache", 0, "cache this many point reads, invalidated by the change feed (0 disables)")
 	flag.Parse()
 
 	if *jsonLog {
@@ -159,6 +160,9 @@ func main() {
 	handler = api.RequireAPIAuth(*authToken, handler)
 	if *idemTTL > 0 {
 		srv.SetIdempotencyTTL(*idemTTL)
+	}
+	if *readCache > 0 {
+		srv.EnableReadCache(*readCache, 5*time.Minute)
 	}
 	if *tenantsFile != "" {
 		reg, err := tenants.Load(*tenantsFile)

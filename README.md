@@ -98,6 +98,8 @@ Multiple conditions AND together.
 `--archive-dir/--archive-interval` (PITR archiving), `--max-inflight` (load shedding),
 `--trace-slow-ms` (slow-request log), `--encryption-key <64-hex>` (encryption at rest),
 `--durable-feed` (persist watch events; cursors survive restart),
+`--tenants <file.json>` (multi-tenant tokens/namespaces/rate-limits/quotas),
+`--read-cache <n>` (point-read cache invalidated by the change feed).
 `--cluster-name <name>` (refuses internal traffic from other clusters), `--json-log`
 (structured JSON logs for Loki/CloudWatch/ELK), `--idempotency-ttl <dur>` (dedupe
 window for `Idempotency-Key` retries, default 10m, 0 disables).

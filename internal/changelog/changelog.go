@@ -44,6 +44,18 @@ type Log struct {
 	signal   chan struct{} // closed+replaced on every append
 	f        *os.File      // durable feed file (nil = in-memory only)
 	fbuf     *bufio.Writer
+	// onAppend, if set, is invoked synchronously on every Append
+	// (under the log lock). Used by the read cache to invalidate on
+	// every local mutation — writes AND replicated applies — without
+	// polling. Must be fast and must not call back into the log.
+	onAppend func(Event)
+}
+
+// OnAppend registers an invalidation callback fired on every event.
+func (l *Log) OnAppend(fn func(Event)) {
+	l.mu.Lock()
+	l.onAppend = fn
+	l.mu.Unlock()
 }
 
 func New(maxSize int, maxAge time.Duration) *Log {
@@ -153,6 +165,9 @@ func (l *Log) Append(collection, id, kind string, doc interface{}) Event {
 	// Wake all waiters.
 	close(l.signal)
 	l.signal = make(chan struct{})
+	if l.onAppend != nil {
+		l.onAppend(ev)
+	}
 	return ev
 }
 

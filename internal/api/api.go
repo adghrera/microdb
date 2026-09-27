@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"microdb/internal/cluster"
+	"microdb/internal/changelog"
 	"microdb/internal/metrics"
 	"microdb/internal/migrate"
+	"microdb/internal/readcache"
 	"microdb/internal/ring"
 	"microdb/internal/store"
 	"microdb/internal/tenants"
@@ -38,6 +40,28 @@ type Server struct {
 	rf      int // replication factor (ring owners consulted per write)
 	idem    *idempotencyCache
 	tenants *tenants.Registry
+	rcache  *readcache.Cache
+}
+
+// EnableReadCache turns on a read-through cache for local (consistency
+// = one) point reads. Entries are invalidated synchronously by every
+// mutation observed in the change feed — local writes AND replicated
+// applies — so a cached read is never staler than this node's own
+// mutation stream. Capacity is total entries; maxAge is a safety-net
+// freshness bound (0 = rely on invalidation only).
+func (s *Server) EnableReadCache(capacity int, maxAge time.Duration) {
+	s.rcache = readcache.New(capacity, maxAge)
+	s.st.ChangeLog().OnAppend(func(ev changelog.Event) {
+		s.rcache.Invalidate(ev.Collection + "\x00" + ev.ID)
+	})
+}
+
+// CacheStats exposes read-cache counters (0s when disabled).
+func (s *Server) CacheStats() (hits, misses, invalidations int64) {
+	if s.rcache == nil {
+		return 0, 0, 0
+	}
+	return s.rcache.Stats()
 }
 
 // SetTenants enables multi-tenant admission control on the public
@@ -546,6 +570,22 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		// the local DC; single-DC microdb collapses them.)
 	default:
 		writeJSON(w, 400, map[string]string{"error": "unknown consistency: use one|quorum|all|local_quorum"})
+		return
+	}
+	if s.rcache != nil {
+		ckey := col + "\x00" + id
+		if v, ok := s.rcache.Get(ckey); ok {
+			writeJSON(w, 200, v)
+			return
+		}
+		d, ok := s.st.Get(col, id)
+		if !ok {
+			writeJSON(w, 404, map[string]string{"error": "not found"})
+			return
+		}
+		md := s.migrateDoc(col, d)
+		s.rcache.Put(ckey, md)
+		writeJSON(w, 200, md)
 		return
 	}
 	d, ok := s.st.Get(col, id)
@@ -1306,6 +1346,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	atomic.StoreInt64(metrics.Default.Gauge("microdb_docs", "Documents currently held (incl. tombstones)"), int64(s.st.DocCount()))
 	atomic.StoreInt64(metrics.Default.Gauge("microdb_collections", "Collections currently held"), int64(len(s.st.Collections())))
 	atomic.StoreInt64(metrics.Default.Gauge("microdb_peers", "Live cluster peers"), int64(len(s.cl.Peers())))
+	if s.rcache != nil {
+		h, m, inv := s.rcache.Stats()
+		atomic.StoreInt64(metrics.Default.Counter("microdb_cache_hits_total", "Read cache hits"), h)
+		atomic.StoreInt64(metrics.Default.Counter("microdb_cache_misses_total", "Read cache misses"), m)
+		atomic.StoreInt64(metrics.Default.Counter("microdb_cache_invalidations_total", "Read cache invalidations from the change feed"), inv)
+		atomic.StoreInt64(metrics.Default.Gauge("microdb_cache_entries", "Live read cache entries"), int64(s.rcache.Len()))
+	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	w.Write([]byte(metrics.Default.Render()))
 }

@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (48 features)
+## ✅ Shipped (51 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -64,6 +64,9 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [x] | **Durable change feed** `--durable-feed` | 6 | Watch events persisted to `<dir>/feed.jsonl`, write-through before cursor release, replay on restart (seq + window), torn-tail tolerant, retention-bounded. Cursors survive node restarts. 3 unit + 1 store test |
 | [x] | **Sort/limit pushdown** on scatter-gather | 6 | `limit=` pushes sort+cap to every shard: each returns only its top (offset+limit) — O(shards x window) wire instead of O(all docs). Honest `total_exact` flag when truncation makes total a lower bound. `TestPaginationSort` extended |
 | [x] | **Online schema migration** (Roadmap E5) | 7 | `PUT /api/collections/{col}/schema` with append-only transforms (rename/drop/retype); docs carry `_schema_ver`, transformed lazily on read (get/query/watch/quorum) — no stop-the-world rewrite; schema replicates as `_config` data. 4 unit + 2 integration tests |
+| [x] | **Tenant isolation & quotas** (Roadmap E1) | 7 | `--tenants file.json`: per-tenant bearer tokens, `<name>.*` collection namespaces (cross-tenant 403), token-bucket rate limits with Retry-After, live-doc storage quotas (overwrites free, deletes free). Constant-time token compare. 3 integration tests |
+| [x] | **Load-aware weighted vnodes** (Roadmap A5) | 7 | Per-node writes/sec EWMA gossiped on the member list; `ring.BuildWeighted` gives vnodes proportional to load (2x load = ~2x keyspace); idle nodes floor at 5% (min 8 vnodes); rebuilt every gossip tick, same epoch, deterministic. 4 ring unit + 1 integration test |
+| [x] | **Read cache with changelog invalidation** (Roadmap C7) | 6 | `--read-cache N`: sharded-LRU read-through cache on local point reads; invalidated synchronously via changelog `OnAppend` hook on every local write AND replicated apply — no TTL-guessing, read-your-writes holds. Cache hit/miss/invalidation metrics. 3 integration tests |
 
 ## ⬜ Remaining (deliberately out of scope for "tiny")
 
@@ -146,7 +149,7 @@ of storage from the query engine.**
 
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
-| [ ] | **Tenant isolation & quotas** | 7 | Per-tenant rate limits, storage quotas, per-tenant auth; noisy-neighbor control at the admission layer. |
+| [x] | **Tenant isolation & quotas** | 7 | ✅ shipped — see "Tenant isolation & quotas (E1)" above |
 | [x] | **Admission control / backpressure** | 7 | ✅ shipped — `--max-inflight` sheds with 429 + Retry-After |
 | [x] | **Per-table configuration** | 6 | ✅ shipped — per-collection RF via `_config` collection |
 | [x] | **Encryption at rest + per-tenant keys** | 6 | ✅ shipped (single-key) — AES-256-GCM per-record; per-tenant keys would need tenancy (E1) |
