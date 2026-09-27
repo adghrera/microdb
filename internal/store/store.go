@@ -491,6 +491,49 @@ func (s *Store) AllDocs() []*Doc {
 	return docs
 }
 
+// ConfigCollection is a reserved collection whose docs hold
+// per-collection settings. Storing config as ordinary data means it
+// replicates, merges (LWW), and survives restarts for free.
+const ConfigCollection = "_config"
+
+// CollectionConfig is the per-collection settings doc.
+type CollectionConfig struct {
+	RF int `json:"rf,omitempty"` // 0 = use the node default
+}
+
+// SetCollectionConfig stores per-collection settings. The returned
+// doc must be fanned out by the caller (the store itself doesn't
+// replicate — that's the API layer's job). rf <= 0 clears the override.
+func (s *Store) SetCollectionConfig(col string, cfg CollectionConfig) (*Doc, error) {
+	return s.Apply(ConfigCollection, col, map[string]interface{}{"rf": cfg.RF})
+}
+
+// GetCollectionConfig returns the stored settings for a collection
+// (zero value if none).
+func (s *Store) GetCollectionConfig(col string) CollectionConfig {
+	d, ok := s.Get(ConfigCollection, col)
+	if !ok {
+		return CollectionConfig{}
+	}
+	var cfg CollectionConfig
+	switch v := d.Fields["rf"].(type) {
+	case float64: // came through a JSON round-trip (replica / restart)
+		cfg.RF = int(v)
+	case int: // stored in-process by SetCollectionConfig
+		cfg.RF = v
+	}
+	return cfg
+}
+
+// EffectiveRF resolves the replication factor for a collection:
+// per-collection override if set and positive, else the fallback.
+func (s *Store) EffectiveRF(col string, fallback int) int {
+	if cfg := s.GetCollectionConfig(col); cfg.RF > 0 {
+		return cfg.RF
+	}
+	return fallback
+}
+
 // ArchiveRaw copies the raw commit log (full version history, not the
 // current-state snapshot) to w. Because the log is append-only, any
 // copy taken at any instant is a valid prefix of history — i.e. a

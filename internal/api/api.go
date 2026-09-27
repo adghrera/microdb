@@ -38,6 +38,50 @@ type Server struct {
 // ReplicationFactor returns the configured RF.
 func (s *Server) ReplicationFactor() int { return s.rf }
 
+// rfFor resolves the effective replication factor for a collection:
+// a per-collection override (stored in the reserved _config
+// collection) wins over the node-level --rf default.
+func (s *Server) rfFor(col string) int {
+	return s.st.EffectiveRF(col, s.rf)
+}
+
+// handleConfigCollection sets per-collection settings over the API:
+// PUT /api/collections/{col}/config {"rf": 5}
+func (s *Server) handleConfigCollection(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "read body"})
+		return
+	}
+	var in struct {
+		RF int `json:"rf"`
+	}
+	if err := json.Unmarshal(body, &in); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "body must be {\"rf\": n}"})
+		return
+	}
+	if in.RF < 0 || in.RF > 9 {
+		writeJSON(w, 400, map[string]string{"error": "rf must be 0..9 (0 clears the override)"})
+		return
+	}
+	cfgDoc, err := s.st.SetCollectionConfig(col, store.CollectionConfig{RF: in.RF})
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	// Replicate the config change like any other write.
+	s.fanout(cfgDoc)
+	writeJSON(w, 200, map[string]interface{}{"collection": col, "rf": in.RF, "effective": s.rfFor(col)})
+}
+
+// handleGetConfigCollection reads the current settings.
+func (s *Server) handleGetConfigCollection(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	cfg := s.st.GetCollectionConfig(col)
+	writeJSON(w, 200, map[string]interface{}{"collection": col, "rf": cfg.RF, "effective": s.rfFor(col)})
+}
+
 type replTask struct {
 	peer string
 	doc  *store.Doc
@@ -66,6 +110,8 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 		s.mux.HandleFunc("DELETE "+prefix+"/collections/{col}/docs/{id}", s.handleDelete)
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/docs", s.handleQuery)
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/watch", s.handleWatch)
+		s.mux.HandleFunc("PUT "+prefix+"/collections/{col}/config", s.handleConfigCollection)
+		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/config", s.handleGetConfigCollection)
 		s.mux.HandleFunc("GET "+prefix+"/cluster", s.handleCluster)
 	}
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -229,7 +275,7 @@ func (s *Server) Owns(col, id string) bool {
 // OwnerSet returns the RF-owner set for col/id under the current ring
 // (exposed for tests and admin tooling).
 func (s *Server) OwnerSet(col, id string) []string {
-	return s.currentRing().Owners(col+"/"+id, s.rf)
+	return s.currentRing().Owners(col+"/"+id, s.rfFor(col))
 }
 
 // owns returns true if this node is the primary owner of the key.
@@ -240,7 +286,7 @@ func (s *Server) owns(key string) bool {
 
 func (s *Server) fanout(d *store.Doc) {
 	key := d.Collection + "/" + d.ID
-	for _, peer := range s.currentRing().Owners(key, s.rf) {
+	for _, peer := range s.currentRing().Owners(key, s.rfFor(d.Collection)) {
 		if peer != s.self {
 			select {
 			case s.repl <- replTask{peer: peer, doc: d}:
@@ -396,7 +442,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	//   all          — block until every RF owner acked
 	consistency := r.URL.Query().Get("consistency")
 	if consistency == "quorum" || consistency == "all" || consistency == "local_quorum" {
-		members := s.currentRing().Owners(key, s.rf)
+		members := s.currentRing().Owners(key, s.rfFor(col))
 		need := len(members)/2 + 1 // W = majority of the RF-owner set
 		if consistency == "all" {
 			need = len(members)
