@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (29 features)
+## ✅ Shipped (35 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -46,6 +46,12 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [x] | **Quorum writes** (Roadmap D1) | 8 | `?consistency=quorum` blocks until W=majority of RF-owner set acked; honest 503 (`applied:true`) when not reached |
 | [x] | **Hinted handoff** (Roadmap D3) | 7 | New `internal/hints`: durable capped JSONL debt, newest-wins replace, exp backoff ≤5min, corrupt-tail tolerant; failed Replicate stashes, 1s replay loop delivers on peer return. 7 unit + 3 integration tests incl. sender-restart durability |
 | [x] | **Graceful decommission** (Roadmap A3) | 9 | `microctl decommission --url`: drain (refuse writes 503) → bulk handoff to peers (failures → hints) → leave broadcast evicts immediately (no 15s TTL wait); gossip tombstones block resurrection 30s, explicit join overrides. Live-verified: 20-doc handoff, survivors complete after kill |
+| [x] | **Bootstrap streaming on join** (Roadmap A1) | 10 | `Join()` pulls the seed's full dataset via paginated `GET /internal/stream/{col}` before returning; `streaming=true` state until complete (accepts writes, reads may be stale); 5 integration tests incl. page coverage + writes-during-streaming |
+| [x] | **Join admission control** (Roadmap A6) | 6 | Seed serves max 2 concurrent bootstrap streams (429 + Retry-After beyond); joiner retries with exponential backoff |
+| [x] | **Full per-request tunable consistency** (Roadmap D2) | 7 | `one`/`quorum`/`all`/`local_quorum` on reads AND writes; unknown label → 400. Tests: labels matrix, all-write quorum failure honest 503, one-write unaffected by dead members |
+| [x] | **Hedged reads on scatter-gather** (Roadmap B5) | 6 | `?hedge_ms=N`: parallel gathers; slow members get a duplicate gather at another member, first response wins; failed hedges never mark response partial |
+| [x] | **Shard-map aware clients** (Roadmap B4) | 6 | `GET /internal/owners/{col}/{id}` (owners + epoch); Go client `Owners`/`PutRouted`/`InvalidateShardMap` — writes go straight to the primary, cache-drop + fallback on move |
+| [x] | **Point-in-time recovery (PITR)** (Roadmap D5) | 7 | `--archive-dir`/`--archive-interval` continuously copy the raw commit log; `microctl pitr --in <log> --until <ts> --dir <new>` replays to any point; recovered store is durable + live. Live-verified restore-before-later-writes |
 
 ## ⬜ Remaining (deliberately out of scope for "tiny")
 
@@ -83,12 +89,12 @@ of storage from the query engine.**
 
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
-| [ ] | **Bootstrap & streaming protocol** | 10 | New node joins → receives ring metadata → **streams the ranges it now owns** from current owners *before* being admitted to the ring. Today a new node starts empty and pulls everything via 10s anti-entropy rounds — unbounded, unthrottled, and reads are stale until it finishes. Needs: range-transfer RPCs, resumable checkpoints, progress reporting, `STREAMING` node state (accept writes, refuse reads). |
+| [x] | **Bootstrap & streaming protocol** | 10 | ✅ shipped — paginated stream on join, streaming state, admission control (see above) |
 | [x] | **Ring epochs + fencing tokens** | 9 | ✅ shipped — see "Ring epochs + write fencing" above |
 | [x] | **Graceful decommission** | 9 | ✅ shipped — see "Graceful decommission" above |
 | [ ] | **Dual-write migration window** | 8 | While a range is moving, both old and new owner accept writes (new owner records `pending_ranges`), merge on completion. This is the DynamoDB/Cassandra mechanism that makes rebalance invisible to clients. |
 | [ ] | **Load-aware token assignment** | 7 | Auto-assign vnodes by observed load (bytes/sec, ops/sec per node) instead of uniform random placement; periodic rebalancer that proposes minimal-movement plans. |
-| [ ] | **Admission control for joins** | 6 | Rate-limit how many nodes may bootstrap concurrently (streaming is the most expensive op in the cluster); queue + priority for failed-join retries. |
+| [x] | **Admission control for joins** | 6 | ✅ shipped — max 2 concurrent stream serves per seed, 429 + Retry-After, joiner backoff |
 
 ## B. Sharding — a real partitioning model
 
@@ -97,8 +103,8 @@ of storage from the query engine.**
 | [ ] | **Partition key + sort key data model** | 8 | Dynamo-style composite keys: items grouped by partition key, ordered by sort key within the partition. Enables `Query(partition = X, sort BETWEEN a AND b)` served from one shard with no scatter. Today: flat `col/id`, no ordering, no locality. |
 | [ ] | **Range-based ownership with split/merge** | 8 | Move from pure vnode-hash to contiguous token ranges that can be **split** (DynamoDB auto-partitions hot keys) and **merged** (cold shards). Requires the epoch machinery from (A) to move ranges atomically. |
 | [ ] | **Per-shard isolation** | 7 | Each shard gets its own commit log, index set, compaction schedule, GC, and metrics. One hot shard can't stall compaction of the whole node; per-shard quotas become possible. |
-| [ ] | **Shard-map aware clients** | 6 | Clients cache the shard→node map, route directly, refresh on epoch mismatch. Cuts coordinator hop and lets the coordinator tier shrink. |
-| [ ] | **Hedged reads on scatter-gather** | 6 | Fire the slow tail of a scatter query a second time to a replica; take the first response. Standard DynamoDB latency trick for cross-partition scans. |
+| [x] | **Shard-map aware clients** | 6 | ✅ shipped — `/internal/owners` + Go client `PutRouted` with cache + fallback |
+| [x] | **Hedged reads on scatter-gather** | 6 | ✅ shipped — `?hedge_ms=N` duplicate-gather-on-slow-tail |
 | [ ] | **Global secondary indexes as a service** | 6 | GSI = a separate index shard keyed by (index_value → partition_key), maintained asynchronously from the change feed, with its own consistency lag exposed to clients. |
 
 ## C. Storage / query-engine separation
@@ -118,10 +124,10 @@ of storage from the query engine.**
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
 | [x] | **Quorum reads (R + W > N)** | 8 | ✅ shipped — `?consistency=quorum|all`, merge by (ver,ts), 503 on unreachable |
-| [ ] | **Per-request tunable consistency** | 7 | `?consistency=one|quorum|all|local_quorum` on reads and writes — the Cassandra contract clients expect. (quorum/all shipped for both; `one`/`local_quorum` labels remain) |
+| [x] | **Per-request tunable consistency** | 7 | ✅ shipped — `one|quorum|all|local_quorum` on reads and writes, unknown → 400 |
 | [x] | **Hinted handoff** | 7 | ✅ shipped — durable hint store, replay on peer return, exp backoff |
 | [x] | **Read-path read repair** | 6 | ✅ shipped — quorum reads push newest version to lagging replicas seen during the read |
-| [ ] | **Point-in-time recovery (PITR)** | 7 | Archive commit-log segments to object storage continuously; restore = replay to any timestamp within the retention window. Upgrades `microctl backup` (snapshot-only) to continuous recovery. |
+| [x] | **Point-in-time recovery (PITR)** | 7 | ✅ shipped — continuous raw-log archiving + `microctl pitr --until` replay |
 | [ ] | **Multi-region replication** | 6 | Cross-region log shipping + conflict resolution **beyond LWW** (vector clocks or CRDTs — LWW across regions silently loses concurrent edits with clock skew). Global secondary index replication with lag metrics. |
 
 ## E. Multi-tenancy & production operations

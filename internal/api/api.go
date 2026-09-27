@@ -85,6 +85,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	s.mux.HandleFunc("POST /internal/decommission", cl.HandleDecommission)
 	s.mux.HandleFunc("GET /internal/stream/{col}", cl.HandleStream)
 	s.mux.HandleFunc("GET /internal/bootstrap", cl.HandleBootstrapStatus)
+	s.mux.HandleFunc("GET /internal/owners/{col}/{id}", s.handleOwners)
 	s.mux.HandleFunc("GET /internal/hints", cl.HandleHints)
 	s.mux.HandleFunc("GET /internal/scan/{col}", s.handleInternalScan)
 
@@ -703,6 +704,18 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 		}
 		flusher.Flush()
 	}
+}
+
+// handleOwners serves the RF-owner set + ring epoch for a key so
+// shard-map-aware clients can route directly to the primary instead
+// of relying on server-side forwarding.
+func (s *Server) handleOwners(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	id := r.PathValue("id")
+	writeJSON(w, 200, map[string]interface{}{
+		"owners": s.OwnerSet(col, id),
+		"epoch":  s.currentRing().Epoch(),
+	})
 }
 
 // handleInternalDoc serves a single local doc for quorum reads by

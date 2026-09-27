@@ -16,19 +16,22 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
 type Client struct {
-	BaseURL string
-	HTTP    *http.Client
-	Token   string // optional bearer token
+	BaseURL    string
+	HTTP       *http.Client
+	Token      string // optional bearer token
+	mu         sync.Mutex
+	ownerCache map[string]ownerEntry // "col/id" -> cached primary + epoch
 }
 
 // New creates a client for a node URL (http:// or https://).
 // For TLS with a custom CA, use NewTLS.
 func New(baseURL string) *Client {
-	return &Client{BaseURL: baseURL, HTTP: &http.Client{Timeout: 10 * time.Second}}
+	return &Client{BaseURL: baseURL, HTTP: &http.Client{Timeout: 10 * time.Second}, ownerCache: map[string]ownerEntry{}}
 }
 
 // NewTLS creates a TLS client trusting the given CA PEM file.
@@ -42,8 +45,9 @@ func NewTLS(baseURL, caFile string) (*Client, error) {
 		return nil, fmt.Errorf("no certs in %s", caFile)
 	}
 	return &Client{
-		BaseURL: baseURL,
-		HTTP:    &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}},
+		BaseURL:    baseURL,
+		HTTP:       &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}},
+		ownerCache: map[string]ownerEntry{},
 	}, nil
 }
 
@@ -59,20 +63,20 @@ type Doc struct {
 
 // QueryResult is the paginated query envelope.
 type QueryResult struct {
-	Count  int    `json:"count"`
-	Total  int    `json:"total"`
-	Docs   []*Doc `json:"docs"`
-	Partial bool  `json:"partial,omitempty"`
+	Count   int    `json:"count"`
+	Total   int    `json:"total"`
+	Docs    []*Doc `json:"docs"`
+	Partial bool   `json:"partial,omitempty"`
 }
 
 // Event is a change-feed event.
 type Event struct {
-	Seq        int64       `json:"seq"`
-	TS         int64       `json:"ts"`
-	Collection string      `json:"collection"`
-	ID         string      `json:"id"`
-	Kind       string      `json:"kind"`
-	Doc        *Doc        `json:"doc,omitempty"`
+	Seq        int64  `json:"seq"`
+	TS         int64  `json:"ts"`
+	Collection string `json:"collection"`
+	ID         string `json:"id"`
+	Kind       string `json:"kind"`
+	Doc        *Doc   `json:"doc,omitempty"`
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out interface{}) error {
@@ -117,6 +121,108 @@ func (c *Client) Put(ctx context.Context, col, id string, fields map[string]inte
 		return nil, err
 	}
 	return &d, nil
+}
+
+// --- shard-map aware routing -------------------------------------
+//
+// A shard-map-aware client caches the primary owner of each key
+// (learned from GET /internal/owners) and sends writes straight to
+// the primary, skipping the coordinator hop through a non-owner node.
+// The cache carries the ring epoch; callers can refresh it wholesale
+// when they observe an epoch change.
+
+type ownerEntry struct {
+	primary string
+	epoch   int64
+}
+
+// Owners returns the cached primary owner for col/id, refreshing the
+// cache from the client's base node if the entry is missing.
+func (c *Client) Owners(ctx context.Context, col, id string) (string, error) {
+	c.mu.Lock()
+	if e, ok := c.ownerCache[col+"/"+id]; ok {
+		c.mu.Unlock()
+		return e.primary, nil
+	}
+	c.mu.Unlock()
+	var out struct {
+		Owners []string `json:"owners"`
+		Epoch  int64    `json:"epoch"`
+	}
+	if err := c.do(ctx, "GET", "/internal/owners/"+col+"/"+id, nil, &out); err != nil {
+		return "", err
+	}
+	if len(out.Owners) == 0 {
+		return "", fmt.Errorf("no owners known for %s/%s", col, id)
+	}
+	c.mu.Lock()
+	c.ownerCache[col+"/"+id] = ownerEntry{primary: out.Owners[0], epoch: out.Epoch}
+	c.mu.Unlock()
+	return out.Owners[0], nil
+}
+
+// PutRouted writes directly to the key's primary owner (learned via
+// the shard map), falling back to the base node if routing fails.
+// Saves a server-side forward hop for hot keys.
+func (c *Client) PutRouted(ctx context.Context, col, id string, fields map[string]interface{}) (*Doc, error) {
+	primary, err := c.Owners(ctx, col, id)
+	if err != nil {
+		return c.Put(ctx, col, id, fields) // fall back to plain forwarding path
+	}
+	b, _ := json.Marshal(fields)
+	var d Doc
+	if err := c.doTo(ctx, primary, "PUT", "/api/collections/"+col+"/docs/"+id, b, &d); err != nil {
+		// Primary may have moved; drop the cache entry and retry once
+		// through the base node (which forwards correctly).
+		c.mu.Lock()
+		delete(c.ownerCache, col+"/"+id)
+		c.mu.Unlock()
+		return c.Put(ctx, col, id, fields)
+	}
+	return &d, nil
+}
+
+// doTo issues a request against an arbitrary node URL (same auth and
+// error handling as do).
+func (c *Client) doTo(ctx context.Context, base, method, path string, body []byte, out interface{}) error {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+path, rdr)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("%s %s%s: %d: %s", method, base, path, resp.StatusCode, string(b))
+	}
+	if out != nil {
+		return json.Unmarshal(b, out)
+	}
+	return nil
+}
+
+// InvalidateShardMap drops all cached ownership (call on epoch
+// mismatch or topology change).
+func (c *Client) InvalidateShardMap() {
+	c.mu.Lock()
+	c.ownerCache = map[string]ownerEntry{}
+	c.mu.Unlock()
 }
 
 // Get fetches one document.

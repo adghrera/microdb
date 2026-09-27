@@ -61,7 +61,10 @@ func TestBootstrapStatusEndpoint(t *testing.T) {
 		t.Fatalf("default max_bootstraps should be 2, got %v", out["max_bootstraps"])
 	}
 	a.cl.MarkBootstrapped()
-	resp2, _ := client.Get(a.addr + "/internal/bootstrap")
+	resp2, err := client.Get(a.addr + "/internal/bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp2.Body.Close()
 	var out2 map[string]interface{}
 	json.NewDecoder(resp2.Body).Decode(&out2)
