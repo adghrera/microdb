@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"fmt"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -91,8 +92,9 @@ func (o *TLSOptions) ServerTLS() (*tls.Config, error) {
 }
 
 type Member struct {
-	Addr string `json:"addr"` // http://host:port
-	TTL  int64  `json:"ttl"`  // unix millis; expired members are dropped
+	Addr string  `json:"addr"` // http://host:port
+	TTL  int64   `json:"ttl"`  // unix millis; expired members are dropped
+	Load float64 `json:"load,omitempty"` // recent writes/sec (EWMA)
 }
 
 type Cluster struct {
@@ -126,6 +128,14 @@ type Cluster struct {
 	left map[string]time.Time
 	// clusterName guards against cross-cluster contamination.
 	clusterName string
+	// loads holds the most recently gossiped write-rate (writes/sec)
+	// per node, including self. Used for load-aware weighted vnode
+	// placement: a node with 2x the average load gets ~2x the vnodes.
+	loads map[string]float64
+	// writeTicks counts client writes since the last EWMA update;
+	// selfLoad is the EWMA of writes/sec fed into the gossiped load.
+	lastWrites atomic.Int64 // last sampled store.WriteCount
+	selfLoad   atomic.Uint64 // float64 bits
 	// OnPeersChanged is called with the live peer list whenever membership changes.
 	OnPeersChanged func(addrs []string)
 }
@@ -143,6 +153,7 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 		self:   self,
 		peers:  map[string]time.Time{},
 		left:   map[string]time.Time{},
+		loads:  map[string]float64{},
 		st:     st,
 		client: &http.Client{Timeout: 30 * time.Second, Transport: transport},
 		stop:   make(chan struct{}),
@@ -573,6 +584,15 @@ func (c *Cluster) fetchMerkleLeaves(peer, col string) ([]merkle.Leaf, error) {
 func (c *Cluster) Stop() { close(c.stop) }
 
 func (c *Cluster) gossipRound() {
+	c.updateSelfLoad()
+	// Refresh placement every tick: the weighted ring is rebuilt from
+	// the latest gossiped loads (ours + peers'), so a node that gets
+	// busier gradually takes a larger share of the keyspace. Rebuild
+	// is same-epoch and cheap (a few hundred vnodes), so no fencing
+	// churn and every node converges on the same view.
+	if c.OnPeersChanged != nil {
+		c.OnPeersChanged(c.Peers())
+	}
 	peers := c.Peers()
 	if len(peers) == 0 {
 		return
@@ -620,6 +640,9 @@ func (c *Cluster) gossipRound() {
 	now := time.Now().UnixMilli()
 	for _, m := range out.Members {
 		if m.Addr != c.self && m.TTL > now {
+			c.mu.Lock()
+			c.loads[m.Addr] = m.Load
+			c.mu.Unlock()
 			if c.seen(m.Addr) {
 				changed = true
 			}
@@ -640,11 +663,46 @@ func (c *Cluster) gossipRound() {
 func (c *Cluster) memberList() []Member {
 	peers := c.Peers()
 	out := make([]Member, 0, len(peers)+1)
-	out = append(out, Member{Addr: c.self, TTL: time.Now().UnixMilli() + 15000})
+	out = append(out, Member{Addr: c.self, TTL: time.Now().UnixMilli() + 15000, Load: c.SelfLoad()})
 	for _, p := range peers {
-		out = append(out, Member{Addr: p, TTL: time.Now().UnixMilli() + 15000})
+		out = append(out, Member{Addr: p, TTL: time.Now().UnixMilli() + 15000, Load: c.LoadOf(p)})
 	}
 	return out
+}
+
+// SelfLoad returns this node's EWMA of client writes/sec.
+func (c *Cluster) SelfLoad() float64 {
+	return math.Float64frombits(c.selfLoad.Load())
+}
+
+// LoadOf returns the last gossiped write-rate for a peer.
+func (c *Cluster) LoadOf(addr string) float64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.loads[addr]
+}
+
+// Loads returns a snapshot of all known node loads (self included).
+func (c *Cluster) Loads() map[string]float64 {
+	c.mu.RLock()
+	out := make(map[string]float64, len(c.loads)+1)
+	for k, v := range c.loads {
+		out[k] = v
+	}
+	c.mu.RUnlock()
+	out[c.self] = c.SelfLoad()
+	return out
+}
+
+// updateSelfLoad samples the store's client-write counter and folds
+// the per-second rate into an EWMA (alpha=0.3: ~3s effective window).
+// Called once per gossip tick.
+func (c *Cluster) updateSelfLoad() {
+	cur := c.st.WriteCount()
+	prev := c.lastWrites.Swap(cur)
+	delta := cur - prev
+	ewma := c.SelfLoad()*0.7 + float64(delta)*0.3
+	c.selfLoad.Store(math.Float64bits(ewma))
 }
 
 // Eviction also bumps the epoch and notifies: a node leaving is a
@@ -1130,6 +1188,9 @@ func (c *Cluster) HandleGossip(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UnixMilli()
 	for _, m := range in.Members {
 		if m.Addr != c.self && m.TTL > now {
+			c.mu.Lock()
+			c.loads[m.Addr] = m.Load
+			c.mu.Unlock()
 			c.seen(m.Addr)
 		}
 	}

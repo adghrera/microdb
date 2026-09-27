@@ -413,8 +413,15 @@ func (s *Server) rebuildRing(addrs []string) {
 	nodes := append([]string{s.self}, addrs...)
 	s.ringMu.Lock()
 	defer s.ringMu.Unlock()
-	s.ring = ring.BuildWithEpoch(nodes, s.cl.Epoch())
+	// Load-aware placement: vnodes are distributed proportional to
+	// each node's gossiped write-rate, so a hot node takes a bigger
+	// share of the keyspace and a cold node a smaller one. With no
+	// load data (or equal loads) this is the uniform ring.
+	s.ring = ring.BuildWeighted(nodes, s.cl.Loads(), s.cl.Epoch())
 }
+
+// RingSnapshot exposes the current placement ring (for admin/CLI use).
+func (s *Server) RingSnapshot() *ring.Ring { return s.currentRing() }
 
 func (s *Server) currentRing() *ring.Ring {
 	s.ringMu.RLock()

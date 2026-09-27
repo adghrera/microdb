@@ -32,9 +32,52 @@ func Build(nodes []string) *Ring { return BuildWithEpoch(nodes, 1) }
 // membership change bumps the epoch; writes carry the epoch so storage
 // can fence writes from nodes with stale ownership views.
 func BuildWithEpoch(nodes []string, epoch int64) *Ring {
+	return BuildWeighted(nodes, nil, epoch)
+}
+
+// BuildWeighted creates a ring where each node gets a number of
+// vnodes proportional to its weight (observed load). A node carrying
+// 2x the cluster-average load gets ~2x the vnodes and therefore
+// ~2x the share of the keyspace; a node with no weight info gets the
+// baseline. Weights <= 0 or a missing entry fall back to the average
+// weight so an unloaded node never loses all its vnodes.
+//
+// Determinism: every node computes the same ring from the same
+// (nodes, weights, epoch) triple — weights must arrive via gossip,
+// not local guesses, or ownership views diverge.
+func BuildWeighted(nodes []string, weights map[string]float64, epoch int64) *Ring {
 	r := &Ring{epoch: epoch}
+	// Average weight over nodes that have one; baseline for the rest.
+	var sum float64
+	var cnt int
 	for _, n := range nodes {
-		for i := 0; i < vnodes; i++ {
+		if w, ok := weights[n]; ok && w > 0 {
+			sum += w
+			cnt++
+		}
+	}
+	avg := 1.0
+	if cnt > 0 {
+		avg = sum / float64(cnt)
+	}
+	const minVnodes = 8
+	for _, n := range nodes {
+		w := avg
+		if x, ok := weights[n]; ok && x > 0 {
+			w = x
+		} else if cnt > 0 {
+			// A node with no/zero load while others report load is
+			// genuinely idle: floor it to 5% of the average rather
+			// than the average itself, so the busy nodes absorb the
+			// keyspace. (If NO node reports load, everyone keeps the
+			// uniform baseline.)
+			w = avg * 0.05
+		}
+		count := int(float64(vnodes) * w / avg)
+		if count < minVnodes {
+			count = minVnodes
+		}
+		for i := 0; i < count; i++ {
 			r.vnodes = append(r.vnodes, vnode{hash(n + "#" + itoa(i)), n})
 		}
 	}

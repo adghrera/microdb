@@ -46,7 +46,12 @@ type Store struct {
 	fsync  bool // sync to disk on every write (durability over throughput)
 	idx    *index.IndexSet // inverted field indexes (fast exact-match lookups)
 	log    *changelog.Log  // bounded mutation feed for watchers
+	writes atomic.Int64   // client writes applied (load signal for placement)
 }
+
+// WriteCount returns the number of client writes applied since start.
+// The cluster samples this each gossip round to derive writes/sec.
+func (s *Store) WriteCount() int64 { return s.writes.Load() }
 
 // ChangeLog exposes the mutation feed (nil-safe: watchers just see no events).
 func (s *Store) ChangeLog() *changelog.Log { return s.log }
@@ -311,6 +316,7 @@ func (s *Store) Apply(collection, id string, fields map[string]interface{}) (*Do
 		return nil, err
 	}
 	s.log.Append(collection, id, "upsert", d)
+	s.writes.Add(1)
 	atomic.AddInt64(metrics.Default.Counter("microdb_writes_total", "Client writes applied"), 1)
 	return d, nil
 }
@@ -411,6 +417,7 @@ func (s *Store) Delete(collection, id string) error {
 		return err
 	}
 	s.log.Append(collection, id, "delete", nil)
+	s.writes.Add(1)
 	atomic.AddInt64(metrics.Default.Counter("microdb_deletes_total", "Client deletes applied"), 1)
 	return nil
 }

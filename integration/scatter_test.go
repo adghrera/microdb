@@ -69,3 +69,61 @@ func TestScatterGatherQuery(t *testing.T) {
 	_ = fmt.Sprint
 	_ = http.StatusOK
 }
+
+// TestLoadAwarePlacement: hammering one node with writes raises its
+// gossiped load, and the weighted ring shifts key ownership toward it.
+func TestLoadAwarePlacement(t *testing.T) {
+	a := startNode(t, t.TempDir()+"/a")
+	b := startNode(t, t.TempDir()+"/b")
+	if err := b.cl.Join(a.addr); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 10*time.Second, func() bool {
+		return len(a.cl.Peers()) == 1 && len(b.cl.Peers()) == 1
+	}, "mesh")
+
+	// Baseline: count how many of a key sample a owns (primary).
+	ownA := func() int {
+		n := 0
+		for i := 0; i < 2000; i++ {
+			if a.apiSrv.RingSnapshot().Owners("loadkey"+itoa2(i), 1)[0] == a.addr {
+				n++
+			}
+		}
+		return n
+	}
+	base := ownA()
+
+	// Hammer node A with writes for ~4 gossip ticks so its EWMA
+	// write-rate climbs well above B's (which stays ~0).
+	deadline := time.Now().Add(4500 * time.Millisecond)
+	for i := 0; time.Now().Before(deadline); i++ {
+		put(t, a.addr, "hotcol", "h"+itoa2(i), map[string]interface{}{"i": i})
+	}
+
+	// A's self load must be positive and gossiped to B.
+	eventually(t, 8*time.Second, func() bool {
+		return a.cl.SelfLoad() > 1 && b.cl.Loads()[a.addr] > 1
+	}, "load gossiped")
+
+	// The ring must have shifted: A now owns more of the sample than
+	// baseline (it carries all the load, B ~0, so A gets the max
+	// weight share).
+	moved := ownA()
+	if moved <= base {
+		t.Fatalf("ownership did not shift to hot node: base=%d now=%d (loads a=%.1f b=%.1f)",
+			base, moved, a.cl.SelfLoad(), b.cl.Loads()[a.addr])
+	}
+}
+
+func itoa2(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b []byte
+	for i > 0 {
+		b = append([]byte{byte('0' + i%10)}, b...)
+		i /= 10
+	}
+	return string(b)
+}
