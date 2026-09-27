@@ -81,6 +81,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	s.mux.HandleFunc("GET /internal/merkle/{col}/node", cl.HandleMerkleNode)
 	s.mux.HandleFunc("GET /internal/merkle/{col}/leaf", cl.HandleMerkleLeaf)
 	s.mux.HandleFunc("POST /internal/antientropy", cl.HandleAntiEntropy)
+	s.mux.HandleFunc("GET /internal/hints", cl.HandleHints)
 	s.mux.HandleFunc("GET /internal/scan/{col}", s.handleInternalScan)
 
 	go s.replicationWorker()

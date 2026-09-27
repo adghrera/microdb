@@ -16,11 +16,13 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"microdb/internal/hints"
 	"microdb/internal/merkle"
 	"microdb/internal/metrics"
 	"microdb/internal/store"
@@ -100,6 +102,8 @@ type Cluster struct {
 	st      *store.Store
 	client  *http.Client
 	stop    chan struct{}
+	// hints is the hinted-handoff store; nil until EnableHints is called.
+	hints *hints.Store
 	// OnPeersChanged is called with the live peer list whenever membership changes.
 	OnPeersChanged func(addrs []string)
 }
@@ -211,6 +215,7 @@ func (c *Cluster) Start() {
 			case <-t.C:
 				c.gossipRound()
 				c.evict()
+				c.replayHints()
 			}
 		}
 	}()
@@ -570,12 +575,18 @@ func (c *Cluster) AdoptEpoch(n int64) {
 }
 
 // ForcePeer injects a peer address into the live set (test hook for
-// simulating unreachable members in quorum scenarios).
+// simulating unreachable members in quorum scenarios). Fires the
+// membership callback so the ring actually includes the injected peer.
 func (c *Cluster) ForcePeer(addr string) {
 	c.mu.Lock()
 	c.peers[addr] = time.Now()
 	c.epoch++
+	cb := c.OnPeersChanged
+	peers := c.peersLocked()
 	c.mu.Unlock()
+	if cb != nil {
+		cb(peers)
+	}
 }
 
 // BumpEpoch raises the membership epoch without changing the member
@@ -604,7 +615,88 @@ func (c *Cluster) peersLocked() []string {
 	return out
 }
 
+// EnableHints turns on hinted handoff: failed Replicate calls to a peer
+// are stored durably in the hint file under dir and replayed when the
+// peer becomes reachable again. Call before Start.
+func (c *Cluster) EnableHints(dir string) error {
+	hs, err := hints.Load(filepath.Join(dir, "hints.jsonl"))
+	if err != nil {
+		return err
+	}
+	c.hints = hs
+	atomic.StoreInt64(metrics.Default.Gauge("microdb_hints_pending", "Hinted-handoff records pending"), int64(hs.Pending()))
+	return nil
+}
+
+// Hints exposes the hint store for status/metrics (nil if disabled).
+func (c *Cluster) Hints() *hints.Store { return c.hints }
+
+// hintFailed records a failed replication as a hint (no-op when hints
+// are disabled).
+func (c *Cluster) hintFailed(peer string, d *store.Doc) {
+	if c.hints == nil || d == nil {
+		return
+	}
+	c.hints.Add(peer, d)
+	atomic.StoreInt64(metrics.Default.Gauge("microdb_hints_pending", "Hinted-handoff records pending"), int64(c.hints.Pending()))
+}
+
+// replayHints tries to deliver every due hint. Called from the gossip
+// loop; delivery failures reschedule with exponential backoff so a dead
+// peer doesn't burn the network.
+func (c *Cluster) replayHints() {
+	if c.hints == nil {
+		return
+	}
+	due := c.hints.Due(time.Now())
+	for _, h := range due {
+		if err := c.postReplicate(h.Target, h.Doc); err != nil {
+			c.hints.Reschedule(h.Target, h.Doc.Collection, h.Doc.ID, 5*time.Minute)
+			continue
+		}
+		c.hints.Remove(h.Target, h.Doc.Collection, h.Doc.ID)
+	}
+	if len(due) > 0 {
+		atomic.StoreInt64(metrics.Default.Gauge("microdb_hints_pending", "Hinted-handoff records pending"), int64(c.hints.Pending()))
+	}
+}
+
+// postReplicate is Replicate without the hint-recording wrapper (used
+// by the replay loop to avoid recursion on failure).
+func (c *Cluster) postReplicate(peer string, d *store.Doc) error {
+	b, _ := json.Marshal(d)
+	resp, err := c.client.Post(peer+"/internal/replicate", "application/json", bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return &PeerError{peer}
+	}
+	return nil
+}
+
+// HandleHints reports the sender-side hinted-handoff state.
+func (c *Cluster) HandleHints(w http.ResponseWriter, r *http.Request) {
+	if c.hints == nil {
+		writeJSON(w, 200, map[string]interface{}{"enabled": false})
+		return
+	}
+	pending, added, delivered, dropped, byTarget := c.hints.Stats()
+	writeJSON(w, 200, map[string]interface{}{
+		"enabled":   true,
+		"pending":   pending,
+		"added":     added,
+		"delivered": delivered,
+		"dropped":   dropped,
+		"by_target": byTarget,
+	})
+}
+
 // Replicate sends a doc to a peer; fire-and-forget with one retry.
+// On failure the doc is stashed as a hint (if enabled) for later
+// handoff, so the write still reaches full RF once the peer returns.
 func (c *Cluster) Replicate(peer string, d *store.Doc) error {
 	atomic.AddInt64(metrics.Default.Counter("microdb_replication_sends_total", "Replication push attempts"), 1)
 	b, _ := json.Marshal(d)
@@ -619,6 +711,7 @@ func (c *Cluster) Replicate(peer string, d *store.Doc) error {
 		}
 		time.Sleep(time.Duration(100*(attempt+1)) * time.Millisecond)
 	}
+	c.hintFailed(peer, d)
 	return &PeerError{peer}
 }
 

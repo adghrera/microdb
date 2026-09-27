@@ -70,6 +70,14 @@ func main() {
 		fmt.Printf("restored %d docs into %s\n", n, *dir)
 	case "status":
 		printStatus(*url)
+	case "hints":
+		resp, err := httpGet(*url + "/internal/hints")
+		if err != nil {
+			fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Println(string(body))
 	default:
 		usage()
 		os.Exit(2)
@@ -94,7 +102,8 @@ func usage() {
 commands:
   backup  --dir <data-dir> --out <file>    snapshot current state to JSONL
   restore --dir <data-dir> --in <file>     apply a JSONL backup (LWW merge)
-  status  --url <node-url>                health + cluster view`)
+  status  --url <node-url>                health + cluster view
+  hints   --url <node-url>                hinted-handoff debt (pending/delivered/dropped)`)
 }
 
 func httpGet(url string) (*http.Response, error) {

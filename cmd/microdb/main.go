@@ -60,6 +60,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("cluster init: %v", err)
 	}
+	// Hinted handoff: writes that can't reach a replica are stashed in
+	// the data dir and replayed when that node returns.
+	if err := cl.EnableHints(*dir); err != nil {
+		log.Fatalf("enable hints: %v", err)
+	}
 	srv := api.NewWithRF(self, st, cl, *rf)
 	cl.Start()
 	defer cl.Stop()
