@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (24 features)
+## ✅ Shipped (29 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -41,6 +41,11 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [x] | **Docker + compose** 3-node cluster (Tier 4) | 4 | ⚠️ files shipped; no Docker daemon in build env to run them |
 | [x] | **README + architecture doc** (Tier 4) | 4 | `README.md` |
 | [x] | **`-race` clean test runs** (Tier 4) | 4 | ⚠️ requires mingw64 toolchain: `CC='C:\w\msys64\mingw64\bin\gcc.exe' CGO_ENABLED=1 go test -race ./...` (MSYS gcc can't build Go's cgo shim) |
+| [x] | **Ring epochs + write fencing** (Roadmap A2) | 9 | Epoch bumped on join/evict, gossiped + adopted monotonically; forwarded writes carry `X-Microdb-Epoch`, stale forwarders get 409 → adopt → retry. `TestFencingStaleEpoch`, `TestEpochPropagation` |
+| [x] | **Quorum reads + read-repair** (Roadmap D1/D4) | 8 | `?consistency=quorum|all` merges replicas by (ver,ts), 503 if quorum unreachable, async repair pushes newest to lagging replicas. `TestQuorumRead`, `TestQuorumReadNotReached` |
+| [x] | **Quorum writes** (Roadmap D1) | 8 | `?consistency=quorum` blocks until W=majority of RF-owner set acked; honest 503 (`applied:true`) when not reached |
+| [x] | **Hinted handoff** (Roadmap D3) | 7 | New `internal/hints`: durable capped JSONL debt, newest-wins replace, exp backoff ≤5min, corrupt-tail tolerant; failed Replicate stashes, 1s replay loop delivers on peer return. 7 unit + 3 integration tests incl. sender-restart durability |
+| [x] | **Graceful decommission** (Roadmap A3) | 9 | `microctl decommission --url`: drain (refuse writes 503) → bulk handoff to peers (failures → hints) → leave broadcast evicts immediately (no 15s TTL wait); gossip tombstones block resurrection 30s, explicit join overrides. Live-verified: 20-doc handoff, survivors complete after kill |
 
 ## ⬜ Remaining (deliberately out of scope for "tiny")
 
@@ -79,8 +84,8 @@ of storage from the query engine.**
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
 | [ ] | **Bootstrap & streaming protocol** | 10 | New node joins → receives ring metadata → **streams the ranges it now owns** from current owners *before* being admitted to the ring. Today a new node starts empty and pulls everything via 10s anti-entropy rounds — unbounded, unthrottled, and reads are stale until it finishes. Needs: range-transfer RPCs, resumable checkpoints, progress reporting, `STREAMING` node state (accept writes, refuse reads). |
-| [ ] | **Ring epochs + fencing tokens** | 9 | Every ring change bumps a global epoch. Storage rejects writes carrying a stale epoch (fencing); coordinators refresh their ring view on `EPOCH_MISMATCH` and retry. Without this, split-brain partitions both accept writes against different ownership maps and anti-entropy can silently lose ranges. |
-| [ ] | **Graceful decommission** | 9 | `microctl decommission <node>`: mark node draining → stream its ranges off to remaining owners → drain in-flight requests → remove from ring. Today a removed node just gets TTL-evicted; its data survives only on replicas that happened to receive it. |
+| [x] | **Ring epochs + fencing tokens** | 9 | ✅ shipped — see "Ring epochs + write fencing" above |
+| [x] | **Graceful decommission** | 9 | ✅ shipped — see "Graceful decommission" above |
 | [ ] | **Dual-write migration window** | 8 | While a range is moving, both old and new owner accept writes (new owner records `pending_ranges`), merge on completion. This is the DynamoDB/Cassandra mechanism that makes rebalance invisible to clients. |
 | [ ] | **Load-aware token assignment** | 7 | Auto-assign vnodes by observed load (bytes/sec, ops/sec per node) instead of uniform random placement; periodic rebalancer that proposes minimal-movement plans. |
 | [ ] | **Admission control for joins** | 6 | Rate-limit how many nodes may bootstrap concurrently (streaming is the most expensive op in the cluster); queue + priority for failed-join retries. |
@@ -112,10 +117,10 @@ of storage from the query engine.**
 
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
-| [ ] | **Quorum reads (R + W > N)** | 8 | Read replicas, merge by (ver, ts), return after R agree. Prerequisite for strong reads and for surviving owner failure without data loss. Today: reads are single-node local. |
-| [ ] | **Per-request tunable consistency** | 7 | `?consistency=one|quorum|all|local_quorum` on reads and writes — the Cassandra contract clients expect. |
-| [ ] | **Hinted handoff** | 7 | When the owner is down, a coordinator stashes the write locally with a hint and replays when the owner returns. Keeps writes at full RF without blocking on the failed node (Dynamo's answer to the RF-fanout stall). |
-| [ ] | **Read-path read repair** | 6 | On any read that sees divergent replicas, asynchronously push the newest version to the stale ones. Merkle anti-entropy already exists for the background path; this makes the *read* path self-healing. |
+| [x] | **Quorum reads (R + W > N)** | 8 | ✅ shipped — `?consistency=quorum|all`, merge by (ver,ts), 503 on unreachable |
+| [ ] | **Per-request tunable consistency** | 7 | `?consistency=one|quorum|all|local_quorum` on reads and writes — the Cassandra contract clients expect. (quorum/all shipped for both; `one`/`local_quorum` labels remain) |
+| [x] | **Hinted handoff** | 7 | ✅ shipped — durable hint store, replay on peer return, exp backoff |
+| [x] | **Read-path read repair** | 6 | ✅ shipped — quorum reads push newest version to lagging replicas seen during the read |
 | [ ] | **Point-in-time recovery (PITR)** | 7 | Archive commit-log segments to object storage continuously; restore = replay to any timestamp within the retention window. Upgrades `microctl backup` (snapshot-only) to continuous recovery. |
 | [ ] | **Multi-region replication** | 6 | Cross-region log shipping + conflict resolution **beyond LWW** (vector clocks or CRDTs — LWW across regions silently loses concurrent edits with clock skew). Global secondary index replication with lag metrics. |
 
@@ -173,7 +178,9 @@ cf6ee02     backup/restore + microctl admin CLI
 8e98b3d     client: typed Go client library + batch decode fix
 388dff7     packaging: Dockerfile + docker-compose 3-node cluster
 e4fe4f1     api: /v1 versioned routes alongside unversioned
+9566790     api+cluster+ring: quorum reads/writes, ring epochs, write fencing
+b2f9c64     hints: durable hinted handoff for failed replication
+bcd684c     cluster+api: graceful decommission with leave tombstones
 ```
 
-**Coverage:** 24 shipped vs 28 originally listed; the 4 remaining are explicitly out of scope.
-Weighted: ~9.4/10 of the in-scope priority mass.
+**Coverage:** 29 shipped; roadmap items A2, A3, D1 (quorum), D3, D4 now done.

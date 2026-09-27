@@ -76,8 +76,8 @@ exchanges just those documents, both directions.
 
 | Method | Path | Notes |
 |---|---|---|
-| `PUT` | `/api/collections/{col}/docs/{id}` | Upsert. Any JSON object. Forwarded to owner if needed. |
-| `GET` | `/api/collections/{col}/docs/{id}` | Read (local copy — eventually fresh). |
+| `PUT` | `/api/collections/{col}/docs/{id}` | Upsert. Any JSON object. Forwarded to owner if needed. `?consistency=quorum` blocks until W replicas ack. |
+| `GET` | `/api/collections/{col}/docs/{id}` | Read. `?consistency=quorum\|all` for strong reads (merge replicas + read-repair). |
 | `DELETE` | `/api/collections/{col}/docs/{id}` | Tombstone delete, replicated. |
 | `POST` | `/api/collections/{col}/docs/batch` | `{"docs":{"id":{...},...}}` — one atomic record. |
 | `GET` | `/api/collections/{col}/docs` | Scatter-gather. `filter`, `sort`, `desc`, `limit`, `offset`. |
@@ -92,7 +92,8 @@ Multiple conditions AND together.
 **CLI flags:** `--addr`, `--dir`, `--join <seed,seed>`, `--rf <n>`, `--fsync`,
 `--auth-token <bearer>`, `--tls-cert/--tls-key/--tls-ca` (mutual TLS on `/internal/*`).
 
-**microctl:** `backup --dir D --out F` · `restore --dir D --in F` · `status --url U`
+**microctl:** `backup --dir D --out F` · `restore --dir D --in F` · `status --url U` ·
+`hints --url U` (handoff debt) · `decommission --url U` (drain a node before stopping it)
 
 **Go client:** `client.New(url)` → `Put/Get/Delete/Batch/Query/Watch/Cluster/Health`,
 bearer token via `c.Token`, TLS via `client.NewTLS(url, caFile)`.
