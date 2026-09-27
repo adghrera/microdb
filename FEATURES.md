@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (40 features)
+## ✅ Shipped (45 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -56,6 +56,11 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [x] | **Request tracing** (Roadmap E5) | 5 | X-Trace-Id on every response (honors incoming id), latency buckets fast/slow/very-slow, slow-request logging with trace id |
 | [x] | **Per-collection configuration** (Roadmap E3) | 6 | `PUT /api/collections/{col}/config {"rf": n}` — per-collection RF stored in reserved `_config` collection, replicated, honored by fanout/quorum/owner-set |
 | [x] | **Encryption at rest** (Roadmap E4) | 6 | AES-256-GCM per-record (`ENC1:` framing, fresh nonce per record); `--encryption-key`; mixed plaintext/crypto logs; compaction re-encrypts; encrypted PITR; wrong-key fails loudly |
+| [x] | **Cluster identity guard** (Roadmap E6) | 8 | `--cluster-name`: every internal request stamped `X-Microdb-Cluster`; mismatched peers get loud 403, `Join()` surfaces the refusal — no silent cross-cluster merges. `TestClusterNameGuard`, `TestJoinRefusedAcrossClusters` |
+| [x] | **Readiness endpoint** `/ready` (Roadmap E6) | 7 | 503 while bootstrapping or decommissioning, 200 only when servable; `/health` stays liveness-only. `TestReadyEndpoint` |
+| [x] | **Version endpoint** `/version` (Roadmap E6) | 4 | version/Go/node/rf/cluster/uptime for ops dashboards. `TestVersionEndpoint` |
+| [x] | **Idempotency keys** (Roadmap E6) | 8 | `Idempotency-Key` header on PUT/POST/DELETE deduped for `--idempotency-ttl` (default 10m); replays return cached response + `X-Idempotent-Replay`, no version churn. `TestIdempotencyKey`, `TestIdempotencyCacheExpiry` |
+| [x] | **Structured JSON logs** `--json-log` (Roadmap E6) | 4 | RFC3339Nano UTC timestamped JSON lines for log shippers. live-verified |
 
 ## ⬜ Remaining (deliberately out of scope for "tiny")
 

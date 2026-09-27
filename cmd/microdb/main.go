@@ -16,7 +16,9 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -45,7 +47,15 @@ func main() {
 	maxInflight := flag.Int64("max-inflight", 0, "shed load with 429 above this many concurrent requests (0 = unlimited)")
 	traceSlowMs := flag.Int64("trace-slow-ms", 500, "log requests slower than this with their trace id")
 	encKey := flag.String("encryption-key", "", "64-hex-char (32-byte) AES-256-GCM key for encryption at rest")
+	clusterName := flag.String("cluster-name", "", "cluster identity guard: nodes only join peers with the same name")
+	jsonLog := flag.Bool("json-log", false, "emit structured JSON logs")
+	idemTTL := flag.Duration("idempotency-ttl", 10*time.Minute, "dedupe window for Idempotency-Key retries (0 disables)")
 	flag.Parse()
+
+	if *jsonLog {
+		log.SetFlags(0)
+		log.SetOutput(&jsonLogWriter{w: os.Stderr})
+	}
 
 	st, err := store.OpenWithKey(*dir, *encKey)
 	if err != nil {
@@ -71,6 +81,9 @@ func main() {
 	// the data dir and replayed when that node returns.
 	if err := cl.EnableHints(*dir); err != nil {
 		log.Fatalf("enable hints: %v", err)
+	}
+	if *clusterName != "" {
+		cl.SetClusterName(*clusterName)
 	}
 	srv := api.NewWithRF(self, st, cl, *rf)
 	cl.Start()
@@ -136,6 +149,9 @@ func main() {
 	log.Printf("microdb node %s listening on %s (data: %s, tls=%v, rf=%d)", self, *addr, *dir, tlsOpts != nil, *rf)
 	var handler http.Handler = srv
 	handler = api.RequireAPIAuth(*authToken, handler)
+	if *idemTTL > 0 {
+		srv.SetIdempotencyTTL(*idemTTL)
+	}
 	if *maxInflight > 0 {
 		handler = api.Backpressure(*maxInflight, handler)
 	}
@@ -155,6 +171,23 @@ func main() {
 	if err := http.ListenAndServe(*addr, handler); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// jsonLogWriter turns each log line into a JSON object with a UTC
+// timestamp, for log shippers (Loki/CloudWatch/ELK).
+type jsonLogWriter struct{ w io.Writer }
+
+func (j *jsonLogWriter) Write(p []byte) (int, error) {
+	msg := strings.TrimRight(string(p), "\n")
+	rec := map[string]string{"ts": time.Now().UTC().Format(time.RFC3339Nano), "msg": msg}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return j.w.Write(p)
+	}
+	if _, err := j.w.Write(append(b, '\n')); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // selfURLWithTLS builds the canonical URL other nodes use to reach us.

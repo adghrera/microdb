@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -123,6 +124,8 @@ type Cluster struct {
 	// clears the tombstone so a restarted node on the same address is
 	// accepted.
 	left map[string]time.Time
+	// clusterName guards against cross-cluster contamination.
+	clusterName string
 	// OnPeersChanged is called with the live peer list whenever membership changes.
 	OnPeersChanged func(addrs []string)
 }
@@ -150,6 +153,33 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 	}, nil
 }
 
+// SetClusterName stamps every internal request this node makes with
+// the cluster name. Peers that belong to a different cluster reject
+// the request outright — this prevents the classic operational
+// disaster of a misconfigured node joining the wrong production
+// cluster and starting to replicate/fence against it.
+func (c *Cluster) SetClusterName(name string) {
+	c.clusterName = name
+	c.client.Transport = &clusterStampTransport{base: c.client.Transport, name: name}
+}
+
+// clusterNameOf returns the configured cluster name ("" = unguarded).
+func (c *Cluster) ClusterName() string { return c.clusterName }
+
+// clusterStampTransport adds the X-Microdb-Cluster header to every
+// outbound request, whatever the inner transport.
+type clusterStampTransport struct {
+	base http.RoundTripper
+	name string
+}
+
+func (t *clusterStampTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.name != "" {
+		req.Header.Set("X-Microdb-Cluster", t.name)
+	}
+	return t.base.RoundTrip(req)
+}
+
 // Join contacts a known seed node and asks for its member list.
 func (c *Cluster) Join(seed string) error {
 	// We are (re)joining under our own address: clear any local
@@ -162,6 +192,12 @@ func (c *Cluster) Join(seed string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	// Non-2xx means the seed refused us (e.g. cluster name mismatch).
+	// Surface it instead of decoding the error body as a member list.
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("join %s refused (%d): %s", seed, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 	var out struct {
 		Members []Member `json:"members"`
 		Epoch   int64    `json:"epoch"`

@@ -85,6 +85,8 @@ exchanges just those documents, both directions.
 | `PUT`/`GET` | `/api/collections/{col}/config` | Per-collection settings: `{"rf": n}` replication factor (0 clears). |
 | `GET` | `/api/cluster` | Self + live peers. |
 | `GET` | `/health` | Liveness (never gated by auth). |
+| `GET` | `/ready` | Readiness: 503 while bootstrapping or decommissioning — gate LB traffic on this. |
+| `GET` | `/version` | Build identity: version, Go runtime, node, rf, cluster name, uptime. |
 | `GET` | `/metrics` | Prometheus text format. |
 
 **Filter operators:** exact, `$gt`, `$gte`, `$lt`, `$lte`, `$ne`, `$in`, `$exists`, `$regex`.
@@ -93,7 +95,14 @@ Multiple conditions AND together.
 **CLI flags:** `--addr`, `--dir`, `--join <seed,seed>`, `--rf <n>`, `--fsync`,
 `--auth-token <bearer>`, `--tls-cert/--tls-key/--tls-ca` (mutual TLS on `/internal/*`),
 `--archive-dir/--archive-interval` (PITR archiving), `--max-inflight` (load shedding),
-`--trace-slow-ms` (slow-request log), `--encryption-key <64-hex>` (encryption at rest).
+`--trace-slow-ms` (slow-request log), `--encryption-key <64-hex>` (encryption at rest),
+`--cluster-name <name>` (refuses internal traffic from other clusters), `--json-log`
+(structured JSON logs for Loki/CloudWatch/ELK), `--idempotency-ttl <dur>` (dedupe
+window for `Idempotency-Key` retries, default 10m, 0 disables).
+
+**Idempotent retries:** send `Idempotency-Key: <uuid>` on any PUT/POST/DELETE; within
+the TTL a replay returns the original response with `X-Idempotent-Replay: true` and
+does not bump the document version.
 
 **microctl:** `backup --dir D --out F` · `restore --dir D --in F` · `status --url U` ·
 `hints --url U` (handoff debt) · `decommission --url U` (drain a node before stopping it) ·

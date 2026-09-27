@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ type Server struct {
 	mux     *http.ServeMux
 	fwdClient *http.Client
 	rf      int // replication factor (ring owners consulted per write)
+	idem    *idempotencyCache
 }
 
 // ReplicationFactor returns the configured RF.
@@ -87,6 +89,15 @@ type replTask struct {
 	doc  *store.Doc
 }
 
+// Version is the build identity; stamped at release time.
+const Version = "0.9.0"
+
+var startTime = time.Now()
+
+func goVersion() string {
+	return runtime.Version()
+}
+
 func New(self string, st *store.Store, cl *cluster.Cluster) *Server {
 	return NewWithRF(self, st, cl, 3)
 }
@@ -96,11 +107,13 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	if rf < 1 {
 		rf = 1
 	}
-	s := &Server{st: st, cl: cl, self: self, repl: make(chan replTask, 256), mux: http.NewServeMux(), fwdClient: &http.Client{Timeout: 5 * time.Second}, rf: rf}
+	s := &Server{st: st, cl: cl, self: self, repl: make(chan replTask, 256), mux: http.NewServeMux(), fwdClient: &http.Client{Timeout: 5 * time.Second}, rf: rf, idem: newIdempotencyCache(10 * time.Minute)}
 	s.ring = ring.Build([]string{self})
 	cl.OnPeersChanged = s.rebuildRing
 
 	s.mux.HandleFunc("GET /health", s.handleHealth)
+	s.mux.HandleFunc("GET /ready", s.handleReady)
+	s.mux.HandleFunc("GET /version", s.handleVersion)
 	// Public API is registered twice: unversioned (canonical) and
 	// under /v1 for clients that pin a version.
 	for _, prefix := range []string{"/api", "/v1/api"} {
@@ -140,7 +153,52 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	return s
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Cluster identity guard: internal traffic must carry our name.
+	// Prevents a misconfigured node from silently merging two
+	// clusters' data and rings.
+	if expected := s.cl.ClusterName(); expected != "" && strings.HasPrefix(r.URL.Path, "/internal/") {
+		got := r.Header.Get("X-Microdb-Cluster")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
+			atomic.AddInt64(metrics.Default.Counter("microdb_cluster_mismatch_total", "Internal requests rejected for cluster mismatch"), 1)
+			writeJSON(w, 403, map[string]interface{}{
+				"error":  "cluster name mismatch — this node belongs to a different cluster",
+				"wanted": expected,
+				"got":    got,
+			})
+			return
+		}
+	}
+	// Idempotency: mutating requests carrying an Idempotency-Key are
+	// executed at most once per TTL; replays get the cached response.
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" || s.idem.ttl <= 0 || (r.Method != "PUT" && r.Method != "POST" && r.Method != "DELETE") {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
+	if e, ok := s.idem.get(key); ok {
+		atomic.AddInt64(metrics.Default.Counter("microdb_idempotent_replays_total", "Requests answered from idempotency cache"), 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Idempotent-Replay", "true")
+		w.WriteHeader(e.status)
+		w.Write(e.body)
+		return
+	}
+	rec := &recordingWriter{hdr: http.Header{}, body: &bytes.Buffer{}}
+	s.mux.ServeHTTP(rec, r)
+	s.idem.put(key, idemEntry{status: rec.status, body: rec.body.Bytes(), created: time.Now()})
+	for k, v := range rec.hdr {
+		for _, vv := range v {
+			w.Header().Add(k, vv)
+		}
+	}
+	w.WriteHeader(rec.status)
+	w.Write(rec.body.Bytes())
+}
+
+// SetIdempotencyTTL configures the dedupe window for Idempotency-Key
+// retries. 0 disables deduplication entirely.
+func (s *Server) SetIdempotencyTTL(d time.Duration) { s.idem = newIdempotencyCache(d) }
 
 // RequireInternalTLS wraps a handler so that /internal/* paths must
 // present a verified client certificate (mutual TLS). Public API
@@ -156,6 +214,75 @@ func RequireInternalTLS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// idempotencyCache provides a short-lived dedupe cache for client
+// retries: a PUT/POST carrying an Idempotency-Key header is executed
+// at most once within the TTL; replays get the original response
+// replayed from the cache. This makes client retries safe under
+// network flakiness (no double-apply, no version churn).
+type idempotencyCache struct {
+	mu      sync.Mutex
+	entries map[string]idemEntry
+	ttl     time.Duration
+}
+
+type idemEntry struct {
+	status  int
+	body    []byte
+	created time.Time
+}
+
+func newIdempotencyCache(ttl time.Duration) *idempotencyCache {
+	return &idempotencyCache{entries: map[string]idemEntry{}, ttl: ttl}
+}
+
+func (c *idempotencyCache) get(key string) (idemEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok || time.Since(e.created) > c.ttl {
+		if ok {
+			delete(c.entries, key)
+		}
+		return idemEntry{}, false
+	}
+	return e, true
+}
+
+func (c *idempotencyCache) put(key string, e idemEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Opportunistic GC of expired entries.
+	for k, v := range c.entries {
+		if time.Since(v.created) > c.ttl {
+			delete(c.entries, k)
+		}
+	}
+	c.entries[key] = e
+}
+
+// recordingWriter captures a response for later replay.
+type recordingWriter struct {
+	hdr    http.Header
+	body   *bytes.Buffer
+	status int
+	wrote  bool
+}
+
+func (r *recordingWriter) Header() http.Header { return r.hdr }
+func (r *recordingWriter) Write(b []byte) (int, error) {
+	if !r.wrote {
+		r.status = 200
+		r.wrote = true
+	}
+	return r.body.Write(b)
+}
+func (r *recordingWriter) WriteHeader(code int) {
+	if !r.wrote {
+		r.status = code
+		r.wrote = true
+	}
 }
 
 // Backpressure sheds load before the cluster melts: at most maxInflight
@@ -298,6 +425,34 @@ func (s *Server) fanout(d *store.Doc) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok", "node": s.self})
+}
+
+// handleReady is the load-balancer readiness probe: 200 only when
+// this node can actually serve traffic — bootstrapped (has its data),
+// not draining, and (if the cluster expects peers) has seen the mesh.
+// /health stays 200 whenever the process is up; /ready gates traffic.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.cl.Draining() {
+		writeJSON(w, 503, map[string]interface{}{"ready": false, "reason": "decommissioning"})
+		return
+	}
+	if s.cl.Streaming() {
+		writeJSON(w, 503, map[string]interface{}{"ready": false, "reason": "bootstrapping"})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ready": true, "node": s.self, "peers": len(s.cl.Peers())})
+}
+
+// handleVersion reports build identity for ops dashboards.
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{
+		"version":   Version,
+		"go":        goVersion(),
+		"node":      s.self,
+		"rf":        s.rf,
+		"cluster":   s.cl.ClusterName(),
+		"uptime_s":  time.Since(startTime).Seconds(),
+	})
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
