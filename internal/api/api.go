@@ -21,6 +21,7 @@ import (
 
 	"microdb/internal/cluster"
 	"microdb/internal/changelog"
+	"microdb/internal/gsi"
 	"microdb/internal/metrics"
 	"microdb/internal/migrate"
 	"microdb/internal/readcache"
@@ -44,7 +45,19 @@ type Server struct {
 	tenants *tenants.Registry
 	rcache  *readcache.Cache
 	rec     *storage.Local // storage-tier record boundary (fenced)
+	gsi     *gsi.Manager
 }
+
+// EnableGSI starts the async global-secondary-index service: a
+// background worker subscribed to the change feed maintains index
+// collections off the write path.
+func (s *Server) EnableGSI() {
+	s.gsi = gsi.NewManager(s.st)
+	s.gsi.Attach()
+}
+
+// GSI exposes the index manager (for tests/ops).
+func (s *Server) GSI() *gsi.Manager { return s.gsi }
 
 // EnableReadCache turns on a read-through cache for local (consistency
 // = one) point reads. Entries are invalidated synchronously by every
@@ -163,6 +176,9 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/config", s.handleGetConfigCollection)
 		s.mux.HandleFunc("PUT "+prefix+"/collections/{col}/schema", s.handlePutSchema)
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/schema", s.handleGetSchema)
+		s.mux.HandleFunc("PUT "+prefix+"/collections/{col}/gsi", s.handleDeclareGSI)
+		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/gsi", s.handleListGSI)
+		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/gsi/{name}", s.handleLookupGSI)
 		s.mux.HandleFunc("GET "+prefix+"/cluster", s.handleCluster)
 	}
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -1417,6 +1433,73 @@ func (s *Server) handleRecordScan(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRecordEpoch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"epoch": s.currentRing().Epoch()})
+}
+
+// --- global secondary indexes (async, off the write path) ----------
+
+// handleDeclareGSI: PUT /api/collections/{col}/gsi
+//
+//	{"name":"by_city","field":"city"}
+//
+// Registers the index and backfills existing docs. New writes are
+// indexed asynchronously by the GSI worker — the response includes
+// the current lag so clients know how fresh the index is.
+func (s *Server) handleDeclareGSI(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "read body"})
+		return
+	}
+	var in gsi.Def
+	if err := json.Unmarshal(body, &in); err != nil {
+		writeJSON(w, 400, map[string]string{"error": `body must be {"name":"...","field":"..."}`})
+		return
+	}
+	if s.gsi == nil {
+		writeJSON(w, 503, map[string]string{"error": "GSI service not enabled (start with --gsi)"})
+		return
+	}
+	n, err := s.gsi.Declare(col, in)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	processed, head, _ := s.gsi.Lag()
+	writeJSON(w, 200, map[string]interface{}{
+		"collection": col, "index": in.Name, "field": in.Field,
+		"backfilled": n, "lag_processed": processed, "feed_head": head,
+	})
+}
+
+// handleListGSI: GET /api/collections/{col}/gsi
+func (s *Server) handleListGSI(w http.ResponseWriter, r *http.Request) {
+	if s.gsi == nil {
+		writeJSON(w, 200, map[string]interface{}{"indexes": []gsi.Def{}})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"indexes": s.gsi.Defs(r.PathValue("col"))})
+}
+
+// handleLookupGSI: GET /api/collections/{col}/gsi/{name}?value=X
+// Returns matching doc ids plus the index lag (processed vs feed
+// head) so the caller can judge staleness.
+func (s *Server) handleLookupGSI(w http.ResponseWriter, r *http.Request) {
+	if s.gsi == nil {
+		writeJSON(w, 503, map[string]string{"error": "GSI service not enabled (start with --gsi)"})
+		return
+	}
+	value := r.URL.Query().Get("value")
+	if value == "" {
+		writeJSON(w, 400, map[string]string{"error": "value query param required"})
+		return
+	}
+	ids, processed, head := s.gsi.Lookup(r.PathValue("col"), r.PathValue("name"), value)
+	writeJSON(w, 200, map[string]interface{}{
+		"ids": ids, "count": len(ids),
+		"lag_processed": processed, "feed_head": head,
+		"lag_events": head - processed,
+	})
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {

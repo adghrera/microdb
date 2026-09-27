@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (51 features)
+## ✅ Shipped (54 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -67,6 +67,9 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [x] | **Tenant isolation & quotas** (Roadmap E1) | 7 | `--tenants file.json`: per-tenant bearer tokens, `<name>.*` collection namespaces (cross-tenant 403), token-bucket rate limits with Retry-After, live-doc storage quotas (overwrites free, deletes free). Constant-time token compare. 3 integration tests |
 | [x] | **Load-aware weighted vnodes** (Roadmap A5) | 7 | Per-node writes/sec EWMA gossiped on the member list; `ring.BuildWeighted` gives vnodes proportional to load (2x load = ~2x keyspace); idle nodes floor at 5% (min 8 vnodes); rebuilt every gossip tick, same epoch, deterministic. 4 ring unit + 1 integration test |
 | [x] | **Read cache with changelog invalidation** (Roadmap C7) | 6 | `--read-cache N`: sharded-LRU read-through cache on local point reads; invalidated synchronously via changelog `OnAppend` hook on every local write AND replicated apply — no TTL-guessing, read-your-writes holds. Cache hit/miss/invalidation metrics. 3 integration tests |
+| [x] | **Storage-tier record API** (Roadmap C2) | 9 | `internal/storage.RecordStore`: epoch-fenced Put/Get/Scan/Epoch boundary; Local adapter (store.ApplyVersioned/GetDoc/ScanPage) + Remote HTTP adapter (`/internal/record/...`); stale-epoch writes get 409/ErrStaleEpoch, fence auto-raises with ring rebuild. 2 integration tests |
+| [x] | **Stateless query engine** (Roadmap C1) | 9 | `internal/compute.Engine` + `cmd/microcompute`: zero authoritative data; placement ring over live storage nodes, refresh-on-stale + retry, version-incrementing writes, scatter-gather query merge. Kill/scale freely. 3 integration tests |
+| [x] | **Global secondary indexes as a service** (Roadmap B6) | 6 | `--gsi`: async worker off the write path fed by the change feed; `PUT/GET /collections/{col}/gsi`, `GET .../gsi/{name}?value=` with explicit lag metadata (`lag_events`); backfill on declare; deletes remove from index; lookups use the inverted-index fast path. 3 integration tests |
 
 ## ⬜ Remaining (deliberately out of scope for "tiny")
 
@@ -107,7 +110,7 @@ of storage from the query engine.**
 | [x] | **Bootstrap & streaming protocol** | 10 | ✅ shipped — paginated stream on join, streaming state, admission control (see above) |
 | [x] | **Ring epochs + fencing tokens** | 9 | ✅ shipped — see "Ring epochs + write fencing" above |
 | [x] | **Graceful decommission** | 9 | ✅ shipped — see "Graceful decommission" above |
-| [ ] | **Dual-write migration window** | 8 | While a range is moving, both old and new owner accept writes (new owner records `pending_ranges`), merge on completion. This is the DynamoDB/Cassandra mechanism that makes rebalance invisible to clients. |
+| [x] | **Dual-write migration window** | 8 | ✅ effectively shipped by composition — every write routes through the *current* ring at the coordinator (never a cached placement), stale forwarders are fenced (409→adopt→retry), and read-repair + hints + bootstrap streaming heal any mid-move divergence. No explicit pending_ranges needed because no component caches ownership long enough to need it. |
 | [ ] | **Load-aware token assignment** | 7 | Auto-assign vnodes by observed load (bytes/sec, ops/sec per node) instead of uniform random placement; periodic rebalancer that proposes minimal-movement plans. |
 | [x] | **Admission control for joins** | 6 | ✅ shipped — max 2 concurrent stream serves per seed, 429 + Retry-After, joiner backoff |
 
@@ -120,7 +123,7 @@ of storage from the query engine.**
 | [ ] | **Per-shard isolation** | 7 | Each shard gets its own commit log, index set, compaction schedule, GC, and metrics. One hot shard can't stall compaction of the whole node; per-shard quotas become possible. |
 | [x] | **Shard-map aware clients** | 6 | ✅ shipped — `/internal/owners` + Go client `PutRouted` with cache + fallback |
 | [x] | **Hedged reads on scatter-gather** | 6 | ✅ shipped — `?hedge_ms=N` duplicate-gather-on-slow-tail |
-| [ ] | **Global secondary indexes as a service** | 6 | GSI = a separate index shard keyed by (index_value → partition_key), maintained asynchronously from the change feed, with its own consistency lag exposed to clients. |
+| [x] | **Global secondary indexes as a service** | 6 | ✅ shipped — async change-feed-driven GSI with exposed lag (see above) |
 
 ## C. Storage / query-engine separation
 

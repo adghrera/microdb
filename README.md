@@ -99,7 +99,8 @@ Multiple conditions AND together.
 `--trace-slow-ms` (slow-request log), `--encryption-key <64-hex>` (encryption at rest),
 `--durable-feed` (persist watch events; cursors survive restart),
 `--tenants <file.json>` (multi-tenant tokens/namespaces/rate-limits/quotas),
-`--read-cache <n>` (point-read cache invalidated by the change feed).
+`--read-cache <n>` (point-read cache invalidated by the change feed),
+`--gsi` (async global secondary indexes with exposed lag).
 `--cluster-name <name>` (refuses internal traffic from other clusters), `--json-log`
 (structured JSON logs for Loki/CloudWatch/ELK), `--idempotency-ttl <dur>` (dedupe
 window for `Idempotency-Key` retries, default 10m, 0 disables).
@@ -107,6 +108,12 @@ window for `Idempotency-Key` retries, default 10m, 0 disables).
 **Idempotent retries:** send `Idempotency-Key: <uuid>` on any PUT/POST/DELETE; within
 the TTL a replay returns the original response with `X-Idempotent-Replay: true` and
 does not bump the document version.
+
+**microcompute (stateless compute node):** `microcompute --addr :8090 --storage http://n1:8081,http://n2:8081`
+— routes reads/writes through the storage-tier record API; holds no data; scale/kill freely.
+
+**GSI:** `PUT /api/collections/{col}/gsi {"name":"by_city","field":"city"}` (backfills),
+`GET /api/collections/{col}/gsi/{name}?value=Lisbon` → ids + `lag_events`.
 
 **microctl:** `backup --dir D --out F` · `restore --dir D --in F` · `status --url U` ·
 `hints --url U` (handoff debt) · `decommission --url U` (drain a node before stopping it) ·
