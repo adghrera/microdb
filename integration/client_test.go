@@ -45,8 +45,13 @@ func TestGoClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Total != 3 || res.Count != 2 {
+	// limit=2 triggers pushdown: the window is exact (2 docs, desc)
+	// but the pre-pagination total is a lower bound.
+	if res.Count != 2 || res.Total < 2 {
 		t.Fatalf("query counts wrong: %+v", res)
+	}
+	if res.TotalExact {
+		t.Fatalf("pushed-down window should report inexact total: %+v", res)
 	}
 	if res.Docs[0].ID != "u3" || res.Docs[1].ID != "u2" {
 		t.Fatalf("sort desc wrong: %s %s", res.Docs[0].ID, res.Docs[1].ID)

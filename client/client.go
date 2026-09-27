@@ -63,10 +63,14 @@ type Doc struct {
 
 // QueryResult is the paginated query envelope.
 type QueryResult struct {
-	Count   int    `json:"count"`
-	Total   int    `json:"total"`
-	Docs    []*Doc `json:"docs"`
-	Partial bool   `json:"partial,omitempty"`
+	Count int    `json:"count"`
+	Total int    `json:"total"`
+	Docs  []*Doc `json:"docs"`
+	// TotalExact reports whether Total is the exact match count.
+	// With sort/limit pushdown a truncated shard makes Total a lower
+	// bound (TotalExact=false); the returned window is always exact.
+	TotalExact bool  `json:"total_exact"`
+	Partial    bool  `json:"partial,omitempty"`
 }
 
 // Event is a change-feed event.

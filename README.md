@@ -83,6 +83,7 @@ exchanges just those documents, both directions.
 | `GET` | `/api/collections/{col}/docs` | Scatter-gather. `filter`, `sort`, `desc`, `limit`, `offset`, `hedge_ms`. |
 | `GET` | `/api/collections/{col}/watch?since=N&wait=S` | NDJSON change feed (long-poll). |
 | `PUT`/`GET` | `/api/collections/{col}/config` | Per-collection settings: `{"rf": n}` replication factor (0 clears). |
+| `PUT`/`GET` | `/api/collections/{col}/schema` | Online migration: `{"transforms":[{"op":"rename\|drop\|retype","from":...,"to":...}]}` — append-only, applied lazily on read. |
 | `GET` | `/api/cluster` | Self + live peers. |
 | `GET` | `/health` | Liveness (never gated by auth). |
 | `GET` | `/ready` | Readiness: 503 while bootstrapping or decommissioning — gate LB traffic on this. |
@@ -96,6 +97,7 @@ Multiple conditions AND together.
 `--auth-token <bearer>`, `--tls-cert/--tls-key/--tls-ca` (mutual TLS on `/internal/*`),
 `--archive-dir/--archive-interval` (PITR archiving), `--max-inflight` (load shedding),
 `--trace-slow-ms` (slow-request log), `--encryption-key <64-hex>` (encryption at rest),
+`--durable-feed` (persist watch events; cursors survive restart),
 `--cluster-name <name>` (refuses internal traffic from other clusters), `--json-log`
 (structured JSON logs for Loki/CloudWatch/ELK), `--idempotency-ttl <dur>` (dedupe
 window for `Idempotency-Key` retries, default 10m, 0 disables).

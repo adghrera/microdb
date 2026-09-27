@@ -25,6 +25,7 @@ import (
 	"microdb/internal/index"
 	"microdb/internal/metrics"
 	"microdb/internal/merkle"
+	"microdb/internal/migrate"
 )
 
 type Doc struct {
@@ -687,6 +688,48 @@ func (s *Store) EffectiveRF(col string, fallback int) int {
 		return cfg.RF
 	}
 	return fallback
+}
+
+// SetCollectionSchema stores the collection's migration schema in
+// the same reserved _config doc (field "schema"), so it replicates
+// and survives restarts like any other data. Existing settings (rf)
+// are preserved.
+func (s *Store) SetCollectionSchema(col string, sch migrate.Schema) (*Doc, error) {
+	if err := sch.Validate(); err != nil {
+		return nil, err
+	}
+	cfg := s.GetCollectionConfig(col)
+	b, err := json.Marshal(sch)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	return s.Apply(ConfigCollection, col, map[string]interface{}{"rf": cfg.RF, "schema": m})
+}
+
+// GetCollectionSchema returns the stored schema for a collection
+// (ok=false when none is set).
+func (s *Store) GetCollectionSchema(col string) (migrate.Schema, bool) {
+	d, ok := s.Get(ConfigCollection, col)
+	if !ok {
+		return migrate.Schema{}, false
+	}
+	raw, ok := d.Fields["schema"].(map[string]interface{})
+	if !ok {
+		return migrate.Schema{}, false
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return migrate.Schema{}, false
+	}
+	var sch migrate.Schema
+	if err := json.Unmarshal(b, &sch); err != nil {
+		return migrate.Schema{}, false
+	}
+	return sch, true
 }
 
 // ArchiveRaw copies the raw commit log (full version history, not the

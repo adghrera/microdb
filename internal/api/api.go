@@ -20,6 +20,7 @@ import (
 
 	"microdb/internal/cluster"
 	"microdb/internal/metrics"
+	"microdb/internal/migrate"
 	"microdb/internal/ring"
 	"microdb/internal/store"
 )
@@ -125,6 +126,8 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/watch", s.handleWatch)
 		s.mux.HandleFunc("PUT "+prefix+"/collections/{col}/config", s.handleConfigCollection)
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/config", s.handleGetConfigCollection)
+		s.mux.HandleFunc("PUT "+prefix+"/collections/{col}/schema", s.handlePutSchema)
+		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/schema", s.handleGetSchema)
 		s.mux.HandleFunc("GET "+prefix+"/cluster", s.handleCluster)
 	}
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -455,6 +458,39 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// migrateDoc returns a schema-migrated COPY of d if the collection
+// has a schema and d is behind it; otherwise returns d unchanged.
+// The stored doc is never mutated on the read path — the transform
+// happens per-response, so migration is invisible, lazy, and safe
+// under concurrent readers.
+func (s *Server) migrateDoc(col string, d *store.Doc) *store.Doc {
+	if d == nil || col == store.ConfigCollection {
+		return d
+	}
+	sch, ok := s.st.GetCollectionSchema(col)
+	if !ok || sch.Version <= migrate.DocVer(d.Fields) {
+		return d
+	}
+	cp := *d
+	cp.Fields = make(map[string]interface{}, len(d.Fields)+1)
+	for k, v := range d.Fields {
+		cp.Fields[k] = v
+	}
+	if sch.Apply(cp.Fields) {
+		return &cp
+	}
+	return d
+}
+
+// migrateDocs maps migrateDoc over a slice.
+func (s *Server) migrateDocs(col string, docs []*store.Doc) []*store.Doc {
+	out := make([]*store.Doc, len(docs))
+	for i, d := range docs {
+		out[i] = s.migrateDoc(col, d)
+	}
+	return out
+}
+
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	id := r.PathValue("id")
@@ -477,7 +513,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "not found"})
 		return
 	}
-	writeJSON(w, 200, d)
+	writeJSON(w, 200, s.migrateDoc(col, d))
 }
 
 // quorumGet reads a doc from self + all live peers, merges by
@@ -527,7 +563,7 @@ func (s *Server) quorumGet(w http.ResponseWriter, col, id string, readAll bool) 
 			go func(peer string) { _ = s.cl.Replicate(peer, newest) }(m)
 		}
 	}
-	writeJSON(w, 200, newest)
+	writeJSON(w, 200, s.migrateDoc(col, newest))
 }
 
 // fetchDocFrom reads one doc from a member (self or peer) without
@@ -817,7 +853,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	gatherOne := func(m string) gatherResult {
 		if m == s.self {
-			docs := s.st.ScanIndexed(col, filter)
+			docs := s.migrateDocs(col, s.st.ScanIndexed(col, filter))
 			trunc := false
 			if pushdown {
 				sort.SliceStable(docs, func(i, j int) bool {
@@ -1021,6 +1057,11 @@ func (s *Server) handleWatch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for _, e := range evs {
+			if e.Kind == "upsert" && e.Doc != nil {
+				if d, ok := e.Doc.(*store.Doc); ok {
+					e.Doc = s.migrateDoc(col, d)
+				}
+			}
 			b, _ := json.Marshal(e)
 			w.Write(append(b, '\n'))
 			since = e.Seq
@@ -1051,7 +1092,7 @@ func (s *Server) handleInternalDoc(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "not found"})
 		return
 	}
-	writeJSON(w, 200, d)
+	writeJSON(w, 200, s.migrateDoc(col, d))
 }
 
 // handleInternalScan serves one shard of a scatter-gather query:
@@ -1073,7 +1114,7 @@ func (s *Server) handleInternalScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	docs := s.st.ScanIndexed(col, filter)
+	docs := s.migrateDocs(col, s.st.ScanIndexed(col, filter))
 	sortField := r.URL.Query().Get("sort")
 	desc := r.URL.Query().Get("desc") == "true"
 	capN := -1
@@ -1103,6 +1144,68 @@ func (s *Server) handleInternalScan(w http.ResponseWriter, r *http.Request) {
 		truncated = true
 	}
 	writeJSON(w, 200, map[string]interface{}{"docs": docs, "total": total, "truncated": truncated})
+}
+
+// handlePutSchema installs/updates a collection's migration schema:
+//
+//	PUT /api/collections/{col}/schema
+//	{"transforms":[{"op":"rename","from":"city","to":"town"},
+//	              {"op":"retype","from":"age","to":"int"}]}
+//
+// The schema version is len(transforms). Transforms are append-only:
+// the new list must extend the current one (same prefix, version >=
+// current), so already-migrated docs stay correct. Docs behind the
+// new version are transformed lazily on read — no rewrite needed.
+func (s *Server) handlePutSchema(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "read body"})
+		return
+	}
+	var in struct {
+		Transforms []migrate.Transform `json:"transforms"`
+	}
+	if err := json.Unmarshal(body, &in); err != nil {
+		writeJSON(w, 400, map[string]string{"error": `body must be {"transforms":[...]}`})
+		return
+	}
+	newSch := migrate.Schema{Version: len(in.Transforms), Transforms: in.Transforms}
+	if err := newSch.Validate(); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	if cur, ok := s.st.GetCollectionSchema(col); ok {
+		if newSch.Version < cur.Version {
+			writeJSON(w, 400, map[string]string{"error": "schema is append-only: new version must be >= current"})
+			return
+		}
+		for i := 0; i < cur.Version && i < len(newSch.Transforms); i++ {
+			if newSch.Transforms[i] != cur.Transforms[i] {
+				writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("transform %d already applied — cannot rewrite history", i)})
+				return
+			}
+		}
+	}
+	doc, err := s.st.SetCollectionSchema(col, newSch)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	s.fanout(doc)
+	writeJSON(w, 200, map[string]interface{}{"collection": col, "version": newSch.Version})
+}
+
+// handleGetSchema returns the collection's current schema (or
+// {"version":0} when none is set).
+func (s *Server) handleGetSchema(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	sch, ok := s.st.GetCollectionSchema(col)
+	if !ok {
+		writeJSON(w, 200, map[string]interface{}{"version": 0, "transforms": []migrate.Transform{}})
+		return
+	}
+	writeJSON(w, 200, sch)
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {

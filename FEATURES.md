@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (45 features)
+## ✅ Shipped (48 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -61,6 +61,9 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [x] | **Version endpoint** `/version` (Roadmap E6) | 4 | version/Go/node/rf/cluster/uptime for ops dashboards. `TestVersionEndpoint` |
 | [x] | **Idempotency keys** (Roadmap E6) | 8 | `Idempotency-Key` header on PUT/POST/DELETE deduped for `--idempotency-ttl` (default 10m); replays return cached response + `X-Idempotent-Replay`, no version churn. `TestIdempotencyKey`, `TestIdempotencyCacheExpiry` |
 | [x] | **Structured JSON logs** `--json-log` (Roadmap E6) | 4 | RFC3339Nano UTC timestamped JSON lines for log shippers. live-verified |
+| [x] | **Durable change feed** `--durable-feed` | 6 | Watch events persisted to `<dir>/feed.jsonl`, write-through before cursor release, replay on restart (seq + window), torn-tail tolerant, retention-bounded. Cursors survive node restarts. 3 unit + 1 store test |
+| [x] | **Sort/limit pushdown** on scatter-gather | 6 | `limit=` pushes sort+cap to every shard: each returns only its top (offset+limit) — O(shards x window) wire instead of O(all docs). Honest `total_exact` flag when truncation makes total a lower bound. `TestPaginationSort` extended |
+| [x] | **Online schema migration** (Roadmap E5) | 7 | `PUT /api/collections/{col}/schema` with append-only transforms (rename/drop/retype); docs carry `_schema_ver`, transformed lazily on read (get/query/watch/quorum) — no stop-the-world rewrite; schema replicates as `_config` data. 4 unit + 2 integration tests |
 
 ## ⬜ Remaining (deliberately out of scope for "tiny")
 
@@ -148,7 +151,7 @@ of storage from the query engine.**
 | [x] | **Per-table configuration** | 6 | ✅ shipped — per-collection RF via `_config` collection |
 | [x] | **Encryption at rest + per-tenant keys** | 6 | ✅ shipped (single-key) — AES-256-GCM per-record; per-tenant keys would need tenancy (E1) |
 | [x] | **Distributed tracing** | 5 | ✅ shipped — X-Trace-Id + latency buckets + slow-request log |
-| [ ] | **Online schema migration** | 5 | Versioned item schemas with background converters; no downtime for field renames/retypes. |
+| [x] | **Online schema migration** | 5 | ✅ shipped — lazy per-doc transforms with `_schema_ver` marker; background persist pass still open |
 
 ---
 
