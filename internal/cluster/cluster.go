@@ -104,6 +104,16 @@ type Cluster struct {
 	stop    chan struct{}
 	// hints is the hinted-handoff store; nil until EnableHints is called.
 	hints *hints.Store
+	// draining marks a node that has begun graceful decommission: it
+	// refuses new writes while its data is handed off to the remaining
+	// peers.
+	draining bool
+	// left holds addresses that gracefully departed, with the time of
+	// departure. Gossip must not resurrect them for the tombstone
+	// window (longer than gossip convergence), but an explicit Join
+	// clears the tombstone so a restarted node on the same address is
+	// accepted.
+	left map[string]time.Time
 	// OnPeersChanged is called with the live peer list whenever membership changes.
 	OnPeersChanged func(addrs []string)
 }
@@ -120,6 +130,7 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 	return &Cluster{
 		self:   self,
 		peers:  map[string]time.Time{},
+		left:   map[string]time.Time{},
 		st:     st,
 		client: &http.Client{Timeout: 3 * time.Second, Transport: transport},
 		stop:   make(chan struct{}),
@@ -128,6 +139,10 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 
 // Join contacts a known seed node and asks for its member list.
 func (c *Cluster) Join(seed string) error {
+	// We are (re)joining under our own address: clear any local
+	// tombstone for it so a restarted node is accepted cluster-wide
+	// once the seed propagates our presence.
+	c.ClearLeave(c.self)
 	resp, err := c.client.Post(seed+"/internal/join", "application/json",
 		bytes.NewReader([]byte(`{"addr":"`+c.self+`"}`)))
 	if err != nil {
@@ -159,12 +174,26 @@ func (c *Cluster) Join(seed string) error {
 func (c *Cluster) seen(addr string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A gracefully-departed address must not be resurrected by stale
+	// gossip until its tombstone window passes (2x the TTL, so every
+	// node's member list has turned over at least once).
+	if t, ok := c.left[addr]; ok && time.Since(t) < 30*time.Second {
+		return false
+	}
 	_, had := c.peers[addr]
 	c.peers[addr] = time.Now()
 	if !had {
 		c.epoch++ // membership changed — new fencing epoch
 	}
 	return !had
+}
+
+// ClearLeave removes a departure tombstone so the address may rejoin
+// (explicit Join calls do this for the joiner).
+func (c *Cluster) ClearLeave(addr string) {
+	c.mu.Lock()
+	delete(c.left, addr)
+	c.mu.Unlock()
 }
 
 // Epoch returns the current membership epoch. Writes carry it so a node
@@ -495,20 +524,40 @@ func (c *Cluster) gossipRound() {
 	if c.seen(peer) {
 		changed = true
 	}
-	// Push our view + epoch, pull theirs.
+	// Push our view + epoch + departure tombstones, pull theirs.
 	members := c.memberList()
-	body, _ := json.Marshal(map[string]interface{}{"addr": c.self, "members": members, "epoch": c.Epoch()})
+	c.mu.RLock()
+	left := make(map[string]int64, len(c.left))
+	for a, t := range c.left {
+		left[a] = t.UnixMilli()
+	}
+	c.mu.RUnlock()
+	body, _ := json.Marshal(map[string]interface{}{"addr": c.self, "members": members, "epoch": c.Epoch(), "left": left})
 	resp, err := c.client.Post(peer+"/internal/gossip", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Members []Member `json:"members"`
-		Epoch   int64    `json:"epoch"`
+		Members []Member          `json:"members"`
+		Epoch   int64           `json:"epoch"`
+		Left    map[string]int64 `json:"left"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&out) != nil {
 		return
+	}
+	// Merge departure tombstones (keep the latest timestamp per addr)
+	// so the whole cluster refuses to resurrect a gracefully-departed
+	// node, not just the peers it notified directly.
+	if len(out.Left) > 0 {
+		c.mu.Lock()
+		for a, ms := range out.Left {
+			t := time.UnixMilli(ms)
+			if cur, ok := c.left[a]; !ok || t.After(cur) {
+				c.left[a] = t
+			}
+		}
+		c.mu.Unlock()
 	}
 	now := time.Now().UnixMilli()
 	for _, m := range out.Members {
@@ -561,15 +610,19 @@ func (c *Cluster) evict() {
 	}
 }
 
-// AdoptEpoch raises our epoch to at least n (never lowers) and fires
-// the membership callback so the ring is rebuilt with the new epoch.
+// AdoptEpoch raises our epoch to at least n (never lowers) and ALWAYS
+// fires the membership callback so the ring is rebuilt with the new
+// epoch. It must not skip the rebuild when the cluster epoch already
+// equals n: the ring can lag the cluster epoch (epoch adopted via one
+// path, ring rebuilt at an older value), and a stale ring epoch would
+// make us fence ourselves forever.
 func (c *Cluster) AdoptEpoch(n int64) {
 	c.mu.Lock()
-	changed := c.adoptEpochLocked(n)
+	c.adoptEpochLocked(n)
 	cb := c.OnPeersChanged
 	peers := c.peersLocked()
 	c.mu.Unlock()
-	if changed && cb != nil {
+	if cb != nil {
 		cb(peers)
 	}
 }
@@ -694,6 +747,111 @@ func (c *Cluster) HandleHints(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Draining reports whether this node is mid-decommission.
+func (c *Cluster) Draining() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.draining
+}
+
+// Decommission gracefully removes this node from the cluster:
+//  1. mark draining (new writes to this node are refused with 503)
+//  2. push every local doc to every remaining peer in bulk so no
+//     range depends on us any more
+//  3. broadcast a leave so peers evict us immediately and rebuild
+//     their rings, instead of waiting out the 15s TTL
+//
+// Returns how many docs were handed off. After it returns the process
+// can exit; remaining nodes converge on the new ring.
+func (c *Cluster) Decommission() (int, error) {
+	c.mu.Lock()
+	c.draining = true
+	peers := c.peersLocked()
+	c.mu.Unlock()
+	if len(peers) == 0 {
+		return 0, nil // standalone node: nothing to hand off
+	}
+	docs := c.st.AllDocs()
+	// Hand off in chunks so a huge store doesn't build one giant request.
+	const chunk = 500
+	handedOff := 0
+	for i := 0; i < len(docs); i += chunk {
+		end := i + chunk
+		if end > len(docs) {
+			end = len(docs)
+		}
+		b, _ := json.Marshal(map[string]interface{}{"docs": docs[i:end]})
+		for _, p := range peers {
+			resp, err := c.client.Post(p+"/internal/replicate_bulk", "application/json", bytes.NewReader(b))
+			if err != nil {
+				// Peer down mid-drain: stash as hints so a later
+				// return still gets the data.
+				for _, d := range docs[i:end] {
+					c.hintFailed(p, d)
+				}
+				continue
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		handedOff = end
+	}
+	// Tell everyone we're leaving: they drop us from their member set
+	// right away and bump the epoch.
+	for _, p := range peers {
+		b, _ := json.Marshal(map[string]interface{}{"addr": c.self, "epoch": c.Epoch()})
+		resp, err := c.client.Post(p+"/internal/leave", "application/json", bytes.NewReader(b))
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}
+	return handedOff, nil
+}
+
+// HandleDecommission triggers graceful shutdown of this node over the
+// wire (used by `microctl decommission`). The node marks itself
+// draining, hands off its data, and broadcasts leave; the caller then
+// stops the process.
+func (c *Cluster) HandleDecommission(w http.ResponseWriter, r *http.Request) {
+	handedOff, err := c.Decommission()
+	if err != nil {
+		writeJSON(w, 500, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "handed_off": handedOff})
+}
+
+// HandleLeave processes a graceful-departure notice: remove the peer
+// now (with an epoch bump) and rebuild our ring. A leave for an
+// unknown address is a no-op.
+func (c *Cluster) HandleLeave(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Addr  string `json:"addr"`
+		Epoch int64  `json:"epoch"`
+	}
+	json.NewDecoder(r.Body).Decode(&in)
+	c.mu.Lock()
+	c.adoptEpochLocked(in.Epoch)
+	// Record the tombstone BEFORE deleting so a concurrent gossip
+	// carrying the old member list can't re-add the address.
+	if in.Addr != "" && in.Addr != c.self {
+		c.left[in.Addr] = time.Now()
+	}
+	_, had := c.peers[in.Addr]
+	delete(c.peers, in.Addr)
+	if had {
+		c.epoch++
+	}
+	cb := c.OnPeersChanged
+	peers := c.peersLocked()
+	c.mu.Unlock()
+	if had && cb != nil {
+		cb(peers)
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "removed": had, "epoch": c.Epoch()})
+}
+
 // Replicate sends a doc to a peer; fire-and-forget with one retry.
 // On failure the doc is stashed as a hint (if enabled) for later
 // handoff, so the write still reaches full RF once the peer returns.
@@ -727,27 +885,43 @@ func (c *Cluster) HandleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&in)
 	c.mu.Lock()
-	c.adoptEpochLocked(in.Epoch)
+	changed := c.adoptEpochLocked(in.Epoch)
+	cb := c.OnPeersChanged
+	// An explicit join overrides any departure tombstone for that
+	// address: the node is back on purpose, not stale gossip.
+	if in.Addr != "" && in.Addr != c.self {
+		delete(c.left, in.Addr)
+	}
 	c.mu.Unlock()
 	if in.Addr != "" && in.Addr != c.self {
-		if c.seen(in.Addr) && c.OnPeersChanged != nil {
-			// A new node joined us directly — our ring must learn it now,
-			// not only when gossip happens to report a change.
-			c.OnPeersChanged(c.Peers())
+		if c.seen(in.Addr) {
+			changed = true
 		}
+	}
+	if changed && cb != nil {
+		// A new node joined us directly — our ring must learn it now,
+		// not only when gossip happens to report a change.
+		cb(c.Peers())
 	}
 	writeJSON(w, 200, map[string]interface{}{"members": c.memberList(), "epoch": c.Epoch()})
 }
 
 func (c *Cluster) HandleGossip(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Addr    string   `json:"addr"`
-		Members []Member `json:"members"`
-		Epoch   int64    `json:"epoch"`
+		Addr    string           `json:"addr"`
+		Members []Member         `json:"members"`
+		Epoch   int64            `json:"epoch"`
+		Left    map[string]int64 `json:"left"`
 	}
 	json.NewDecoder(r.Body).Decode(&in)
 	c.mu.Lock()
 	c.adoptEpochLocked(in.Epoch)
+	for a, ms := range in.Left {
+		t := time.UnixMilli(ms)
+		if cur, ok := c.left[a]; !ok || t.After(cur) {
+			c.left[a] = t
+		}
+	}
 	c.mu.Unlock()
 	now := time.Now().UnixMilli()
 	for _, m := range in.Members {

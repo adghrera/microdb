@@ -447,6 +447,29 @@ func (s *Store) DocsByIDs(collection string, ids []string) []*Doc {
 // JSONL (one doc per line, current versions only — no history).
 // Safe to take while writes continue: the snapshot is taken under the
 // read lock.
+// AllDocs returns a snapshot of every stored doc (tombstones included)
+// sorted by (collection, id). Used by graceful decommission to hand
+// this node's data off to the remaining cluster.
+func (s *Store) AllDocs() []*Doc {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	docs := make([]*Doc, 0, len(s.docs))
+	for _, d := range s.docs {
+		docs = append(docs, d)
+	}
+	sort.Slice(docs, func(i, j int) bool {
+		if docs[i].Collection != docs[j].Collection {
+			return docs[i].Collection < docs[j].Collection
+		}
+		return docs[i].ID < docs[j].ID
+	})
+	return docs
+}
+
+// Backup writes a snapshot of the current in-memory state to w as
+// JSONL (one doc per line, current versions only — no history).
+// Safe to take while writes continue: the snapshot is taken under the
+// read lock.
 func (s *Store) Backup(w io.Writer) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

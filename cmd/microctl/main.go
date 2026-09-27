@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 
 	"microdb/internal/store"
 )
@@ -78,6 +79,25 @@ func main() {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
 		fmt.Println(string(body))
+	case "decommission":
+		// Ask the target node to drain: refuse writes, hand its data
+		// off to the remaining peers, and broadcast its departure.
+		// The node process itself must then be stopped by the operator.
+		req, err := http.NewRequest("POST", *url+"/internal/decommission", nil)
+		if err != nil {
+			fatal(err)
+		}
+		resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+		if err != nil {
+			fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			fatal(fmt.Errorf("decommission failed (%d): %s", resp.StatusCode, body))
+		}
+		fmt.Printf("node drained: %s\n", body)
+		fmt.Println("safe to stop the microdb process now")
 	default:
 		usage()
 		os.Exit(2)
@@ -103,7 +123,8 @@ commands:
   backup  --dir <data-dir> --out <file>    snapshot current state to JSONL
   restore --dir <data-dir> --in <file>     apply a JSONL backup (LWW merge)
   status  --url <node-url>                health + cluster view
-  hints   --url <node-url>                hinted-handoff debt (pending/delivered/dropped)`)
+  hints   --url <node-url>                hinted-handoff debt (pending/delivered/dropped)
+  decommission --url <node-url>          drain a node: hand off data + broadcast leave`)
 }
 
 func httpGet(url string) (*http.Response, error) {

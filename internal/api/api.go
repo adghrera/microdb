@@ -81,6 +81,8 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	s.mux.HandleFunc("GET /internal/merkle/{col}/node", cl.HandleMerkleNode)
 	s.mux.HandleFunc("GET /internal/merkle/{col}/leaf", cl.HandleMerkleLeaf)
 	s.mux.HandleFunc("POST /internal/antientropy", cl.HandleAntiEntropy)
+	s.mux.HandleFunc("POST /internal/leave", cl.HandleLeave)
+	s.mux.HandleFunc("POST /internal/decommission", cl.HandleDecommission)
 	s.mux.HandleFunc("GET /internal/hints", cl.HandleHints)
 	s.mux.HandleFunc("GET /internal/scan/{col}", s.handleInternalScan)
 
@@ -277,6 +279,10 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := col + "/" + id
+	if s.cl.Draining() {
+		writeJSON(w, 503, map[string]string{"error": "node is decommissioning, retry elsewhere"})
+		return
+	}
 	if !s.owns(key) {
 		s.forwardBytes(w, r, "PUT", "/api/collections/"+col+"/docs/"+id, body, 0)
 		return
@@ -334,6 +340,10 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 // doc out to its ring owners. One round-trip for bulk imports.
 func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
+	if s.cl.Draining() {
+		writeJSON(w, 503, map[string]string{"error": "node is decommissioning, retry elsewhere"})
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20)) // 32 MiB cap
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": "read body"})
@@ -361,6 +371,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	id := r.PathValue("id")
 	key := col + "/" + id
+	if s.cl.Draining() {
+		writeJSON(w, 503, map[string]string{"error": "node is decommissioning, retry elsewhere"})
+		return
+	}
 	if !s.owns(key) {
 		s.forwardBytes(w, r, "DELETE", "/api/collections/"+col+"/docs/"+id, nil, 0)
 		return
@@ -398,7 +412,12 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Microdb-Hop", "1")
+	// The hop marker guards against forwarding loops on the FIRST hop.
+	// A post-fencing retry must NOT carry it: we adopted a fresher ring
+	// view, so this attempt is a fresh first-hop, not a loop.
+	if attempt == 0 {
+		req.Header.Set("X-Microdb-Hop", "1")
+	}
 	req.Header.Set("X-Microdb-Epoch", strconv.FormatInt(s.currentRing().Epoch(), 10))
 	resp, err := s.fwdClient.Do(req)
 	if err != nil {
