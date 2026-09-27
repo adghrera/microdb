@@ -54,6 +54,104 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
+# 🚀 Roadmap: DynamoDB / Cassandra-class scalability
+
+What it would take to evolve microdb from a fixed-cluster toy into a horizontally
+scalable database: **dynamic node membership, real sharding, and full separation
+of storage from the query engine.**
+
+**Gap analysis — what we already have vs. what the real systems rely on:**
+
+| Concept | microdb today | DynamoDB / Cassandra |
+|---|---|---|
+| Membership | Gossip + TTL eviction ✅ | Same idea (gossip/seed nodes) ✅ |
+| Placement | Consistent-hash vnodes ✅ | Cassandra vnodes ✅ / DynamoDB range partitions ❌ |
+| New node | Starts **empty**, backfills via anti-entropy pull (O(all data), slow, no admission control) | **Bootstrap + streaming**: ranges transferred before the node serves reads |
+| Ring changes | Rebuilt locally per node, no global version | **Versioned ring epochs** with fencing tokens |
+| Data model | Collection + doc id | **Partition key + sort key**, per-partition ordering |
+| Storage/compute | **Coupled** — every node owns data and serves queries | **Disaggregated** — stateless compute over a durable storage/log tier |
+| Consistency | LWW eventual, RF fanout | **Quorum R+W>N**, tunable per request, hinted handoff |
+
+---
+
+## A. Elastic membership — add/remove nodes dynamically
+
+| ☐ | Feature | Pri | What it takes |
+|---|---------|-----|---------------|
+| [ ] | **Bootstrap & streaming protocol** | 10 | New node joins → receives ring metadata → **streams the ranges it now owns** from current owners *before* being admitted to the ring. Today a new node starts empty and pulls everything via 10s anti-entropy rounds — unbounded, unthrottled, and reads are stale until it finishes. Needs: range-transfer RPCs, resumable checkpoints, progress reporting, `STREAMING` node state (accept writes, refuse reads). |
+| [ ] | **Ring epochs + fencing tokens** | 9 | Every ring change bumps a global epoch. Storage rejects writes carrying a stale epoch (fencing); coordinators refresh their ring view on `EPOCH_MISMATCH` and retry. Without this, split-brain partitions both accept writes against different ownership maps and anti-entropy can silently lose ranges. |
+| [ ] | **Graceful decommission** | 9 | `microctl decommission <node>`: mark node draining → stream its ranges off to remaining owners → drain in-flight requests → remove from ring. Today a removed node just gets TTL-evicted; its data survives only on replicas that happened to receive it. |
+| [ ] | **Dual-write migration window** | 8 | While a range is moving, both old and new owner accept writes (new owner records `pending_ranges`), merge on completion. This is the DynamoDB/Cassandra mechanism that makes rebalance invisible to clients. |
+| [ ] | **Load-aware token assignment** | 7 | Auto-assign vnodes by observed load (bytes/sec, ops/sec per node) instead of uniform random placement; periodic rebalancer that proposes minimal-movement plans. |
+| [ ] | **Admission control for joins** | 6 | Rate-limit how many nodes may bootstrap concurrently (streaming is the most expensive op in the cluster); queue + priority for failed-join retries. |
+
+## B. Sharding — a real partitioning model
+
+| ☐ | Feature | Pri | What it takes |
+|---|---------|-----|---------------|
+| [ ] | **Partition key + sort key data model** | 8 | Dynamo-style composite keys: items grouped by partition key, ordered by sort key within the partition. Enables `Query(partition = X, sort BETWEEN a AND b)` served from one shard with no scatter. Today: flat `col/id`, no ordering, no locality. |
+| [ ] | **Range-based ownership with split/merge** | 8 | Move from pure vnode-hash to contiguous token ranges that can be **split** (DynamoDB auto-partitions hot keys) and **merged** (cold shards). Requires the epoch machinery from (A) to move ranges atomically. |
+| [ ] | **Per-shard isolation** | 7 | Each shard gets its own commit log, index set, compaction schedule, GC, and metrics. One hot shard can't stall compaction of the whole node; per-shard quotas become possible. |
+| [ ] | **Shard-map aware clients** | 6 | Clients cache the shard→node map, route directly, refresh on epoch mismatch. Cuts coordinator hop and lets the coordinator tier shrink. |
+| [ ] | **Hedged reads on scatter-gather** | 6 | Fire the slow tail of a scatter query a second time to a replica; take the first response. Standard DynamoDB latency trick for cross-partition scans. |
+| [ ] | **Global secondary indexes as a service** | 6 | GSI = a separate index shard keyed by (index_value → partition_key), maintained asynchronously from the change feed, with its own consistency lag exposed to clients. |
+
+## C. Storage / query-engine separation
+
+| ☐ | Feature | Pri | What it takes |
+|---|---------|-----|---------------|
+| [ ] | **Stateless query engine** | 9 | Compute nodes hold **no authoritative data**: they parse, plan, route to the storage tier, merge, and cache. A compute node can die or scale out with zero data movement. Today every node is both — the core coupling to break. |
+| [ ] | **Storage-tier record API** | 9 | Storage nodes expose a minimal, epoch-fenced record interface: `Put(key, ver, ts, value)`, `Get(key)`, `ScanRange(prefix, lo, hi)`, `Tombstone(key)`. The query engine never touches JSONL directly. This API boundary *is* the disaggregation. |
+| [ ] | **Durable shared commit log** | 8 | Writes append to a replicated log service (Kafka-like, or S3 segments with an append protocol) that the storage tier replays. Compute nodes become crash-free by construction; durability moves out of per-node `fsync` into the log's own replication (multi-AZ quorum). |
+| [ ] | **Tiered storage: hot NVMe + cold object store** | 7 | Storage nodes keep a bounded hot window on local SSD; older segments live in S3-compatible object storage, fetched lazily on read. Cost model of Aurora/DynamoDB: compute and IOPS scale independently of dataset size. |
+| [ ] | **Index service off the write path** | 7 | A separate tier consumes the change feed and maintains secondary indexes (currently in-process inverted indexes). Write latency stops paying for index maintenance; indexes scale and fail independently. |
+| [ ] | **Compute autoscaling** | 7 | Stateless query nodes behind a load balancer: scale out in seconds on CPU/queue-depth, scale in by draining. No bootstrap, no streaming — the payoff of (C1). |
+| [ ] | **Cache invalidation via changelog** | 6 | Query-engine caches subscribe to the storage-tier change feed and invalidate on mutation instead of TTL-guessing. Makes read-your-writes cheap at the engine level. |
+
+## D. Consistency & durability at scale
+
+| ☐ | Feature | Pri | What it takes |
+|---|---------|-----|---------------|
+| [ ] | **Quorum reads (R + W > N)** | 8 | Read replicas, merge by (ver, ts), return after R agree. Prerequisite for strong reads and for surviving owner failure without data loss. Today: reads are single-node local. |
+| [ ] | **Per-request tunable consistency** | 7 | `?consistency=one|quorum|all|local_quorum` on reads and writes — the Cassandra contract clients expect. |
+| [ ] | **Hinted handoff** | 7 | When the owner is down, a coordinator stashes the write locally with a hint and replays when the owner returns. Keeps writes at full RF without blocking on the failed node (Dynamo's answer to the RF-fanout stall). |
+| [ ] | **Read-path read repair** | 6 | On any read that sees divergent replicas, asynchronously push the newest version to the stale ones. Merkle anti-entropy already exists for the background path; this makes the *read* path self-healing. |
+| [ ] | **Point-in-time recovery (PITR)** | 7 | Archive commit-log segments to object storage continuously; restore = replay to any timestamp within the retention window. Upgrades `microctl backup` (snapshot-only) to continuous recovery. |
+| [ ] | **Multi-region replication** | 6 | Cross-region log shipping + conflict resolution **beyond LWW** (vector clocks or CRDTs — LWW across regions silently loses concurrent edits with clock skew). Global secondary index replication with lag metrics. |
+
+## E. Multi-tenancy & production operations
+
+| ☐ | Feature | Pri | What it takes |
+|---|---------|-----|---------------|
+| [ ] | **Tenant isolation & quotas** | 7 | Per-tenant rate limits, storage quotas, per-tenant auth; noisy-neighbor control at the admission layer. |
+| [ ] | **Admission control / backpressure** | 7 | Queue-depth and latency-signal-based load shedding: reject over budget with 429 + retry-after before the cluster melts. |
+| [ ] | **Per-table configuration** | 6 | RF, consistency defaults, index definitions, compaction policy per table instead of per-process flags. |
+| [ ] | **Encryption at rest + per-tenant keys** | 6 | Segment-level encryption (SSE-style), KMS-managed per-tenant keys. |
+| [ ] | **Distributed tracing** | 5 | Trace IDs through coordinator → storage → index tiers; per-span latency to find tail causes. |
+| [ ] | **Online schema migration** | 5 | Versioned item schemas with background converters; no downtime for field renames/retypes. |
+
+---
+
+## Suggested phasing
+
+| Phase | Theme | Features | Why this order |
+|-------|-------|----------|----------------|
+| **1** | Break the coupling | C1 stateless engine, C2 storage API | Everything else is easier once the boundary exists; do it before the codebase grows against the current coupling |
+| **2** | Make membership safe & dynamic | A2 epochs/fencing, A1 bootstrap+streaming, A4 dual-write, A3 decommission | Fencing first (correctness), then streaming (speed), then drain |
+| **3** | Real sharding | B1 partition/sort keys, B2 split/merge, B3 per-shard isolation | Needs phase-2 epoch machinery to move ranges safely |
+| **4** | Durability & consistency | C3 shared log, D1–D4 quorum/hints/read-repair, D5 PITR | Quorum needs stable ownership (phase 2) and the log gives the durability story |
+| **5** | Scale-out economics | C4 tiered storage, C5 index service, C6 autoscale, B5 hedged reads | Cost and tail-latency wins once the architecture supports them |
+| **6** | Production hardening | E1–E6, D6 multi-region | Multi-tenant / multi-region only after single-region is elastic |
+
+**Honest scope note:** phases 1–3 alone are roughly a rewrite of the ownership and
+data-placement layers (the ring, store, and cluster packages stop being one
+process-level blob). That's the real cost of disaggregation — DynamoDB, Cassandra,
+and Aurora each represent many engineer-years in exactly these layers. microdb's
+current gossip + Merkle + LWW pieces map 1:1 onto concepts these systems use, so
+the *knowledge* transfers even where the code must be restructured.
+
+---
+
 ## Commit history (one feature per commit)
 
 ```
