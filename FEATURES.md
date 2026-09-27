@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (35 features)
+## ✅ Shipped (40 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -52,6 +52,10 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [x] | **Hedged reads on scatter-gather** (Roadmap B5) | 6 | `?hedge_ms=N`: parallel gathers; slow members get a duplicate gather at another member, first response wins; failed hedges never mark response partial |
 | [x] | **Shard-map aware clients** (Roadmap B4) | 6 | `GET /internal/owners/{col}/{id}` (owners + epoch); Go client `Owners`/`PutRouted`/`InvalidateShardMap` — writes go straight to the primary, cache-drop + fallback on move |
 | [x] | **Point-in-time recovery (PITR)** (Roadmap D5) | 7 | `--archive-dir`/`--archive-interval` continuously copy the raw commit log; `microctl pitr --in <log> --until <ts> --dir <new>` replays to any point; recovered store is durable + live. Live-verified restore-before-later-writes |
+| [x] | **Backpressure / load shedding** (Roadmap E2) | 7 | `--max-inflight`: 429 + Retry-After above the concurrent cap instead of queueing to timeout; /health never shed; shed counter + inflight gauge |
+| [x] | **Request tracing** (Roadmap E5) | 5 | X-Trace-Id on every response (honors incoming id), latency buckets fast/slow/very-slow, slow-request logging with trace id |
+| [x] | **Per-collection configuration** (Roadmap E3) | 6 | `PUT /api/collections/{col}/config {"rf": n}` — per-collection RF stored in reserved `_config` collection, replicated, honored by fanout/quorum/owner-set |
+| [x] | **Encryption at rest** (Roadmap E4) | 6 | AES-256-GCM per-record (`ENC1:` framing, fresh nonce per record); `--encryption-key`; mixed plaintext/crypto logs; compaction re-encrypts; encrypted PITR; wrong-key fails loudly |
 
 ## ⬜ Remaining (deliberately out of scope for "tiny")
 
@@ -135,10 +139,10 @@ of storage from the query engine.**
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
 | [ ] | **Tenant isolation & quotas** | 7 | Per-tenant rate limits, storage quotas, per-tenant auth; noisy-neighbor control at the admission layer. |
-| [ ] | **Admission control / backpressure** | 7 | Queue-depth and latency-signal-based load shedding: reject over budget with 429 + retry-after before the cluster melts. |
-| [ ] | **Per-table configuration** | 6 | RF, consistency defaults, index definitions, compaction policy per table instead of per-process flags. |
-| [ ] | **Encryption at rest + per-tenant keys** | 6 | Segment-level encryption (SSE-style), KMS-managed per-tenant keys. |
-| [ ] | **Distributed tracing** | 5 | Trace IDs through coordinator → storage → index tiers; per-span latency to find tail causes. |
+| [x] | **Admission control / backpressure** | 7 | ✅ shipped — `--max-inflight` sheds with 429 + Retry-After |
+| [x] | **Per-table configuration** | 6 | ✅ shipped — per-collection RF via `_config` collection |
+| [x] | **Encryption at rest + per-tenant keys** | 6 | ✅ shipped (single-key) — AES-256-GCM per-record; per-tenant keys would need tenancy (E1) |
+| [x] | **Distributed tracing** | 5 | ✅ shipped — X-Trace-Id + latency buckets + slow-request log |
 | [ ] | **Online schema migration** | 5 | Versioned item schemas with background converters; no downtime for field renames/retypes. |
 
 ---

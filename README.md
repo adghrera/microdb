@@ -80,8 +80,9 @@ exchanges just those documents, both directions.
 | `GET` | `/api/collections/{col}/docs/{id}` | Read. `?consistency=quorum\|all` for strong reads (merge replicas + read-repair). |
 | `DELETE` | `/api/collections/{col}/docs/{id}` | Tombstone delete, replicated. |
 | `POST` | `/api/collections/{col}/docs/batch` | `{"docs":{"id":{...},...}}` — one atomic record. |
-| `GET` | `/api/collections/{col}/docs` | Scatter-gather. `filter`, `sort`, `desc`, `limit`, `offset`. |
+| `GET` | `/api/collections/{col}/docs` | Scatter-gather. `filter`, `sort`, `desc`, `limit`, `offset`, `hedge_ms`. |
 | `GET` | `/api/collections/{col}/watch?since=N&wait=S` | NDJSON change feed (long-poll). |
+| `PUT`/`GET` | `/api/collections/{col}/config` | Per-collection settings: `{"rf": n}` replication factor (0 clears). |
 | `GET` | `/api/cluster` | Self + live peers. |
 | `GET` | `/health` | Liveness (never gated by auth). |
 | `GET` | `/metrics` | Prometheus text format. |
@@ -90,10 +91,13 @@ exchanges just those documents, both directions.
 Multiple conditions AND together.
 
 **CLI flags:** `--addr`, `--dir`, `--join <seed,seed>`, `--rf <n>`, `--fsync`,
-`--auth-token <bearer>`, `--tls-cert/--tls-key/--tls-ca` (mutual TLS on `/internal/*`).
+`--auth-token <bearer>`, `--tls-cert/--tls-key/--tls-ca` (mutual TLS on `/internal/*`),
+`--archive-dir/--archive-interval` (PITR archiving), `--max-inflight` (load shedding),
+`--trace-slow-ms` (slow-request log), `--encryption-key <64-hex>` (encryption at rest).
 
 **microctl:** `backup --dir D --out F` · `restore --dir D --in F` · `status --url U` ·
-`hints --url U` (handoff debt) · `decommission --url U` (drain a node before stopping it)
+`hints --url U` (handoff debt) · `decommission --url U` (drain a node before stopping it) ·
+`pitr --in <raw-log> --until <ts> --dir <new-dir> [--encryption-key K]`
 
 **Go client:** `client.New(url)` → `Put/Get/Delete/Batch/Query/Watch/Cluster/Health`,
 bearer token via `c.Token`, TLS via `client.NewTLS(url, caFile)`.
