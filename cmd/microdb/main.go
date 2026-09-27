@@ -30,6 +30,7 @@ import (
 	"microdb/internal/api"
 	"microdb/internal/cluster"
 	"microdb/internal/store"
+	"microdb/internal/tenants"
 )
 
 func main() {
@@ -51,6 +52,7 @@ func main() {
 	jsonLog := flag.Bool("json-log", false, "emit structured JSON logs")
 	idemTTL := flag.Duration("idempotency-ttl", 10*time.Minute, "dedupe window for Idempotency-Key retries (0 disables)")
 	durableFeed := flag.Bool("durable-feed", false, "persist the watch change feed to disk (cursors survive restart, 24h retention)")
+	tenantsFile := flag.String("tenants", "", "JSON file with tenant definitions (tokens, rate limits, quotas); enables multi-tenancy")
 	flag.Parse()
 
 	if *jsonLog {
@@ -157,6 +159,14 @@ func main() {
 	handler = api.RequireAPIAuth(*authToken, handler)
 	if *idemTTL > 0 {
 		srv.SetIdempotencyTTL(*idemTTL)
+	}
+	if *tenantsFile != "" {
+		reg, err := tenants.Load(*tenantsFile)
+		if err != nil {
+			log.Fatalf("load tenants: %v", err)
+		}
+		srv.SetTenants(reg)
+		log.Printf("multi-tenancy enabled: %d tenants from %s", len(reg.All()), *tenantsFile)
 	}
 	if *maxInflight > 0 {
 		handler = api.Backpressure(*maxInflight, handler)

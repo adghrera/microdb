@@ -23,6 +23,7 @@ import (
 	"microdb/internal/migrate"
 	"microdb/internal/ring"
 	"microdb/internal/store"
+	"microdb/internal/tenants"
 )
 
 type Server struct {
@@ -36,7 +37,14 @@ type Server struct {
 	fwdClient *http.Client
 	rf      int // replication factor (ring owners consulted per write)
 	idem    *idempotencyCache
+	tenants *tenants.Registry
 }
+
+// SetTenants enables multi-tenant admission control on the public
+// API: bearer tokens resolve to tenants, collections must live under
+// the tenant's "<name>." prefix, requests are rate-limited per
+// tenant, and writes are checked against the tenant's doc quota.
+func (s *Server) SetTenants(r *tenants.Registry) { s.tenants = r }
 
 // ReplicationFactor returns the configured RF.
 func (s *Server) ReplicationFactor() int { return s.rf }
@@ -169,6 +177,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"wanted": expected,
 				"got":    got,
 			})
+			return
+		}
+	}
+	// Multi-tenant admission: on the public API, a bearer token must
+	// resolve to a tenant, the collection must live under the
+	// tenant's "<name>." namespace, and the tenant's rate bucket
+	// must have a token. (Doc quota is checked per-write in the
+	// handlers, where the exact delta is known.)
+	if s.tenants != nil && !s.tenants.Empty() && (strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/v1/api/")) {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		t, ok := s.tenants.Lookup(tok)
+		if !ok {
+			writeJSON(w, 401, map[string]string{"error": "unknown tenant token"})
+			return
+		}
+		// Extract the collection from the path (/api/collections/{col}/...)
+		// — PathValue is only populated after mux routing, which hasn't
+		// happened yet at this point in ServeHTTP.
+		if col := collectionFromPath(r.URL.Path); col != "" && !tenants.PrefixAllowed(t, col) {
+			writeJSON(w, 403, map[string]string{"error": fmt.Sprintf("collection %q is outside tenant %q namespace", col, t.Name)})
+			return
+		}
+		if allowed, retry := s.tenants.AllowRate(t); !allowed {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retry.Seconds())+1))
+			writeJSON(w, 429, map[string]string{"error": "tenant rate limit exceeded"})
 			return
 		}
 	}
@@ -591,6 +624,38 @@ func (s *Server) fetchDocFrom(member, col, id string) (*store.Doc, error) {
 	return &d, nil
 }
 
+// collectionFromPath pulls {col} out of /api/collections/{col}/...
+// (or the /v1 prefix). Returns "" when the path doesn't carry one.
+func collectionFromPath(p string) string {
+	segs := strings.Split(strings.Trim(p, "/"), "/")
+	for i := 0; i+1 < len(segs); i++ {
+		if segs[i] == "collections" {
+			return segs[i+1]
+		}
+	}
+	return ""
+}
+
+// tenantQuotaOK checks the tenant that owns `col` against its doc
+// quota for admitting `delta` new live docs. No tenants configured,
+// no tenant owning the collection, or unlimited quota -> true.
+func (s *Server) tenantQuotaOK(col string, delta int64) (bool, *tenants.Tenant) {
+	if s.tenants == nil || s.tenants.Empty() {
+		return true, nil
+	}
+	name := tenants.TenantFromCollection(col)
+	if name == "" {
+		return true, nil
+	}
+	// Find the tenant by name (not token) for quota accounting.
+	for _, t := range s.tenants.All() {
+		if t.Name == name {
+			return s.tenants.CheckQuota(t, s.st.CountUnder(name+"."), delta), t
+		}
+	}
+	return true, nil
+}
+
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	id := r.PathValue("id")
@@ -618,6 +683,12 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	if h := r.Header.Get("X-Microdb-Epoch"); h != "" {
 		if fwdEpoch, err := strconv.ParseInt(h, 10, 64); err == nil && fwdEpoch < s.currentRing().Epoch() {
 			writeJSON(w, 409, map[string]interface{}{"error": "stale ring epoch", "epoch": s.currentRing().Epoch()})
+			return
+		}
+	}
+	if _, existed := s.st.Get(col, id); !existed {
+		if ok, t := s.tenantQuotaOK(col, 1); !ok {
+			writeJSON(w, 403, map[string]interface{}{"error": "tenant storage quota exceeded", "tenant": t.Name, "max_docs": t.MaxDocs})
 			return
 		}
 	}
@@ -690,6 +761,16 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.Unmarshal(body, &in); err != nil || len(in.Docs) == 0 {
 		writeJSON(w, 400, map[string]string{"error": `body must be {"docs": {id: fields, ...}}`})
+		return
+	}
+	var newCount int64
+	for id := range in.Docs {
+		if _, exists := s.st.Get(col, id); !exists {
+			newCount++
+		}
+	}
+	if ok, t := s.tenantQuotaOK(col, newCount); !ok {
+		writeJSON(w, 403, map[string]interface{}{"error": "tenant storage quota exceeded", "tenant": t.Name, "max_docs": t.MaxDocs})
 		return
 	}
 	docs, err := s.st.ApplyBatch(col, in.Docs)

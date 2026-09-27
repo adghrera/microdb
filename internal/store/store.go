@@ -690,6 +690,21 @@ func (s *Store) EffectiveRF(col string, fallback int) int {
 	return fallback
 }
 
+// CountUnder counts live (non-deleted) docs in every collection
+// whose name starts with prefix (e.g. "acme." counts acme.users,
+// acme.orders). Used for tenant storage quotas.
+func (s *Store) CountUnder(prefix string) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int64
+	for _, d := range s.docs {
+		if !d.Deleted && strings.HasPrefix(d.Collection, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
 // SetCollectionSchema stores the collection's migration schema in
 // the same reserved _config doc (field "schema"), so it replicates
 // and survives restarts like any other data. Existing settings (rf)
