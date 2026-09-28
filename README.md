@@ -82,7 +82,9 @@ exchanges just those documents, both directions.
 | `POST` | `/api/collections/{col}/docs/batch` | `{"docs":{"id":{...},...}}` — one atomic record. |
 | `GET` | `/api/collections/{col}/docs` | Scatter-gather. `filter`, `sort`, `desc`, `limit`, `offset`, `hedge_ms`. |
 | `GET` | `/api/collections/{col}/watch?since=N&wait=S` | NDJSON change feed (long-poll). |
-| `PUT`/`GET` | `/api/collections/{col}/config` | Per-collection settings: `{"rf": n}` replication factor (0 clears). |
+| `PUT`/`GET` | `/api/collections/{col}/config` | Per-collection settings: `rf`, `partition_field`, `sort_field`, `max_docs` (quota). |
+| `GET` | `/api/collections/{col}/partition/{pk}` | Single-shard partition query: `sort_gte/lte/gt/lt`, `desc`, `limit`. Requires `partition_field`. |
+| `GET` | `/api/stats/collections` | Per-collection ops counters + live doc counts (isolation visibility). |
 | `PUT`/`GET` | `/api/collections/{col}/schema` | Online migration: `{"transforms":[{"op":"rename\|drop\|retype","from":...,"to":...}]}` — append-only, applied lazily on read. |
 | `GET` | `/api/cluster` | Self + live peers. |
 | `GET` | `/health` | Liveness (never gated by auth). |

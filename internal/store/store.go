@@ -48,6 +48,67 @@ type Store struct {
 	idx    *index.IndexSet // inverted field indexes (fast exact-match lookups)
 	log    *changelog.Log  // bounded mutation feed for watchers
 	writes atomic.Int64   // client writes applied (load signal for placement)
+	// Per-collection live stats for isolation: ops counters and an
+	// approximate live-doc count per collection. A hot collection
+	// must be visible (metrics) and containable (quota) without
+	// touching other collections.
+	colStats map[string]*ColStats
+}
+
+// ColStats tracks live per-collection activity.
+type ColStats struct {
+	Writes  atomic.Int64
+	Deletes atomic.Int64
+	Reads   atomic.Int64
+	Queries atomic.Int64
+	Live    atomic.Int64 // live (non-deleted) docs
+}
+
+// StatsFor returns (creating if needed) the stats bucket for a
+// collection.
+func (s *Store) StatsFor(col string) *ColStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.colStats == nil {
+		s.colStats = map[string]*ColStats{}
+	}
+	st, ok := s.colStats[col]
+	if !ok {
+		st = &ColStats{}
+		s.colStats[col] = st
+	}
+	return st
+}
+
+// ColSnapshot is a plain-value snapshot of ColStats (map-safe).
+type ColSnapshot struct {
+	Writes  int64 `json:"writes"`
+	Deletes int64 `json:"deletes"`
+	Reads   int64 `json:"reads"`
+	Queries int64 `json:"queries"`
+	Live    int64 `json:"live_docs"`
+}
+
+// AllColStats snapshots per-collection stats.
+func (s *Store) AllColStats() map[string]ColSnapshot {
+	s.mu.RLock()
+	cols := make([]string, 0, len(s.colStats))
+	for c := range s.colStats {
+		cols = append(cols, c)
+	}
+	s.mu.RUnlock()
+	out := map[string]ColSnapshot{}
+	for _, c := range cols {
+		st := s.StatsFor(c)
+		out[c] = ColSnapshot{
+			Writes:  st.Writes.Load(),
+			Deletes: st.Deletes.Load(),
+			Reads:   st.Reads.Load(),
+			Queries: st.Queries.Load(),
+			Live:    st.Live.Load(),
+		}
+	}
+	return out
 }
 
 // WriteCount returns the number of client writes applied since start.
@@ -214,7 +275,7 @@ func OpenWithKey(dir, keyHex string) (*Store, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, "data.jsonl")
-	s := &Store{docs: map[string]*Doc{}, path: path, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute)}
+	s := &Store{docs: map[string]*Doc{}, path: path, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute), colStats: map[string]*ColStats{}}
 	if keyHex != "" {
 		if err := s.SetEncryptionKey(keyHex); err != nil {
 			return nil, err
@@ -288,6 +349,25 @@ func (s *Store) merge(d *Doc) bool {
 	k := key(d.Collection, d.ID)
 	cur, ok := s.docs[k]
 	if !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS) {
+		// Maintain the per-collection live count across the state
+		// transition (this is the only place docs change state).
+		// colStats may be nil on bare stores (e.g. PITR replay
+		// builds one directly) — lazily initialize.
+		if s.colStats == nil {
+			s.colStats = map[string]*ColStats{}
+		}
+		st := s.colStats[d.Collection]
+		if st == nil {
+			st = &ColStats{}
+			s.colStats[d.Collection] = st
+		}
+		wasLive := ok && !cur.Deleted
+		nowLive := !d.Deleted
+		if wasLive && !nowLive {
+			st.Live.Add(-1)
+		} else if !wasLive && nowLive {
+			st.Live.Add(1)
+		}
 		s.docs[k] = d
 		return true
 	}
@@ -664,7 +744,8 @@ const ConfigCollection = "_config"
 type CollectionConfig struct {
 	RF            int    `json:"rf,omitempty"`            // 0 = use the node default
 	PartitionField string `json:"partition_field,omitempty"` // route by this field's value, not doc id
-	SortField     string `json:"sort_field,omitempty"`     // within-partition ordering field
+	SortField     string `json:"sort_field,omitempty"`      // within-partition ordering field
+	MaxDocs     int64  `json:"max_docs,omitempty"`      // live-doc quota for this collection (0 = unlimited)
 }
 
 // SetCollectionConfig stores per-collection settings. The returned
@@ -677,6 +758,9 @@ func (s *Store) SetCollectionConfig(col string, cfg CollectionConfig) (*Doc, err
 	}
 	if cfg.SortField != "" {
 		fields["sort_field"] = cfg.SortField
+	}
+	if cfg.MaxDocs > 0 {
+		fields["max_docs"] = cfg.MaxDocs
 	}
 	return s.Apply(ConfigCollection, col, fields)
 }
@@ -700,6 +784,14 @@ func (s *Store) GetCollectionConfig(col string) CollectionConfig {
 	}
 	if v, ok := d.Fields["sort_field"].(string); ok {
 		cfg.SortField = v
+	}
+	switch v := d.Fields["max_docs"].(type) {
+	case float64:
+		cfg.MaxDocs = int64(v)
+	case int:
+		cfg.MaxDocs = int64(v)
+	case int64:
+		cfg.MaxDocs = v
 	}
 	return cfg
 }

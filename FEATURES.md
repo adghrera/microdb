@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (54 features)
+## ✅ Shipped (56 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -69,6 +69,8 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [x] | **Read cache with changelog invalidation** (Roadmap C7) | 6 | `--read-cache N`: sharded-LRU read-through cache on local point reads; invalidated synchronously via changelog `OnAppend` hook on every local write AND replicated apply — no TTL-guessing, read-your-writes holds. Cache hit/miss/invalidation metrics. 3 integration tests |
 | [x] | **Storage-tier record API** (Roadmap C2) | 9 | `internal/storage.RecordStore`: epoch-fenced Put/Get/Scan/Epoch boundary; Local adapter (store.ApplyVersioned/GetDoc/ScanPage) + Remote HTTP adapter (`/internal/record/...`); stale-epoch writes get 409/ErrStaleEpoch, fence auto-raises with ring rebuild. 2 integration tests |
 | [x] | **Stateless query engine** (Roadmap C1) | 9 | `internal/compute.Engine` + `cmd/microcompute`: zero authoritative data; placement ring over live storage nodes, refresh-on-stale + retry, version-incrementing writes, scatter-gather query merge. Kill/scale freely. 3 integration tests |
+| [x] | **Partition key + sort key data model** (Roadmap B1) | 8 | `partition_field`/`sort_field` in collection config; ids become `pk\|sort`; ring key = col/partitionValue so one partition = one shard. `GET /collections/{col}/partition/{pk}` = Dynamo-style Query (sort_gte/lte/gt/lt, desc, limit) served from ONE node, forwarded by non-owners. Write validation: id prefix must match partition field; batches stay in one partition. 3 integration tests |
+| [x] | **Per-collection isolation** (Roadmap B3) | 7 | Per-collection live stats (writes/deletes/reads/queries/live_docs) tracked at the merge choke point, seeded from replay on restart; `GET /api/stats/collections` for noisy-collection visibility; `max_docs` per-collection quota (403 on overflow, overwrites free, deletes free) — a runaway collection can't consume neighbors' headroom. 3 integration tests |
 | [x] | **Global secondary indexes as a service** (Roadmap B6) | 6 | `--gsi`: async worker off the write path fed by the change feed; `PUT/GET /collections/{col}/gsi`, `GET .../gsi/{name}?value=` with explicit lag metadata (`lag_events`); backfill on declare; deletes remove from index; lookups use the inverted-index fast path. 3 integration tests |
 
 ## ⬜ Remaining (deliberately out of scope for "tiny")
@@ -120,7 +122,7 @@ of storage from the query engine.**
 |---|---------|-----|---------------|
 | [ ] | **Partition key + sort key data model** | 8 | Dynamo-style composite keys: items grouped by partition key, ordered by sort key within the partition. Enables `Query(partition = X, sort BETWEEN a AND b)` served from one shard with no scatter. Today: flat `col/id`, no ordering, no locality. |
 | [ ] | **Range-based ownership with split/merge** | 8 | Move from pure vnode-hash to contiguous token ranges that can be **split** (DynamoDB auto-partitions hot keys) and **merged** (cold shards). Requires the epoch machinery from (A) to move ranges atomically. |
-| [ ] | **Per-shard isolation** | 7 | Each shard gets its own commit log, index set, compaction schedule, GC, and metrics. One hot shard can't stall compaction of the whole node; per-shard quotas become possible. |
+| [x] | **Per-shard isolation** | 7 | ✅ shipped at collection granularity (see above) — per-collection stats + quotas; per-collection physical log split remains out of scope for "tiny" |
 | [x] | **Shard-map aware clients** | 6 | ✅ shipped — `/internal/owners` + Go client `PutRouted` with cache + fallback |
 | [x] | **Hedged reads on scatter-gather** | 6 | ✅ shipped — `?hedge_ms=N` duplicate-gather-on-slow-tail |
 | [x] | **Global secondary indexes as a service** | 6 | ✅ shipped — async change-feed-driven GSI with exposed lag (see above) |

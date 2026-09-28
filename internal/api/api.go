@@ -106,9 +106,10 @@ func (s *Server) handleConfigCollection(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var in struct {
-		RF             int    `json:"rf"`
+		RF             int   `json:"rf"`
 		PartitionField string `json:"partition_field"`
 		SortField      string `json:"sort_field"`
+		MaxDocs        int64 `json:"max_docs"`
 	}
 	if err := json.Unmarshal(body, &in); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "body must be {\"rf\": n, \"partition_field\": \"x\", \"sort_field\": \"y\"}"})
@@ -129,7 +130,11 @@ func (s *Server) handleConfigCollection(w http.ResponseWriter, r *http.Request) 
 	if sf == "" {
 		sf = cur.SortField
 	}
-	cfgDoc, err := s.st.SetCollectionConfig(col, store.CollectionConfig{RF: in.RF, PartitionField: pf, SortField: sf})
+	md := in.MaxDocs
+	if md == 0 {
+		md = cur.MaxDocs
+	}
+	cfgDoc, err := s.st.SetCollectionConfig(col, store.CollectionConfig{RF: in.RF, PartitionField: pf, SortField: sf, MaxDocs: md})
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -137,7 +142,7 @@ func (s *Server) handleConfigCollection(w http.ResponseWriter, r *http.Request) 
 	// Replicate the config change like any other write.
 	s.fanout(cfgDoc)
 	writeJSON(w, 200, map[string]interface{}{"collection": col, "rf": in.RF, "effective": s.rfFor(col),
-		"partition_field": pf, "sort_field": sf})
+		"partition_field": pf, "sort_field": sf, "max_docs": md})
 }
 
 // handleGetConfigCollection reads the current settings.
@@ -203,6 +208,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 		s.mux.HandleFunc("GET "+prefix+"/cluster", s.handleCluster)
 	}
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
+	s.mux.HandleFunc("GET /api/stats/collections", s.handleCollectionStats)
 
 	// internal replication + membership endpoints
 	s.mux.HandleFunc("POST /internal/join", cl.HandleJoin)
@@ -662,6 +668,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "unknown consistency: use one|quorum|all|local_quorum"})
 		return
 	}
+	s.colOp(col, "read")
 	if s.rcache != nil {
 		ckey := col + "\x00" + id
 		if v, ok := s.rcache.Get(ckey); ok {
@@ -810,6 +817,17 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": perr})
 		return
 	}
+	// Per-collection quota: a runaway collection can't grow past its
+	// max_docs without affecting neighbors' capacity headroom.
+	if cfg := s.st.GetCollectionConfig(col); cfg.MaxDocs > 0 {
+		if _, exists := s.st.Get(col, id); !exists {
+			if s.st.StatsFor(col).Live.Load() >= cfg.MaxDocs {
+				writeJSON(w, 403, map[string]interface{}{"error": "collection quota exceeded", "collection": col, "max_docs": cfg.MaxDocs})
+				return
+			}
+		}
+	}
+	s.colOp(col, "write")
 	key := s.routingKey(col, id)
 	if s.cl.Draining() {
 		writeJSON(w, 503, map[string]string{"error": "node is decommissioning, retry elsewhere"})
@@ -936,6 +954,13 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 			newCount++
 		}
 	}
+	if cfg := s.st.GetCollectionConfig(col); cfg.MaxDocs > 0 {
+		if s.st.StatsFor(col).Live.Load()+newCount > cfg.MaxDocs {
+			writeJSON(w, 403, map[string]interface{}{"error": "collection quota exceeded", "collection": col, "max_docs": cfg.MaxDocs})
+			return
+		}
+	}
+	s.st.StatsFor(col).Writes.Add(int64(len(in.Docs)))
 	if ok, t := s.tenantQuotaOK(col, newCount); !ok {
 		writeJSON(w, 403, map[string]interface{}{"error": "tenant storage quota exceeded", "tenant": t.Name, "max_docs": t.MaxDocs})
 		return
@@ -954,6 +979,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	id := r.PathValue("id")
+	s.colOp(col, "delete")
 	key := s.routingKey(col, id)
 	if s.cl.Draining() {
 		writeJSON(w, 503, map[string]string{"error": "node is decommissioning, retry elsewhere"})
@@ -1041,6 +1067,7 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 // merged set.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
+	s.colOp(col, "query")
 	var filter map[string]interface{}
 	if f := r.URL.Query().Get("filter"); f != "" {
 		if err := json.Unmarshal([]byte(f), &filter); err != nil {
@@ -1710,6 +1737,29 @@ func sortPart(id string) string {
 		return id[i+1:]
 	}
 	return ""
+}
+
+// colOp bumps a per-collection operation counter (isolation
+// visibility: one hot collection is obvious in the stats and can be
+// quota-limited without touching its neighbors).
+func (s *Server) colOp(col, kind string) {
+	st := s.st.StatsFor(col)
+	switch kind {
+	case "read":
+		st.Reads.Add(1)
+	case "write":
+		st.Writes.Add(1)
+	case "delete":
+		st.Deletes.Add(1)
+	case "query":
+		st.Queries.Add(1)
+	}
+}
+
+// handleCollectionStats: GET /api/stats/collections — per-collection
+// ops + live docs (isolation observability).
+func (s *Server) handleCollectionStats(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{"collections": s.st.AllColStats()})
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
