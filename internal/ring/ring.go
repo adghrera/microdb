@@ -25,6 +25,10 @@ func hash(s string) uint32 {
 	return f.Sum32()
 }
 
+// Hash exposes the ring's token function so other components (the
+// range planner) can map keys into the same 32-bit token space.
+func Hash(s string) uint32 { return hash(s) }
+
 // Build creates a ring from the given node addresses (epoch 1).
 func Build(nodes []string) *Ring { return BuildWithEpoch(nodes, 1) }
 

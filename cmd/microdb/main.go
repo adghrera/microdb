@@ -57,6 +57,7 @@ func main() {
 	readCache := flag.Int("read-cache", 0, "cache this many point reads, invalidated by the change feed (0 disables)")
 	gsiOn := flag.Bool("gsi", false, "enable async global secondary index service (off the write path)")
 	sharedLog := flag.String("shared-log", "", "comma-separated shared commit log (microlog) URLs; client writes go through the log before touching local state")
+	rangeMap := flag.Duration("range-map", 0, "enable load-adaptive range ownership: replan interval (e.g. 2s); 0 = disabled (pure vnode ring)")
 	flag.Parse()
 
 	if *jsonLog {
@@ -184,6 +185,10 @@ func main() {
 	}
 	if *readCache > 0 {
 		srv.EnableReadCache(*readCache, 5*time.Minute)
+	}
+	if *rangeMap > 0 {
+		srv.EnableRangeMap(*rangeMap)
+		log.Printf("range map enabled: split/merge replan every %s", *rangeMap)
 	}
 	if *tenantsFile != "" {
 		reg, err := tenants.Load(*tenantsFile)

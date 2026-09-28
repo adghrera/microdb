@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (56 features)
+## ✅ Shipped (58 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -122,7 +122,7 @@ of storage from the query engine.**
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
 | [ ] | **Partition key + sort key data model** | 8 | Dynamo-style composite keys: items grouped by partition key, ordered by sort key within the partition. Enables `Query(partition = X, sort BETWEEN a AND b)` served from one shard with no scatter. Today: flat `col/id`, no ordering, no locality. |
-| [ ] | **Range-based ownership with split/merge** | 8 | Move from pure vnode-hash to contiguous token ranges that can be **split** (DynamoDB auto-partitions hot keys) and **merged** (cold shards). Requires the epoch machinery from (A) to move ranges atomically. |
+| [x] | **Range-based ownership with split/merge** | 8 | ✅ shipped — `internal/ranges`: contiguous token-range ownership over the 32-bit space, load-driven split at the load-median (hot-key auto-carving) and implicit merge on cooling. Deterministic planner = pure function of gossiped inputs (nodes, RF, 256-bucket EWMA writes/sec, epoch, base ring), so every node converges on the identical plan with no agreement protocol. Load signal shared peer-to-peer via `/internal/loadbuckets`; routing consults the plan first (epoch-guarded) and falls back to the vnode ring. Off by default: `--range-map <interval>`. |
 | [x] | **Per-shard isolation** | 7 | ✅ shipped at collection granularity (see above) — per-collection stats + quotas; per-collection physical log split remains out of scope for "tiny" |
 | [x] | **Shard-map aware clients** | 6 | ✅ shipped — `/internal/owners` + Go client `PutRouted` with cache + fallback |
 | [x] | **Hedged reads on scatter-gather** | 6 | ✅ shipped — `?hedge_ms=N` duplicate-gather-on-slow-tail |

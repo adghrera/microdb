@@ -25,6 +25,7 @@ import (
 	"microdb/internal/metrics"
 	"microdb/internal/migrate"
 	"microdb/internal/readcache"
+	"microdb/internal/ranges"
 	"microdb/internal/ring"
 	"microdb/internal/storage"
 	"microdb/internal/store"
@@ -46,6 +47,14 @@ type Server struct {
 	rcache  *readcache.Cache
 	rec     *storage.Local // storage-tier record boundary (fenced)
 	gsi     *gsi.Manager
+	// Range map (load-adaptive contiguous ownership): nil until
+	// EnableRangeMap. rangeBuckets counts writes per token high
+	// byte; rangeEWMA is the smoothed writes/sec; rangePlan is the
+	// last computed plan.
+	rangeMu      *sync.RWMutex
+	rangeBuckets []int64
+	rangeEWMA    []float64
+	rangePlan    *ranges.Plan
 }
 
 // EnableGSI starts the async global-secondary-index service: a
@@ -227,6 +236,9 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	s.mux.HandleFunc("GET /internal/stream/{col}", cl.HandleStream)
 	s.mux.HandleFunc("GET /internal/bootstrap", cl.HandleBootstrapStatus)
 	s.mux.HandleFunc("GET /internal/owners/{col}/{id}", s.handleOwners)
+	s.mux.HandleFunc("GET /internal/ranges", s.handleRangePlan)
+	s.mux.HandleFunc("POST /internal/ranges/replan", s.handleRangeReplan)
+	s.mux.HandleFunc("GET /internal/loadbuckets", s.handleLoadBuckets)
 	s.mux.HandleFunc("GET /internal/hints", cl.HandleHints)
 	s.mux.HandleFunc("GET /internal/scan/{col}", s.handleInternalScan)
 
@@ -527,7 +539,7 @@ func (s *Server) Owns(col, id string) bool {
 // OwnerSet returns the RF-owner set for col/id under the current ring
 // (exposed for tests and admin tooling).
 func (s *Server) OwnerSet(col, id string) []string {
-	return s.currentRing().Owners(s.routingKey(col, id), s.rfFor(col))
+	return s.placementOwners(s.routingKey(col, id), s.rfFor(col))
 }
 
 // owns returns true if this node is the primary owner of the key.
@@ -570,13 +582,13 @@ func (s *Server) checkPartitionID(col, id string, fields map[string]interface{})
 }
 
 func (s *Server) owns(key string) bool {
-	owners := s.currentRing().Owners(key, 1)
+	owners := s.placementOwners(key, 1)
 	return len(owners) > 0 && owners[0] == s.self
 }
 
 func (s *Server) fanout(d *store.Doc) {
 	key := d.Collection + "/" + d.ID
-	for _, peer := range s.currentRing().Owners(key, s.rfFor(d.Collection)) {
+	for _, peer := range s.placementOwners(key, s.rfFor(d.Collection)) {
 		if peer != s.self {
 			select {
 			case s.repl <- replTask{peer: peer, doc: d}:
@@ -833,7 +845,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 503, map[string]string{"error": "node is decommissioning, retry elsewhere"})
 		return
 	}
-	if !s.owns(key) {
+	if !s.owns(key) && r.Header.Get("X-Microdb-Forwarded") == "" {
 		s.forwardBytes(w, r, "PUT", "/api/collections/"+col+"/docs/"+id, body, 0)
 		return
 	}
@@ -863,7 +875,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	//   all          — block until every RF owner acked
 	consistency := r.URL.Query().Get("consistency")
 	if consistency == "quorum" || consistency == "all" || consistency == "local_quorum" {
-		members := s.currentRing().Owners(key, s.rfFor(col))
+		members := s.placementOwners(key, s.rfFor(col))
 		need := len(members)/2 + 1 // W = majority of the RF-owner set
 		if consistency == "all" {
 			need = len(members)
@@ -1007,7 +1019,7 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 		writeJSON(w, 503, map[string]string{"error": "ownership unstable, retry"})
 		return
 	}
-	owner := s.currentRing().Owners(s.routingKey(r.PathValue("col"), r.PathValue("id")), 1)
+	owner := s.placementOwners(s.routingKey(r.PathValue("col"), r.PathValue("id")), 1)
 	if len(owner) == 0 {
 		writeJSON(w, 503, map[string]string{"error": "no owner known"})
 		return
@@ -1028,6 +1040,11 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 	if attempt == 0 {
 		req.Header.Set("X-Microdb-Hop", "1")
 	}
+	// Tell the receiver this is an already-routed write: under the
+	// range map the primary can shift between ticks, so a forwarded
+	// write must be applied by whoever receives it instead of being
+	// bounced back in a ping-pong.
+	req.Header.Set("X-Microdb-Forwarded", "1")
 	req.Header.Set("X-Microdb-Epoch", strconv.FormatInt(s.currentRing().Epoch(), 10))
 	resp, err := s.fwdClient.Do(req)
 	if err != nil {
@@ -1638,7 +1655,7 @@ func (s *Server) handlePartitionQuery(w http.ResponseWriter, r *http.Request) {
 		// Forward straight to the partition owner (forwardBytes
 		// derives the owner from the doc-id path value, which this
 		// route doesn't have).
-		owner := s.currentRing().Owners(col+"/"+pk, 1)
+		owner := s.placementOwners(col+"/"+pk, 1)
 		if len(owner) == 0 {
 			writeJSON(w, 503, map[string]string{"error": "no owner known"})
 			return

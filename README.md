@@ -108,6 +108,10 @@ Multiple conditions AND together.
 window for `Idempotency-Key` retries, default 10m, 0 disables),
 `--shared-log <url,url,url>` (write-through every client mutation to a durable
 quorum-replicated shared commit log before it touches local state).
+`--range-map <interval>` (load-adaptive range ownership: hot token ranges split
+automatically and migrate off the hot node; cold shards merge. Off by default;
+e.g. `--range-map 2s`. Inspect via `GET /internal/ranges`, force with
+`POST /internal/ranges/replan`).
 
 **microlog (shared commit log service):** `microlog --addr :9001 --members http://h1:9001,http://h2:9002,http://h3:9003 --dir ./log1`
 — run 3 (odd) nodes; appends ACK only after a majority persist. Leader = first
