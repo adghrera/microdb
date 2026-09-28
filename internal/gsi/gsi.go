@@ -173,6 +173,12 @@ func (m *Manager) saveDefs(col string, defs []Def) error {
 	var fields map[string]interface{}
 	json.Unmarshal(b, &fields)
 	fields["rf"] = cfg.RF
+	if cfg.PartitionField != "" {
+		fields["partition_field"] = cfg.PartitionField
+	}
+	if cfg.SortField != "" {
+		fields["sort_field"] = cfg.SortField
+	}
 	_, err := m.st.Apply(store.ConfigCollection, col, fields)
 	return err
 }

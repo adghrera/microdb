@@ -662,14 +662,23 @@ const ConfigCollection = "_config"
 
 // CollectionConfig is the per-collection settings doc.
 type CollectionConfig struct {
-	RF int `json:"rf,omitempty"` // 0 = use the node default
+	RF            int    `json:"rf,omitempty"`            // 0 = use the node default
+	PartitionField string `json:"partition_field,omitempty"` // route by this field's value, not doc id
+	SortField     string `json:"sort_field,omitempty"`     // within-partition ordering field
 }
 
 // SetCollectionConfig stores per-collection settings. The returned
 // doc must be fanned out by the caller (the store itself doesn't
 // replicate — that's the API layer's job). rf <= 0 clears the override.
 func (s *Store) SetCollectionConfig(col string, cfg CollectionConfig) (*Doc, error) {
-	return s.Apply(ConfigCollection, col, map[string]interface{}{"rf": cfg.RF})
+	fields := map[string]interface{}{"rf": cfg.RF}
+	if cfg.PartitionField != "" {
+		fields["partition_field"] = cfg.PartitionField
+	}
+	if cfg.SortField != "" {
+		fields["sort_field"] = cfg.SortField
+	}
+	return s.Apply(ConfigCollection, col, fields)
 }
 
 // GetCollectionConfig returns the stored settings for a collection
@@ -685,6 +694,12 @@ func (s *Store) GetCollectionConfig(col string) CollectionConfig {
 		cfg.RF = int(v)
 	case int: // stored in-process by SetCollectionConfig
 		cfg.RF = v
+	}
+	if v, ok := d.Fields["partition_field"].(string); ok {
+		cfg.PartitionField = v
+	}
+	if v, ok := d.Fields["sort_field"].(string); ok {
+		cfg.SortField = v
 	}
 	return cfg
 }

@@ -95,10 +95,17 @@ func TestLoadAwarePlacement(t *testing.T) {
 	base := ownA()
 
 	// Hammer node A with writes for ~4 gossip ticks so its EWMA
-	// write-rate climbs well above B's (which stays ~0).
+	// write-rate climbs well above B's. Only keys A is primary for
+	// count toward A's load — writes to B-primary keys would be
+	// forwarded and load B instead (which is correct behavior, but
+	// would muddy this test's signal).
 	deadline := time.Now().Add(4500 * time.Millisecond)
 	for i := 0; time.Now().Before(deadline); i++ {
-		put(t, a.addr, "hotcol", "h"+itoa2(i), map[string]interface{}{"i": i})
+		key := "h" + itoa2(i)
+		if !a.apiSrv.Owns("hotcol", key) {
+			continue
+		}
+		put(t, a.addr, "hotcol", key, map[string]interface{}{"i": i})
 	}
 
 	// A's self load must be positive and gossiped to B.
@@ -108,12 +115,11 @@ func TestLoadAwarePlacement(t *testing.T) {
 
 	// The ring must have shifted: A now owns more of the sample than
 	// baseline (it carries all the load, B ~0, so A gets the max
-	// weight share).
-	moved := ownA()
-	if moved <= base {
-		t.Fatalf("ownership did not shift to hot node: base=%d now=%d (loads a=%.1f b=%.1f)",
-			base, moved, a.cl.SelfLoad(), b.cl.Loads()[a.addr])
-	}
+	// weight share). The rebuild happens on gossip ticks with the
+	// loads from the PREVIOUS round, so poll until it lands.
+	eventually(t, 15*time.Second, func() bool {
+		return ownA() > base
+	}, "ownership shifted to hot node")
 }
 
 func itoa2(i int) string {

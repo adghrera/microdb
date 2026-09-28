@@ -106,31 +106,51 @@ func (s *Server) handleConfigCollection(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var in struct {
-		RF int `json:"rf"`
+		RF             int    `json:"rf"`
+		PartitionField string `json:"partition_field"`
+		SortField      string `json:"sort_field"`
 	}
 	if err := json.Unmarshal(body, &in); err != nil {
-		writeJSON(w, 400, map[string]string{"error": "body must be {\"rf\": n}"})
+		writeJSON(w, 400, map[string]string{"error": "body must be {\"rf\": n, \"partition_field\": \"x\", \"sort_field\": \"y\"}"})
 		return
 	}
 	if in.RF < 0 || in.RF > 9 {
 		writeJSON(w, 400, map[string]string{"error": "rf must be 0..9 (0 clears the override)"})
 		return
 	}
-	cfgDoc, err := s.st.SetCollectionConfig(col, store.CollectionConfig{RF: in.RF})
+	// Preserve existing partition/sort settings when the caller only
+	// sends rf (and vice versa).
+	cur := s.st.GetCollectionConfig(col)
+	pf := in.PartitionField
+	if pf == "" {
+		pf = cur.PartitionField
+	}
+	sf := in.SortField
+	if sf == "" {
+		sf = cur.SortField
+	}
+	cfgDoc, err := s.st.SetCollectionConfig(col, store.CollectionConfig{RF: in.RF, PartitionField: pf, SortField: sf})
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
 	// Replicate the config change like any other write.
 	s.fanout(cfgDoc)
-	writeJSON(w, 200, map[string]interface{}{"collection": col, "rf": in.RF, "effective": s.rfFor(col)})
+	writeJSON(w, 200, map[string]interface{}{"collection": col, "rf": in.RF, "effective": s.rfFor(col),
+		"partition_field": pf, "sort_field": sf})
 }
 
 // handleGetConfigCollection reads the current settings.
 func (s *Server) handleGetConfigCollection(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	cfg := s.st.GetCollectionConfig(col)
-	writeJSON(w, 200, map[string]interface{}{"collection": col, "rf": cfg.RF, "effective": s.rfFor(col)})
+	writeJSON(w, 200, map[string]interface{}{
+		"collection":      col,
+		"rf":              cfg.RF,
+		"effective":       s.rfFor(col),
+		"partition_field": cfg.PartitionField,
+		"sort_field":      cfg.SortField,
+	})
 }
 
 type replTask struct {
@@ -171,6 +191,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 		s.mux.HandleFunc("POST "+prefix+"/collections/{col}/docs/batch", s.handleBatch)
 		s.mux.HandleFunc("DELETE "+prefix+"/collections/{col}/docs/{id}", s.handleDelete)
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/docs", s.handleQuery)
+		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/partition/{pk}", s.handlePartitionQuery)
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/watch", s.handleWatch)
 		s.mux.HandleFunc("PUT "+prefix+"/collections/{col}/config", s.handleConfigCollection)
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/config", s.handleGetConfigCollection)
@@ -494,16 +515,54 @@ func (s *Server) replicationWorker() {
 
 // Owns reports whether this node is the primary owner of col/id.
 func (s *Server) Owns(col, id string) bool {
-	return s.owns(col + "/" + id)
+	return s.owns(s.routingKey(col, id))
 }
 
 // OwnerSet returns the RF-owner set for col/id under the current ring
 // (exposed for tests and admin tooling).
 func (s *Server) OwnerSet(col, id string) []string {
-	return s.currentRing().Owners(col+"/"+id, s.rfFor(col))
+	return s.currentRing().Owners(s.routingKey(col, id), s.rfFor(col))
 }
 
 // owns returns true if this node is the primary owner of the key.
+// routingKey computes the ring key for a document. For collections
+// with a partition_field configured, the doc id must be
+// "partitionValue|sortValue" — the ring key becomes col/partitionValue
+// so ALL docs of one partition live on the same shard (locality:
+// one-shard reads, one-shard range queries, no scatter). Without a
+// partition_field the key is col/id as always.
+func (s *Server) routingKey(col, id string) string {
+	if cfg := s.st.GetCollectionConfig(col); cfg.PartitionField != "" {
+		pk := id
+		if i := strings.Index(id, "|"); i >= 0 {
+			pk = id[:i]
+		}
+		return col + "/" + pk
+	}
+	return col + "/" + id
+}
+
+// checkPartitionID validates that a write's partition field value
+// matches the id prefix convention for partitioned collections.
+func (s *Server) checkPartitionID(col, id string, fields map[string]interface{}) string {
+	cfg := s.st.GetCollectionConfig(col)
+	if cfg.PartitionField == "" {
+		return ""
+	}
+	pk := id
+	if i := strings.Index(id, "|"); i >= 0 {
+		pk = id[:i]
+	}
+	v, ok := fields[cfg.PartitionField]
+	if !ok {
+		return fmt.Sprintf("collection %q is partitioned by %q: field required", col, cfg.PartitionField)
+	}
+	if fmt.Sprintf("%v", v) != pk {
+		return fmt.Sprintf("id prefix %q does not match %s=%v", pk, cfg.PartitionField, v)
+	}
+	return ""
+}
+
 func (s *Server) owns(key string) bool {
 	owners := s.currentRing().Owners(key, 1)
 	return len(owners) > 0 && owners[0] == s.self
@@ -747,7 +806,11 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "body must be a JSON object"})
 		return
 	}
-	key := col + "/" + id
+	if perr := s.checkPartitionID(col, id, fields); perr != "" {
+		writeJSON(w, 400, map[string]string{"error": perr})
+		return
+	}
+	key := s.routingKey(col, id)
 	if s.cl.Draining() {
 		writeJSON(w, 503, map[string]string{"error": "node is decommissioning, retry elsewhere"})
 		return
@@ -841,6 +904,32 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": `body must be {"docs": {id: fields, ...}}`})
 		return
 	}
+	// Partitioned collections: every doc in the batch must belong to
+	// the same partition, and this node must own it — otherwise the
+	// batch can't be one atomic log record on one shard.
+	if pfield := s.st.GetCollectionConfig(col).PartitionField; pfield != "" {
+		partition := ""
+		for id, fields := range in.Docs {
+			if perr := s.checkPartitionID(col, id, fields); perr != "" {
+				writeJSON(w, 400, map[string]string{"error": perr})
+				return
+			}
+			pk := id
+			if i := strings.Index(id, "|"); i >= 0 {
+				pk = id[:i]
+			}
+			if partition == "" {
+				partition = pk
+			} else if pk != partition {
+				writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("batch spans partitions %q and %q — one batch = one partition", partition, pk)})
+				return
+			}
+		}
+		if !s.owns(col + "/" + partition) {
+			s.forwardBytes(w, r, "POST", "/api/collections/"+col+"/docs/batch", body, 0)
+			return
+		}
+	}
 	var newCount int64
 	for id := range in.Docs {
 		if _, exists := s.st.Get(col, id); !exists {
@@ -865,7 +954,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	col := r.PathValue("col")
 	id := r.PathValue("id")
-	key := col + "/" + id
+	key := s.routingKey(col, id)
 	if s.cl.Draining() {
 		writeJSON(w, 503, map[string]string{"error": "node is decommissioning, retry elsewhere"})
 		return
@@ -892,7 +981,7 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 		writeJSON(w, 503, map[string]string{"error": "ownership unstable, retry"})
 		return
 	}
-	owner := s.currentRing().Owners(r.PathValue("col")+"/"+r.PathValue("id"), 1)
+	owner := s.currentRing().Owners(s.routingKey(r.PathValue("col"), r.PathValue("id")), 1)
 	if len(owner) == 0 {
 		writeJSON(w, 503, map[string]string{"error": "no owner known"})
 		return
@@ -1500,6 +1589,127 @@ func (s *Server) handleLookupGSI(w http.ResponseWriter, r *http.Request) {
 		"lag_processed": processed, "feed_head": head,
 		"lag_events": head - processed,
 	})
+}
+
+// handlePartitionQuery: GET /api/collections/{col}/partition/{pk}
+//   ?sort_gte=A&sort_lte=B&sort_lt=..&sort_gt=..&desc=true&limit=N
+//
+// Dynamo-style Query(): for collections with a partition_field, all
+// docs of one partition live on one shard, so this is served from a
+// single node with NO scatter-gather. If this node doesn't own the
+// partition, the request is forwarded to the owner. Results are
+// ordered by the sort component of the doc id (the part after '|').
+func (s *Server) handlePartitionQuery(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	pk := r.PathValue("pk")
+	cfg := s.st.GetCollectionConfig(col)
+	if cfg.PartitionField == "" {
+		writeJSON(w, 400, map[string]string{"error": "collection has no partition_field — use /docs scatter query"})
+		return
+	}
+	if !s.owns(col + "/" + pk) {
+		// Forward straight to the partition owner (forwardBytes
+		// derives the owner from the doc-id path value, which this
+		// route doesn't have).
+		owner := s.currentRing().Owners(col+"/"+pk, 1)
+		if len(owner) == 0 {
+			writeJSON(w, 503, map[string]string{"error": "no owner known"})
+			return
+		}
+		req, _ := http.NewRequest("GET", owner[0]+r.URL.String(), nil)
+		resp, err := s.fwdClient.Do(req)
+		if err != nil {
+			writeJSON(w, 502, map[string]string{"error": "partition forward failed"})
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+	// Sort bounds on the sort component (id suffix).
+	type bound struct {
+		op    string
+		value string
+	}
+	var bounds []bound
+	for _, b := range []struct {
+		param string
+		op    string
+	}{{"sort_gte", "gte"}, {"sort_lte", "lte"}, {"sort_gt", "gt"}, {"sort_lt", "lt"}} {
+		if v := r.URL.Query().Get(b.param); v != "" {
+			bounds = append(bounds, bound{b.op, v})
+		}
+	}
+	limit := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil || n < 0 {
+			writeJSON(w, 400, map[string]string{"error": "bad limit"})
+			return
+		}
+		limit = n
+	}
+	desc := r.URL.Query().Get("desc") == "true"
+
+	docs := s.st.Scan(col, func(d *store.Doc) bool {
+		idPk := d.ID
+		if i := strings.Index(d.ID, "|"); i >= 0 {
+			idPk = d.ID[:i]
+		}
+		if idPk != pk {
+			return false
+		}
+		sv := ""
+		if i := strings.Index(d.ID, "|"); i >= 0 {
+			sv = d.ID[i+1:]
+		}
+		for _, b := range bounds {
+			switch b.op {
+			case "gte":
+				if sv < b.value {
+					return false
+				}
+			case "lte":
+				if sv > b.value {
+					return false
+				}
+			case "gt":
+				if sv <= b.value {
+					return false
+				}
+			case "lt":
+				if sv >= b.value {
+					return false
+				}
+			}
+		}
+		return true
+	})
+	sort.Slice(docs, func(i, j int) bool {
+		si, sj := sortPart(docs[i].ID), sortPart(docs[j].ID)
+		if desc {
+			return si > sj
+		}
+		return si < sj
+	})
+	total := len(docs)
+	if limit > 0 && len(docs) > limit {
+		docs = docs[:limit]
+	}
+	docs = s.migrateDocs(col, docs)
+	writeJSON(w, 200, map[string]interface{}{
+		"count": len(docs), "total": total, "docs": docs,
+		"partition": pk, "shards_queried": 1,
+	})
+}
+
+func sortPart(id string) string {
+	if i := strings.Index(id, "|"); i >= 0 {
+		return id[i+1:]
+	}
+	return ""
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
