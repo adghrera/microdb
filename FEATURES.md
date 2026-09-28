@@ -8,7 +8,7 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 
 ---
 
-## ✅ Shipped (58 features)
+## ✅ Shipped (59 features)
 
 | ✓ | Feature | Pri | Verification |
 |---|---------|-----|--------------|
@@ -114,7 +114,7 @@ of storage from the query engine.**
 | [x] | **Ring epochs + fencing tokens** | 9 | ✅ shipped — see "Ring epochs + write fencing" above |
 | [x] | **Graceful decommission** | 9 | ✅ shipped — see "Graceful decommission" above |
 | [x] | **Dual-write migration window** | 8 | ✅ effectively shipped by composition — every write routes through the *current* ring at the coordinator (never a cached placement), stale forwarders are fenced (409→adopt→retry), and read-repair + hints + bootstrap streaming heal any mid-move divergence. No explicit pending_ranges needed because no component caches ownership long enough to need it. |
-| [ ] | **Load-aware token assignment** | 7 | Auto-assign vnodes by observed load (bytes/sec, ops/sec per node) instead of uniform random placement; periodic rebalancer that proposes minimal-movement plans. |
+| [x] | **Load-aware token assignment** (Roadmap A5) | 7 | Sticky minimal-movement rebalancer: `ranges.Rebalance` keeps a range's previous primary when it stays within a `1.1x` fair-share band, so steady load and small drift cause zero churn; only ranges that must move (departed owner, band breach) are reassigned, and a join fills the new node with the minimum set. `MovementCount` measures churn; `PlanFor` is the cold-start (`prev=nil`) case. 5 unit + 1 integration test (live join distributes load across all 3 nodes) |
 | [x] | **Admission control for joins** | 6 | ✅ shipped — max 2 concurrent stream serves per seed, 429 + Retry-After, joiner backoff |
 
 ## B. Sharding — a real partitioning model

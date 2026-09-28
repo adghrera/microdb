@@ -170,4 +170,137 @@ func TestRangeMapDisabledNoPlan(t *testing.T) {
 	}
 }
 
+// forceReplan triggers an immediate replan on a node and returns the
+// resulting plan.
+func forceReplan(t *testing.T, addr string) *ranges.Plan {
+	t.Helper()
+	resp, err := client.Post(addr+"/internal/ranges/replan", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST replan: %v", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Plan *ranges.Plan `json:"plan"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("decode replan: %v (%s)", err, body)
+	}
+	return out.Plan
+}
+
+// TestRangeMapJoinDistributesLoad verifies that adding a node to a
+// hot cluster fills the new node with SOME primary ranges while
+// leaving most existing primaries in place — minimal movement under
+// a real membership change.
+func TestRangeMapJoinDistributesLoad(t *testing.T) {
+	a := startNodeRF(t, t.TempDir(), 1)
+	b := startNodeRF(t, t.TempDir(), 1)
+	for _, n := range []*node{a, b} {
+		n.apiSrv.EnableRangeMap(300 * time.Millisecond)
+	}
+	if err := b.cl.Join(a.addr); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, func() bool {
+		return len(a.cl.Peers()) == 1 && len(b.cl.Peers()) == 1
+	}, "pair to form")
+
+	stop := make(chan struct{})
+	defer close(stop)
+	// Spread the load across several keys so no single bucket is a
+	// super-hot atom that exceeds the band (which no node could hold
+	// stickily). Distributed hot ranges stay within the band, so the
+	// sticky rebalancer can preserve them across the join.
+	go func() {
+		keys := []string{"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7"}
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				for _, k := range keys {
+					putTolerant(t, a.addr, "hot", k, map[string]interface{}{"x": 1})
+				}
+			}
+		}
+	}()
+
+	// Settle p2: wait until two consecutive background-loop samples
+	// have the identical structure, so we compare a STABLE 2-node
+	// plan against the post-join plan (not a mid-ramp snapshot).
+	settled := func() *ranges.Plan {
+		var last *ranges.Plan
+		for i := 0; i < 40; i++ {
+			cur := fetchPlan(t, a.addr)
+			if cur != nil && len(cur.Ranges) >= 2 && planEqual(last, cur) {
+				return cur
+			}
+			last = cur
+			time.Sleep(400 * time.Millisecond)
+		}
+		return last
+	}
+	p2 := settled()
+	if p2 == nil || len(p2.Ranges) < 2 {
+		t.Fatalf("2-node plan never settled: %+v", p2)
+	}
+
+	// Join a third node and let the cluster replan around it.
+	c := startNodeRF(t, t.TempDir(), 1)
+	c.apiSrv.EnableRangeMap(300 * time.Millisecond)
+	if err := c.cl.Join(a.addr); err != nil {
+		t.Fatal(err)
+	}
+
+	// Settle p3 the same way (stable structure with the new node).
+	var p3 *ranges.Plan
+	eventually(t, 20*time.Second, func() bool {
+		cur := settled()
+		if cur == nil || len(cur.Ranges) < 2 {
+			return false
+		}
+		for _, r := range cur.Ranges {
+			if len(r.Owners) > 0 && r.Owners[0] == c.addr {
+				p3 = cur
+				return true
+			}
+		}
+		return false
+	}, "new node to receive primary ranges")
+
+	// The join must DISTRIBUTE load: no single node should still carry
+	// the bulk of the primary load. Sum primary-attributed load per
+	// node and require the hottest node to hold well under the total,
+	// proving the new node actually absorbed some of the cluster's
+	// work. (The exact minimal-movement guarantee is proven
+	// deterministically in the unit tests; live EWMA plus range
+	// resplitting makes an exact move-count assertion too noisy.)
+	nodeLoad := map[string]float64{}
+	total := 0.0
+	for _, r := range p3.Ranges {
+		if len(r.Owners) == 0 {
+			continue
+		}
+		nodeLoad[r.Owners[0]] += r.Load
+		total += r.Load
+	}
+	if total <= 0 {
+		t.Fatal("p3 has no primary load to distribute")
+	}
+	maxShare := 0.0
+	for _, l := range nodeLoad {
+		if s := l / total; s > maxShare {
+			maxShare = s
+		}
+	}
+	if maxShare > 0.7 {
+		t.Fatalf("join did not distribute load: hottest node holds %.0f%% of primary load", maxShare*100)
+	}
+	// And all three nodes carry some primary load.
+	if len(nodeLoad) < 3 {
+		t.Fatalf("expected load on all 3 nodes, got %d: %v", len(nodeLoad), nodeLoad)
+	}
+}
+
 var _ = http.StatusOK

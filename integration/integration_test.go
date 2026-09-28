@@ -70,6 +70,25 @@ func put(t *testing.T, addr, col, id string, fields map[string]interface{}) int 
 	return resp.StatusCode
 }
 
+// putTolerant is for background hammering goroutines: it never calls
+// t.Fatalf (fataling from a non-test goroutine is unsafe) and simply
+// returns 0 on any transient error. During a live join, forwarding a
+// write to a node that is mid-bootstrap can EOF or be refused; those
+// are expected and must not fail the test.
+func putTolerant(t *testing.T, addr, col, id string, fields map[string]interface{}) int {
+	t.Helper()
+	b, _ := json.Marshal(fields)
+	req, _ := http.NewRequest("PUT", addr+"/api/collections/"+col+"/docs/"+id, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
 func get(addr, col, id string) (int, map[string]interface{}) {
 	resp, err := client.Get(addr + "/api/collections/" + col + "/docs/" + id)
 	if err != nil {

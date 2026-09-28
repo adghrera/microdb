@@ -132,6 +132,31 @@ const (
 // regions are never split, and adjacent cold ranges with the same
 // primary merge.
 func PlanFor(nodes []string, rf int, bucketLoad []float64, epoch int64, base BaseRing) *Plan {
+	return Rebalance(nodes, rf, bucketLoad, epoch, base, nil)
+}
+
+// ImbalanceThreshold is the hysteresis band for the sticky
+// rebalancer: a node may carry up to ImbalanceThreshold * fair-share
+// before ranges are shed off it. A value of 1.0 rebalances exactly;
+// 1.1 lets load drift of up to ~10% happen with ZERO range moves,
+// which is the whole point of minimal-movement. Small fluctuations
+// below the band never trigger churn.
+const ImbalanceThreshold = 1.1
+
+// Rebalance computes the plan, optionally seeded with the previous
+// plan for MINIMAL MOVEMENT. With prev==nil it behaves exactly like
+// PlanFor (fresh greedy). With a prev plan, each range keeps its
+// previous primary as long as that node is still live and stays
+// within ImbalanceThreshold * fair-share; only ranges that would
+// overflow their old primary move, and they move to the coolest node.
+//
+// Consequences:
+//   - A node JOIN shrinks the fair-share, so old primaries overflow
+//     and shed exactly the ranges needed to fill the new node — the
+//     minimum set that restores balance.
+//   - A node LEAVE reassigns only the departed node's ranges.
+//   - Small load drift inside the band moves nothing.
+func Rebalance(nodes []string, rf int, bucketLoad []float64, epoch int64, base BaseRing, prev *Plan) *Plan {
 	if len(nodes) == 0 || rf <= 0 || len(bucketLoad) != Buckets {
 		return nil
 	}
@@ -149,13 +174,126 @@ func PlanFor(nodes []string, rf int, bucketLoad []float64, epoch int64, base Bas
 		return nil
 	}
 
-	// Recursive split: a region hotter than a node's fair share
-	// splits at its load-median until it fits or can't split further.
-	// Every leaf of a split subtree is KEPT (falling back to the ring
-	// would re-concentrate the load the split relieved). Only the
-	// whole space being cold yields no plan at all — then the base
-	// ring owns everything. A hot spot cools down, the next replan
-	// produces coarser ranges: that is the merge.
+	out := splitRanges(bucketLoad, total, fair)
+	if len(out) == 0 {
+		return nil
+	}
+
+	// Heaviest-first ordering makes the greedy/sticky pass deterministic
+	// and spreads the big ranges before the small ones.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Load != out[j].Load {
+			return out[i].Load > out[j].Load
+		}
+		return out[i].Start < out[j].Start
+	})
+
+	live := make(map[string]bool, len(sorted))
+	for _, n := range sorted {
+		live[n] = true
+	}
+	assigned := make(map[string]float64, len(sorted))
+	for _, n := range sorted {
+		assigned[n] = 0
+	}
+	cap := ImbalanceThreshold * fair
+
+	// Sticky primary pass: prefer the previous primary when it is live
+	// and taking this range keeps that node inside the band. Otherwise
+	// fall to the coolest live node (fresh greedy for uncovered ranges).
+	for i := range out {
+		primary := ""
+		if prev != nil {
+			if pp := prevPrimaryFor(prev, out[i].Start); pp != "" && live[pp] && assigned[pp]+out[i].Load <= cap {
+				primary = pp
+			}
+		}
+		if primary == "" {
+			for _, n := range sorted { // sorted: deterministic tie-break
+				if primary == "" || assigned[n] < assigned[primary] {
+					primary = n
+				}
+			}
+		}
+		out[i].Owners = []string{primary}
+		assigned[primary] += out[i].Load
+	}
+
+	// Balance refinement: if the sticky pass left any node above the
+	// band (because its previous ranges alone exceed it), shed the
+	// largest ranges off the hottest node to the coolest node until
+	// every node is inside the band or no move helps. Shedding the
+	// LARGEST range reduces the max with the FEWEST moves.
+	for guard := 0; guard < len(out)*2; guard++ {
+		hot, cool := "", ""
+		for _, n := range sorted {
+			if hot == "" || assigned[n] > assigned[hot] {
+				hot = n
+			}
+			if cool == "" || assigned[n] < assigned[cool] {
+				cool = n
+			}
+		}
+		if hot == cool || assigned[hot] <= cap {
+			break // balanced within the band
+		}
+		// Find the largest range on `hot` whose move to `cool` strictly
+		// reduces the spread (and does not overshoot cool past hot).
+		idx := -1
+		var bestLoad float64
+		for i := range out {
+			if out[i].Owners[0] != hot {
+				continue
+			}
+			moved := out[i].Load
+			if moved <= 0 {
+				continue
+			}
+			newHot := assigned[hot] - moved
+			newCool := assigned[cool] + moved
+			// Only accept if it reduces the max load on these two.
+			if newHot < assigned[hot] && newCool < assigned[hot] {
+				if moved > bestLoad {
+					bestLoad, idx = moved, i
+				}
+			}
+		}
+		if idx < 0 {
+			break // nothing movable improves the balance
+		}
+		out[idx].Owners[0] = cool
+		assigned[hot] -= bestLoad
+		assigned[cool] += bestLoad
+	}
+
+	// Replicas: base-ring owner order for the region start, excluding
+	// the primary, so replica placement keeps the ring's spread.
+	for i := range out {
+		primary := out[i].Owners[0]
+		if base != nil {
+			for _, o := range base.Owners(tokenKey(out[i].Start), rf*3) {
+				if len(out[i].Owners) >= rf {
+					break
+				}
+				if o != primary {
+					out[i].Owners = append(out[i].Owners, o)
+				}
+			}
+		}
+	}
+
+	// Final invariant check: sorted, non-overlapping.
+	sort.Slice(out, func(i, j int) bool { return out[i].Start < out[j].Start })
+	return &Plan{Epoch: epoch, Ranges: out}
+}
+
+// splitRanges runs the recursive hot-region split and returns the
+// leaf ranges (Load set, Owners nil). A region hotter than fair
+// splits at its load-median until it fits or can't split further.
+// Every leaf of a split subtree is KEPT (falling back to the ring
+// would re-concentrate the load the split relieved). Only the whole
+// space being cold yields no ranges — then the base ring owns all.
+func splitRanges(bucketLoad []float64, total, fair float64) []Range {
 	var split func(lo, hi int, load float64, depth int, splitAbove bool) []Range
 	split = func(lo, hi int, load float64, depth int, splitAbove bool) []Range {
 		if load <= fair {
@@ -178,56 +316,49 @@ func PlanFor(nodes []string, rf int, bucketLoad []float64, epoch int64, base Bas
 	for (1<<maxDepth) < MaxRanges {
 		maxDepth++
 	}
-	out := split(0, Buckets, total, maxDepth, false)
-	if len(out) == 0 {
-		return nil
-	}
+	return split(0, Buckets, total, maxDepth, false)
+}
 
-	// Greedy primary assignment: heaviest ranges first, each to the
-	// node carrying the least assigned load so far.
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Load != out[j].Load {
-			return out[i].Load > out[j].Load
-		}
-		return out[i].Start < out[j].Start
-	})
-	assigned := map[string]float64{}
-	for _, n := range sorted {
-		assigned[n] = 0
+// prevPrimaryFor returns the primary (first owner) of the prev-plan
+// range covering `token`, or "" if none. Used to seed the sticky
+// rebalancer from the previous ownership view.
+func prevPrimaryFor(prev *Plan, token uint32) string {
+	if prev == nil || len(prev.Ranges) == 0 {
+		return ""
 	}
-	for i := range out {
-		best := ""
-		for _, n := range sorted { // sorted: deterministic tie-break
-			if best == "" || assigned[n] < assigned[best] {
-				best = n
-			}
-		}
-		owners := []string{best}
-		// Replicas: base-ring owner order for the region start,
-		// excluding the greedy primary, so replica placement still
-		// follows the ring's spread properties.
-		if base != nil {
-			for _, o := range base.Owners(tokenKey(out[i].Start), rf*3) {
-				if len(owners) >= rf {
-					break
-				}
-				if o != best {
-					owners = append(owners, o)
-				}
-			}
-		}
-		out[i].Owners = owners
-		assigned[best] += out[i].Load
+	i := sort.Search(len(prev.Ranges), func(i int) bool { return prev.Ranges[i].Start > token }) - 1
+	if i < 0 {
+		return ""
 	}
+	r := prev.Ranges[i]
+	if r.End != 0 && token >= r.End {
+		return "" // gap in the previous overlay
+	}
+	if len(r.Owners) == 0 {
+		return ""
+	}
+	return r.Owners[0]
+}
 
-	// Cold merge is implicit: a cooled region's load drops below the
-	// fair share and its ranges simply stop appearing in the overlay,
-	// falling back to the base ring. Only the explicit MergeAdjacent
-	// primitive above is needed for manual range surgery.
-
-	// Final invariant check: sorted, non-overlapping.
-	sort.Slice(out, func(i, j int) bool { return out[i].Start < out[j].Start })
-	return &Plan{Epoch: epoch, Ranges: out}
+// MovementCount returns how many ranges changed primary between two
+// plans, counting each range in `next` whose primary differs from
+// the primary that owned its region in `prev`. A new range (no prev
+// coverage) counts as one move. This is the churn metric the
+// minimal-movement rebalancer minimizes.
+func MovementCount(prev, next *Plan) int {
+	if next == nil {
+		return 0
+	}
+	moves := 0
+	for _, r := range next.Ranges {
+		if len(r.Owners) == 0 {
+			continue
+		}
+		if prevPrimaryFor(prev, r.Start) != r.Owners[0] {
+			moves++
+		}
+	}
+	return moves
 }
 
 // BaseRing is the fallback placement source (the vnode ring).

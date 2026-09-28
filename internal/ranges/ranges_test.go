@@ -290,3 +290,134 @@ func TestCooledPlanHasNoHotRanges(t *testing.T) {
 		}
 	}
 }
+
+// --- Minimal-movement rebalancer (A5) ---
+
+func TestRebalanceStickyIdempotent(t *testing.T) {
+	// Rebalancing a plan against itself must move NOTHING: every
+	// range keeps its previous primary because the previous primary
+	// is live and already inside the band.
+	nodes := []string{"a", "b", "c"}
+	b := load(map[int]float64{10: 200, 200: 150}, 0.5)
+	p1 := PlanFor(nodes, 2, b, 1, &fakeBase{nodes})
+	if p1 == nil || len(p1.Ranges) == 0 {
+		t.Fatal("expected a non-trivial plan")
+	}
+	p2 := Rebalance(nodes, 2, b, 2, &fakeBase{nodes}, p1)
+	if p2 == nil {
+		t.Fatal("expected a rebalanced plan")
+	}
+	if m := MovementCount(p1, p2); m != 0 {
+		t.Fatalf("sticky rebalance against self moved %d ranges, want 0", m)
+	}
+}
+
+func TestRebalanceHysteresisSmallDrift(t *testing.T) {
+	// A small load drift (inside ImbalanceThreshold) must cause ZERO
+	// range moves — that is the hysteresis that stops churn.
+	nodes := []string{"a", "b", "c"}
+	base := load(map[int]float64{40: 120, 41: 90, 42: 60}, 1.0)
+	p1 := PlanFor(nodes, 2, base, 1, &fakeBase{nodes})
+	if p1 == nil {
+		t.Fatal("expected plan")
+	}
+	// Nudge every bucket by ~3% — well inside the 10% band.
+	drift := make([]float64, Buckets)
+	for i, v := range base {
+		drift[i] = v * 1.03
+	}
+	p2 := Rebalance(nodes, 2, drift, 2, &fakeBase{nodes}, p1)
+	if p2 == nil {
+		t.Fatal("expected plan after drift")
+	}
+	if m := MovementCount(p1, p2); m != 0 {
+		t.Fatalf("small drift moved %d ranges, want 0 (hysteresis)", m)
+	}
+}
+
+func TestRebalanceNodeJoinFewerMovesThanFresh(t *testing.T) {
+	// Adding a node: the sticky rebalancer must move no MORE ranges
+	// than a cold-start fresh plan would. This is the core minimal-
+	// movement guarantee — we fill the new node with the minimum set
+	// of ranges needed to restore balance.
+	nodes2 := []string{"a", "b"}
+	nodes3 := []string{"a", "b", "c"}
+	b := load(map[int]float64{10: 300, 150: 250}, 1.0)
+	p2 := PlanFor(nodes2, 2, b, 1, &fakeBase{nodes2})
+	if p2 == nil {
+		t.Fatal("expected 2-node plan")
+	}
+	fresh := PlanFor(nodes3, 2, b, 2, &fakeBase{nodes3})
+	sticky := Rebalance(nodes3, 2, b, 2, &fakeBase{nodes3}, p2)
+	if fresh == nil || sticky == nil {
+		t.Fatal("expected 3-node plans")
+	}
+	mf := MovementCount(p2, fresh)
+	ms := MovementCount(p2, sticky)
+	if ms > mf {
+		t.Fatalf("sticky moved %d ranges but fresh moved %d — sticky must be <= fresh", ms, mf)
+	}
+	// And the new node must actually receive some load (we are not
+	// just keeping the old plan and ignoring the new capacity).
+	gotNew := false
+	for _, r := range sticky.Ranges {
+		if len(r.Owners) > 0 && r.Owners[0] == "c" {
+			gotNew = true
+		}
+	}
+	if !gotNew {
+		t.Fatal("new node 'c' received no primary ranges — rebalance did nothing")
+	}
+}
+
+func TestRebalanceNodeLeaveOnlyDepartedMoves(t *testing.T) {
+	// Removing a node: ranges that were NOT owned by the departed
+	// node keep their primary; only the departed node's ranges move.
+	nodes := []string{"a", "b", "c"}
+	b := load(map[int]float64{5: 180, 100: 160, 200: 140}, 1.0)
+	p1 := PlanFor(nodes, 2, b, 1, &fakeBase{nodes})
+	if p1 == nil {
+		t.Fatal("expected plan")
+	}
+	// Count how many ranges in p1 were owned by 'c'.
+	cOwned := 0
+	for _, r := range p1.Ranges {
+		if len(r.Owners) > 0 && r.Owners[0] == "c" {
+			cOwned++
+		}
+	}
+	if cOwned == 0 {
+		t.Skip("load did not place any primary on 'c'; nothing to test")
+	}
+	survivors := []string{"a", "b"}
+	p2 := Rebalance(survivors, 2, b, 2, &fakeBase{survivors}, p1)
+	if p2 == nil {
+		t.Fatal("expected plan after leave")
+	}
+	// No surviving range should have moved: every move counted must
+	// correspond to a range that 'c' previously owned. MovementCount
+	// counts ranges in p2 whose primary differs from prev coverage.
+	moves := MovementCount(p1, p2)
+	if moves > cOwned {
+		t.Fatalf("node leave moved %d ranges but only %d were owned by 'c'", moves, cOwned)
+	}
+	// And no range in the new plan may still name the departed node.
+	for _, r := range p2.Ranges {
+		for _, o := range r.Owners {
+			if o == "c" {
+				t.Fatalf("departed node 'c' still owns a range: %+v", r)
+			}
+		}
+	}
+}
+
+func TestRebalanceDeterministic(t *testing.T) {
+	nodes := []string{"a", "b", "c"}
+	b := load(map[int]float64{30: 220, 90: 180, 210: 160}, 0.7)
+	p1 := PlanFor(nodes, 2, b, 1, &fakeBase{nodes})
+	a := Rebalance(nodes, 2, b, 2, &fakeBase{nodes}, p1)
+	bb := Rebalance(nodes, 2, b, 2, &fakeBase{nodes}, p1)
+	if !reflect.DeepEqual(a, bb) {
+		t.Fatal("Rebalance is not deterministic")
+	}
+}

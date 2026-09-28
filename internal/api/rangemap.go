@@ -105,13 +105,19 @@ func (s *Server) replanOnce(interval time.Duration) error {
 		}
 	}
 
-	// 3. Recompute the plan from (nodes, rf, cluster load, epoch).
+	// 3. Recompute the plan from (nodes, rf, cluster load, epoch),
+	// seeded with the current plan for MINIMAL MOVEMENT: ranges keep
+	// their existing primary unless the band is exceeded, so node
+	// joins/leaves and load drift move the fewest ranges possible.
 	nodes := append(s.cl.Peers(), s.self)
 	rf := s.rf
 	if rf > len(nodes) {
 		rf = len(nodes)
 	}
-	plan := ranges.PlanFor(nodes, rf, cluster, s.cl.Epoch(), s.currentRing())
+	s.rangeMu.RLock()
+	prev := s.rangePlan
+	s.rangeMu.RUnlock()
+	plan := ranges.Rebalance(nodes, rf, cluster, s.cl.Epoch(), s.currentRing(), prev)
 	s.rangeMu.Lock()
 	s.rangePlan = plan
 	s.rangeMu.Unlock()
