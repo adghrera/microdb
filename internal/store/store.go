@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"microdb/internal/metrics"
 	"microdb/internal/merkle"
 	"microdb/internal/migrate"
+	"microdb/internal/sharedlog"
 	"microdb/internal/storage"
 )
 
@@ -53,6 +55,14 @@ type Store struct {
 	// must be visible (metrics) and containable (quota) without
 	// touching other collections.
 	colStats map[string]*ColStats
+	// Durable shared commit log (C3): when attached, every client
+	// mutation is appended to the shared log BEFORE it touches local
+	// state. A write the log cannot persist quorum-durable fails and
+	// is not applied locally — durability comes from the log's own
+	// replication, not this node's disk.
+	shared     *sharedlog.Client
+	sharedState string // path holding the last durable LSN checkpoint
+	sharedLSN  int64
 }
 
 // ColStats tracks live per-collection activity.
@@ -135,6 +145,105 @@ func (s *Store) EnableDurableFeed() error {
 
 // Indexes exposes the index set (enabled by default; pass false to OpenOpts to disable).
 func (s *Store) Indexes() *index.IndexSet { return s.idx }
+
+// AttachSharedLog makes every client mutation write-through to a
+// durable shared commit log before touching local state. A write
+// the log cannot persist quorum-durable returns an error and is NOT
+// applied locally. The local JSONL log stays as the node's own
+// materialized view; recovery of lost local state uses
+// RecoverSharedLog. Call before serving writes.
+func (s *Store) AttachSharedLog(c *sharedlog.Client) {
+	s.shared = c
+	s.sharedState = filepath.Join(filepath.Dir(s.path), "sharedlog.state")
+	if b, err := os.ReadFile(s.sharedState); err == nil {
+		n, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+		s.sharedLSN = n
+	}
+}
+
+// SharedAttached reports whether a shared commit log is wired in.
+func (s *Store) SharedAttached() bool { return s.shared != nil }
+
+// SharedLSN returns the last LSN this store durably appended.
+func (s *Store) SharedLSN() int64 { return s.sharedLSN }
+
+// sharedAppend appends one plaintext record (single-doc or batch
+// framing, same bytes as the local log line) to the shared log and
+// checkpoints the LSN. No-op when no shared log is attached.
+// Caller holds the write lock (checkpoint ordering).
+func (s *Store) sharedAppend(plain []byte) error {
+	if s.shared == nil {
+		return nil
+	}
+	lsn, err := s.shared.Append(plain)
+	if err != nil {
+		atomic.AddInt64(metrics.Default.Counter("microdb_sharedlog_failures_total", "Shared-log appends that failed (quorum not reached)"), 1)
+		return fmt.Errorf("shared log append: %w", err)
+	}
+	s.sharedLSN = lsn
+	_ = os.WriteFile(s.sharedState, []byte(strconv.FormatInt(lsn, 10)), 0o644)
+	atomic.AddInt64(metrics.Default.Counter("microdb_sharedlog_appends_total", "Shared-log appends committed"), 1)
+	return nil
+}
+
+// RecoverSharedLog applies shared-log entries newer than this
+// store's checkpoint through the normal merge path, resuming where
+// the last attach left off. Call BEFORE AttachSharedLog so replayed
+// records are not re-appended to the log. Returns entries applied.
+func RecoverSharedLog(s *Store, c *sharedlog.Client) (int, error) {
+	statePath := filepath.Join(filepath.Dir(s.path), "sharedlog.state")
+	var after int64
+	if b, err := os.ReadFile(statePath); err == nil {
+		after, _ = strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	}
+	applied := 0
+	for {
+		entries := c.Tail(after, 500)
+		if len(entries) == 0 {
+			break
+		}
+		for _, e := range entries {
+			trimmed := strings.TrimSpace(string(e.Payload))
+			if trimmed != "" {
+				if strings.HasPrefix(trimmed, `{"batch":`) {
+					var rec struct {
+						Batch []*Doc `json:"batch"`
+					}
+					if json.Unmarshal([]byte(trimmed), &rec) == nil {
+						for _, d := range rec.Batch {
+							if s.ApplyRemote(d) {
+								applied++
+							}
+						}
+					}
+				} else {
+					var d Doc
+					if json.Unmarshal([]byte(trimmed), &d) == nil {
+						if s.ApplyRemote(&d) {
+							applied++
+						}
+					}
+				}
+			}
+			if e.LSN > after {
+				after = e.LSN
+			}
+		}
+		if len(entries) < 500 {
+			break
+		}
+	}
+	_ = os.WriteFile(statePath, []byte(strconv.FormatInt(after, 10)), 0o644)
+	return applied, nil
+}
+
+// isNew reports whether doc d would change stored state under the
+// LWW merge rule. Caller holds the lock; used to decide whether a
+// write is worth a durable shared-log append before applying it.
+func (s *Store) isNew(d *Doc) bool {
+	cur, ok := s.docs[key(d.Collection, d.ID)]
+	return !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS)
+}
 
 // SetFsync enables fsync-on-write. With it enabled every Apply/Delete
 // blocks until the record is durable on disk; without it the OS page
@@ -384,12 +493,19 @@ func (s *Store) Apply(collection, id string, fields map[string]interface{}) (*Do
 		ver = cur.Ver + 1
 	}
 	d := &Doc{ID: id, Ver: ver, TS: time.Now().UnixMilli(), Collection: collection, Fields: fields}
+	b, _ := json.Marshal(d)
+	// Durability first: the record must be quorum-durable in the
+	// shared log before it touches local state (no-op without a log).
+	if s.isNew(d) {
+		if err := s.sharedAppend(b); err != nil {
+			return nil, err
+		}
+	}
 	if !s.merge(d) {
 		return d, nil // concurrent newer write already applied
 	}
 	s.idx.For(collection).Remove(id)
 	s.idx.For(collection).Add(id, fields)
-	b, _ := json.Marshal(d)
 	if err := s.appendRecord(s.f, b); err != nil {
 		return nil, err
 	}
@@ -417,9 +533,7 @@ func (s *Store) ApplyBatch(collection string, docs map[string]map[string]interfa
 		}
 		d := &Doc{ID: id, Ver: ver, TS: time.Now().UnixMilli(), Collection: collection, Fields: fields}
 		out = append(out, d)
-		if s.merge(d) {
-			s.idx.For(collection).Remove(id)
-			s.idx.For(collection).Add(id, fields)
+		if s.isNew(d) {
 			changed = append(changed, d)
 		}
 	}
@@ -428,6 +542,16 @@ func (s *Store) ApplyBatch(collection string, docs map[string]map[string]interfa
 	}
 	rec := map[string]interface{}{"batch": changed}
 	b, _ := json.Marshal(rec)
+	// Durability first: the whole batch lands in the shared log (one
+	// append, one quorum) before any local state changes.
+	if err := s.sharedAppend(b); err != nil {
+		return nil, err
+	}
+	for _, d := range changed {
+		s.idx.For(collection).Remove(d.ID)
+		s.idx.For(collection).Add(d.ID, d.Fields)
+		s.merge(d)
+	}
 	if err := s.appendRecord(s.f, b); err != nil {
 		return nil, err
 	}
@@ -486,11 +610,17 @@ func (s *Store) Delete(collection, id string) error {
 		ver = cur.Ver + 1
 	}
 	d := &Doc{ID: id, Ver: ver, TS: time.Now().UnixMilli(), Collection: collection, Deleted: true}
+	b, _ := json.Marshal(d)
+	// Durability first (same contract as Apply).
+	if s.isNew(d) {
+		if err := s.sharedAppend(b); err != nil {
+			return err
+		}
+	}
 	if !s.merge(d) {
 		return nil
 	}
 	s.idx.For(collection).Remove(id)
-	b, _ := json.Marshal(d)
 	if err := s.appendRecord(s.f, b); err != nil {
 		return err
 	}

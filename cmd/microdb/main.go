@@ -29,6 +29,7 @@ import (
 
 	"microdb/internal/api"
 	"microdb/internal/cluster"
+	"microdb/internal/sharedlog"
 	"microdb/internal/store"
 	"microdb/internal/tenants"
 )
@@ -55,6 +56,7 @@ func main() {
 	tenantsFile := flag.String("tenants", "", "JSON file with tenant definitions (tokens, rate limits, quotas); enables multi-tenancy")
 	readCache := flag.Int("read-cache", 0, "cache this many point reads, invalidated by the change feed (0 disables)")
 	gsiOn := flag.Bool("gsi", false, "enable async global secondary index service (off the write path)")
+	sharedLog := flag.String("shared-log", "", "comma-separated shared commit log (microlog) URLs; client writes go through the log before touching local state")
 	flag.Parse()
 
 	if *jsonLog {
@@ -73,6 +75,21 @@ func main() {
 	}
 	st.SetFsync(*fsync)
 	defer st.Close()
+
+	// Durable shared commit log (C3): recover anything newer than our
+	// checkpoint from the log, then route all client writes through
+	// it. Durability now comes from the log's quorum replication,
+	// not this node's disk.
+	if *sharedLog != "" {
+		members := splitList(*sharedLog)
+		lc := sharedlog.NewClient(members)
+		applied, err := store.RecoverSharedLog(st, lc)
+		if err != nil {
+			log.Fatalf("shared log recovery: %v", err)
+		}
+		st.AttachSharedLog(lc)
+		log.Printf("shared log attached (%d members); recovered %d entries since last checkpoint", len(members), applied)
+	}
 
 	var tlsOpts *cluster.TLSOptions
 	if *tlsCert != "" {
@@ -212,6 +229,19 @@ func (j *jsonLogWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// splitList splits a comma-separated flag value, trimming blanks.
+func splitList(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // selfURLWithTLS builds the canonical URL other nodes use to reach us.

@@ -105,7 +105,15 @@ Multiple conditions AND together.
 `--gsi` (async global secondary indexes with exposed lag).
 `--cluster-name <name>` (refuses internal traffic from other clusters), `--json-log`
 (structured JSON logs for Loki/CloudWatch/ELK), `--idempotency-ttl <dur>` (dedupe
-window for `Idempotency-Key` retries, default 10m, 0 disables).
+window for `Idempotency-Key` retries, default 10m, 0 disables),
+`--shared-log <url,url,url>` (write-through every client mutation to a durable
+quorum-replicated shared commit log before it touches local state).
+
+**microlog (shared commit log service):** `microlog --addr :9001 --members http://h1:9001,http://h2:9002,http://h3:9003 --dir ./log1`
+— run 3 (odd) nodes; appends ACK only after a majority persist. Leader = first
+reachable member in order; failover promotes the next member and seeds its LSN above
+any peer's. microdb nodes recover by tailing the log from their last checkpoint,
+so a node that loses its local disk rebuilds from the log's own replication.
 
 **Idempotent retries:** send `Idempotency-Key: <uuid>` on any PUT/POST/DELETE; within
 the TTL a replay returns the original response with `X-Idempotent-Replay: true` and
