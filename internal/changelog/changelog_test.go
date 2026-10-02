@@ -2,6 +2,7 @@ package changelog
 
 import (
 	"os"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -34,6 +35,38 @@ func TestSizeTrim(t *testing.T) {
 	}
 	if all[0].Seq != 8 {
 		t.Fatalf("oldest retained should be seq 8, got %d", all[0].Seq)
+	}
+}
+
+// TestAppendPastCapIsCheap pins the allocation cost of trimming: once
+// the feed is at its size cap, every append used to rebuild the whole
+// retained window (~800KB for a 10k cap), which made every write pay
+// for the feed's history. Re-slicing keeps it near-zero.
+func TestAppendPastCapIsCheap(t *testing.T) {
+	const feedCap = 10000
+	l := New(feedCap, time.Hour)
+	for i := 0; i < feedCap*2; i++ {
+		l.Append("c", "x", "upsert", nil)
+	}
+	if len(l.Since(0)) != feedCap {
+		t.Fatalf("window should be capped at %d", feedCap)
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	const n = 200
+	for i := 0; i < n; i++ {
+		l.Append("c", "x", "upsert", nil)
+	}
+	runtime.ReadMemStats(&after)
+	got := after.TotalAlloc - before.TotalAlloc
+	// Budget: 200 appends must not rebuild a 10k window. The old
+	// behaviour allocated ~80MB here; anything near that is a regression.
+	if got > 4<<20 {
+		t.Fatalf("%d appends past the cap allocated %d bytes (window copy is back?)", n, got)
+	}
+	if len(l.Since(0)) != feedCap {
+		t.Fatalf("window should still be capped at %d, got %d", feedCap, len(l.Since(0)))
 	}
 }
 

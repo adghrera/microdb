@@ -250,19 +250,26 @@ func (l *Log) WaitFiltered(collection string, since int64, timeout time.Duration
 	}
 }
 
+// trimLocked enforces the size and age caps. Trimming must not copy
+// the retained window: an earlier version rebuilt the slice on every
+// append, so once the feed hit its 10k cap every single write allocated
+// ~800KB and the GC spent most of its time scanning it (the write cost
+// the benchmark harness exposed). Re-slicing is O(1); the backing array
+// is only reallocated when append grows it, at which point the copy is
+// proportional to the retained window and amortised away.
 func (l *Log) trimLocked() {
-	// Drop oldest beyond size cap.
-	if len(l.events) > l.maxSize {
-		l.events = append([]Event(nil), l.events[len(l.events)-l.maxSize:]...)
-	}
-	// Drop events older than retention.
+	// Drop events older than retention, from the front.
 	cutoff := time.Now().Add(-l.maxAge).UnixMilli()
 	idx := 0
 	for idx < len(l.events) && l.events[idx].TS < cutoff {
 		idx++
 	}
 	if idx > 0 {
-		l.events = append([]Event(nil), l.events[idx:]...)
+		l.events = l.events[idx:]
+	}
+	// Keep only the newest maxSize events.
+	if len(l.events) > l.maxSize {
+		l.events = l.events[len(l.events)-l.maxSize:]
 	}
 }
 

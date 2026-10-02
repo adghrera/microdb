@@ -12,20 +12,31 @@ import (
 )
 
 // Index is a thread-safe inverted index for one collection.
+//
+// fields is the classic inverted map: field -> encoded value -> doc ids.
+// byID is the reverse map that keeps writes cheap: id -> field ->
+// encoded value. Without it, dropping one document would have to walk
+// every field and value bucket in the collection, making every write
+// O(collection size) — the quadratic path the benchmark harness
+// exposed (3.18ms/op point writes at 10k docs).
 type Index struct {
 	mu      sync.RWMutex
 	fields  map[string]map[string]map[string]bool // field -> encoded value -> doc ids
 	indexed map[string]bool                       // fields we index (nil = all)
+	byID    map[string]map[string]string          // doc id -> field -> encoded value
 }
 
 func New() *Index {
 	return &Index{
 		fields:  map[string]map[string]map[string]bool{},
 		indexed: nil, // index all fields by default
+		byID:    map[string]map[string]string{},
 	}
 }
 
 // SetIndexedFields restricts which fields get indexed (nil = all).
+// Entries for fields that just stopped being indexed are purged so the
+// forward and reverse maps can never disagree.
 func (ix *Index) SetIndexedFields(fs []string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
@@ -33,10 +44,26 @@ func (ix *Index) SetIndexedFields(fs []string) {
 		ix.indexed = nil
 		return
 	}
-	ix.indexed = map[string]bool{}
+	next := make(map[string]bool, len(fs))
 	for _, f := range fs {
-		ix.indexed[f] = true
+		next[f] = true
 	}
+	for f := range ix.fields {
+		if !next[f] {
+			delete(ix.fields, f)
+		}
+	}
+	for id, fv := range ix.byID {
+		for f := range fv {
+			if !next[f] {
+				delete(fv, f)
+			}
+		}
+		if len(fv) == 0 {
+			delete(ix.byID, id)
+		}
+	}
+	ix.indexed = next
 }
 
 func encodeValue(v interface{}) string {
@@ -47,10 +74,18 @@ func encodeValue(v interface{}) string {
 	return string(b)
 }
 
-// Add indexes a doc's fields under its id.
+// Add indexes a doc's fields under its id. Self-correcting: if the
+// document previously indexed a different value for a field, that
+// stale bucket entry is dropped first, so Add may be called directly
+// on updates without a separate Remove.
 func (ix *Index) Add(id string, fields map[string]interface{}) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	ix.addLocked(id, fields)
+}
+
+func (ix *Index) addLocked(id string, fields map[string]interface{}) {
+	rev, haveRev := ix.byID[id]
 	for f, v := range fields {
 		if ix.indexed != nil && !ix.indexed[f] {
 			continue
@@ -58,6 +93,12 @@ func (ix *Index) Add(id string, fields map[string]interface{}) {
 		val := encodeValue(v)
 		if val == "" {
 			continue
+		}
+		// Drop the previous value for this field, if any.
+		if haveRev {
+			if old, ok := rev[f]; ok && old != val {
+				ix.unindex(id, f, old)
+			}
 		}
 		byVal, ok := ix.fields[f]
 		if !ok {
@@ -70,24 +111,58 @@ func (ix *Index) Add(id string, fields map[string]interface{}) {
 			byVal[val] = ids
 		}
 		ids[id] = true
+		if !haveRev {
+			rev = map[string]string{}
+			ix.byID[id] = rev
+			haveRev = true
+		}
+		rev[f] = val
 	}
 }
 
-// Remove drops all index entries for a doc id.
+// unindex drops one (field, value) membership. Caller holds the lock.
+func (ix *Index) unindex(id, field, val string) {
+	byVal := ix.fields[field]
+	if byVal == nil {
+		return
+	}
+	ids := byVal[val]
+	delete(ids, id)
+	if len(ids) == 0 {
+		delete(byVal, val)
+	}
+	if len(byVal) == 0 {
+		delete(ix.fields, field)
+	}
+}
+
+// Remove drops all index entries for a doc id in O(fields on that doc)
+// by consulting the reverse map — it never walks the collection.
 func (ix *Index) Remove(id string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	for f, byVal := range ix.fields {
-		for val, ids := range byVal {
-			delete(ids, id)
-			if len(ids) == 0 {
-				delete(byVal, val)
-			}
-		}
-		if len(byVal) == 0 {
-			delete(ix.fields, f)
-		}
+	ix.removeLocked(id)
+}
+
+func (ix *Index) removeLocked(id string) {
+	rev := ix.byID[id]
+	if rev == nil {
+		return // never indexed (or already removed): nothing to scan
 	}
+	for f, val := range rev {
+		ix.unindex(id, f, val)
+	}
+	delete(ix.byID, id)
+}
+
+// Upsert is Remove+Add under a single lock — the write path's index
+// maintenance. It drops fields the document no longer has and replaces
+// changed values, so one call is always a correct re-index.
+func (ix *Index) Upsert(id string, fields map[string]interface{}) {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	ix.removeLocked(id)
+	ix.addLocked(id, fields)
 }
 
 // Lookup returns doc ids whose field equals the encoded value.

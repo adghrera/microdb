@@ -260,6 +260,16 @@ func (s *Store) sync() error {
 
 func key(col, id string) string { return col + "\x00" + id }
 
+// indexable returns the fields to keep in the inverted index for a
+// document: deleted docs are removed from the index entirely rather
+// than indexed under their stale fields.
+func indexable(d *Doc) map[string]interface{} {
+	if d == nil || d.Deleted {
+		return nil
+	}
+	return d.Fields
+}
+
 // --- encryption at rest ------------------------------------------
 //
 // When a key is set, every log record is written as
@@ -504,8 +514,7 @@ func (s *Store) Apply(collection, id string, fields map[string]interface{}) (*Do
 	if !s.merge(d) {
 		return d, nil // concurrent newer write already applied
 	}
-	s.idx.For(collection).Remove(id)
-	s.idx.For(collection).Add(id, fields)
+	s.idx.For(collection).Upsert(id, fields)
 	if err := s.appendRecord(s.f, b); err != nil {
 		return nil, err
 	}
@@ -548,8 +557,7 @@ func (s *Store) ApplyBatch(collection string, docs map[string]map[string]interfa
 		return nil, err
 	}
 	for _, d := range changed {
-		s.idx.For(collection).Remove(d.ID)
-		s.idx.For(collection).Add(d.ID, d.Fields)
+		s.idx.For(collection).Upsert(d.ID, d.Fields)
 		s.merge(d)
 	}
 	if err := s.appendRecord(s.f, b); err != nil {
@@ -571,10 +579,7 @@ func (s *Store) ApplyRemote(d *Doc) bool {
 	if !s.merge(d) {
 		return false
 	}
-	s.idx.For(d.Collection).Remove(d.ID)
-	if !d.Deleted {
-		s.idx.For(d.Collection).Add(d.ID, d.Fields)
-	}
+	s.idx.For(d.Collection).Upsert(d.ID, indexable(d))
 	b, _ := json.Marshal(d)
 	if err := s.appendRecord(s.f, b); err != nil {
 		return false

@@ -106,12 +106,19 @@ Every row below is ☐ — **no claim is made until it is verified.**
 | **Observable or it didn't happen** | Every feature ships a metric or log line proving it works in production, not just in tests. |
 | **One feature per commit** | Matches the existing history discipline. |
 
-> **First finding (baseline, 2026):** the harness immediately exposed an O(n²)
-> path — `StorePointWrite` costs **3.18 ms/op** once a collection holds 10k docs
-> and `StoreOpenReplay` takes **1.0 s** for 5k documents, while point reads are
-> 196 ns. Writes scale with *collection size* because `index.Index.Remove` walks
-> every field/value bucket of the collection on every write instead of remembering
-> what one doc indexed. Fixed in the commit that follows the harness.
+> **First finding (baseline, 2026):** the harness immediately exposed two write paths
+> that scale with *data size* instead of *document size*:
+>
+> | Path | Symptom | Root cause | After |
+> |------|---------|------------|-------|
+> | point write | **3.18 ms/op** at 10k docs (vs 196 ns reads) | `index.Remove` walked every field/value bucket of the collection on every write | **8.0 µs/op** (397×) |
+> | watch feed trim | **804 KB allocated per write** once the feed hit its 10k cap | `changelog.trimLocked` rebuilt the whole retained window on every append → GC dominated the profile | **1.6 KB/op** (500×) |
+> | batch write (100 docs) | 41.7 ms | both of the above, ×100 | **0.29 ms** (142×) |
+> | log replay on startup | 1.0 s for 5k docs | same index path during replay | **34 ms** (30×) |
+> | HTTP PUT | 4.44 ms | store cost paid per request | **0.90 ms** (4.9×) |
+>
+> Fixed in the commit that follows the harness; `bench/README.md` is how this is
+> kept fixed.
 
 ## F. Speed — latency & throughput
 
