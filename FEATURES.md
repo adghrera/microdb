@@ -96,6 +96,36 @@ That is what this section is for.
 
 Every row below is ☐ — **no claim is made until it is verified.**
 
+### Build order — top 20 by priority (tracked across commits)
+
+| # | Tier | Feature | Pri | Status |
+|---|------|---------|-----|--------|
+| 1 | F | Benchmark harness + perf regression gate | 10 | ✅ |
+| 2 | P | Rolling-upgrade wire versioning (N / N−1) | 10 | ✅ |
+| 3 | F | Group commit / write batching | 9 | ⬜ |
+| 4 | F | Sharded store map (kill the global write lock) | 9 | ⬜ |
+| 5 | P | End-to-end integrity: checksums + `verify` + `repair` | 9 | ⬜ |
+| 6 | F | Block/page store with sparse index | 9 | ⬜ |
+| 7 | S | Tiered storage: hot local + cold object store | 9 | ⬜ |
+| 8 | F | Segment compression | 8 | ⬜ |
+| 9 | F | Bloom filters per segment | 8 | ⬜ |
+| 10 | F | Operator pushdown into the scan | 8 | ⬜ |
+| 11 | F | Parallel scatter-gather with a shared deadline | 8 | ⬜ |
+| 12 | F | Aggregate pushdown (`count/sum/min/max/group_by`) | 8 | ⬜ |
+| 13 | S | Topology-aware placement (rack/zone) | 8 | ⬜ |
+| 14 | S | Membership that scales to hundreds of nodes | 8 | ⬜ |
+| 15 | P | Scheduled, verified, offsite backups | 8 | ⬜ |
+| 16 | P | Secrets & key rotation | 8 | ⬜ |
+| 17 | P | Audit log | 8 | ⬜ |
+| 18 | P | SLO metrics + error budget | 8 | ⬜ |
+| 19 | P | Graceful shutdown that loses nothing | 7 | ⬜ |
+| 20 | P | Continuous profiling (`pprof`) | 7 | ⬜ |
+
+*(Plus one unplanned blocker the harness forced: making write cost
+independent of data size — shipped with #1.)*
+
+**Progress: 2 / 20 built.**
+
 ### Ground rules for this tier
 
 | Rule | Why |
@@ -156,7 +186,7 @@ Every row below is ☐ — **no claim is made until it is verified.**
 
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
-| [ ] | **Rolling-upgrade compatibility (N / N−1 wire)** | 10 | Version every internal envelope (gossip, replication, bootstrap stream, record API), negotiate on connect, reject incompatible peers cleanly. Without this a live cluster can never be upgraded without downtime — and unversioned messages are a silent-corruption risk. |
+| [x] | **Rolling-upgrade compatibility (N / N−1 wire)** | 10 | ✅ shipped — new `internal/protocol`: `X-Microdb-Protocol` stamped on every `/internal/*` request (cluster `clusterStampTransport`, api `protoStampTransport`) and advertised on every reply. Requests outside `[MinSupported, Version]` are refused with **505 + a structured body** (`peer_version`/`min_supported`/`max_supported`/`server_version`) *before* any of it is parsed into membership or data; an absent header means `LegacyVersion` (a pre-versioning binary), never "whatever we are today" — so the window survives the first version bump. Out-of-window peers are recorded in `Cluster.Incompatible()`, skipped by gossip, and surfaced in `/api/cluster` and `microctl status` (which now prints `/version`, incl. `protocol` + `protocol_window`). Joining an incompatible seed fails with a diagnosis and leaves zero partial membership. 5 `protocol` unit tests + 4 integration tests (negotiation matrix incl. malformed header, public API unaffected, clean join failure, `/version`) |
 | [ ] | **End-to-end integrity: checksums + `verify` + `repair`** | 9 | CRC32C per record on disk and per message on the wire; `microctl verify` walks segments and the ring reporting corrupt or divergent records, `microctl repair` re-fetches from peers. |
 | [ ] | **Scheduled, verified, offsite backups** | 8 | `microctl backup --target <dir|s3>` with retention policy + checksum manifest, and `microctl backup verify` restoring into a scratch dir and asserting counts. An untested backup is not a backup. |
 | [ ] | **Secrets & key rotation** | 8 | `--tls-*`, `--auth-token`, and encryption keys read from file/env (never argv), hot-reloaded on SIGHUP; per-record `key_id` so old records still decrypt under old keys after rotation. |

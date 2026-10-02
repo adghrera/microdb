@@ -137,7 +137,7 @@ func main() {
 }
 
 func printStatus(base string) {
-	for _, ep := range []string{"/health", "/api/cluster"} {
+	for _, ep := range []string{"/health", "/version", "/api/cluster"} {
 		resp, err := httpGet(base + ep)
 		if err != nil {
 			fatal(fmt.Errorf("%s: %w", ep, err))

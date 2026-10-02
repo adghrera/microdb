@@ -24,6 +24,7 @@ import (
 	"microdb/internal/gsi"
 	"microdb/internal/metrics"
 	"microdb/internal/migrate"
+	"microdb/internal/protocol"
 	"microdb/internal/readcache"
 	"microdb/internal/ranges"
 	"microdb/internal/ring"
@@ -190,7 +191,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	if rf < 1 {
 		rf = 1
 	}
-	s := &Server{st: st, cl: cl, self: self, repl: make(chan replTask, 256), mux: http.NewServeMux(), fwdClient: &http.Client{Timeout: 5 * time.Second}, rf: rf, idem: newIdempotencyCache(10 * time.Minute), rec: storage.NewLocal(st)}
+	s := &Server{st: st, cl: cl, self: self, repl: make(chan replTask, 256), mux: http.NewServeMux(), fwdClient: &http.Client{Timeout: 5 * time.Second, Transport: &protoStampTransport{base: http.DefaultTransport}}, rf: rf, idem: newIdempotencyCache(10 * time.Minute), rec: storage.NewLocal(st)}
 	s.ring = ring.Build([]string{self})
 	cl.OnPeersChanged = s.rebuildRing
 
@@ -257,6 +258,31 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Wire-protocol negotiation (rolling upgrades). Internal traffic
+	// outside our version window is refused loudly, before any of it
+	// can be half-parsed into membership or data — a mixed-version mesh
+	// must fail as "incompatible", never as silent corruption.
+	if strings.HasPrefix(r.URL.Path, "/internal/") {
+		pv, perr := protocol.Parse(r.Header.Get(protocol.Header))
+		if perr != nil {
+			pv = -1 // unparseable: report it as out of window
+		}
+		if perr != nil || protocol.CheckRequest(pv) != nil {
+			atomic.AddInt64(metrics.Default.Counter("microdb_protocol_rejections_total", "Internal requests refused for wire-version mismatch"), 1)
+			w.Header().Set(protocol.Header, protocol.String())
+			writeJSON(w, 505, map[string]interface{}{
+				"error":          "incompatible wire protocol — upgrade or roll back this node",
+				"peer_version":   pv,
+				"min_supported":  protocol.MinSupported,
+				"max_supported":  protocol.Version,
+				"server_version": protocol.Version,
+			})
+			return
+		}
+	}
+	// Advertise our version on every reply so a peer can detect a
+	// mismatch even on a 200, and so operators can curl it.
+	w.Header().Set(protocol.Header, protocol.String())
 	// Cluster identity guard: internal traffic must carry our name.
 	// Prevents a misconfigured node from silently merging two
 	// clusters' data and rings.
@@ -621,13 +647,29 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 // handleVersion reports build identity for ops dashboards.
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
-		"version":   Version,
-		"go":        goVersion(),
-		"node":      s.self,
-		"rf":        s.rf,
-		"cluster":   s.cl.ClusterName(),
-		"uptime_s":  time.Since(startTime).Seconds(),
+		"version":         Version,
+		"go":              goVersion(),
+		"node":            s.self,
+		"rf":              s.rf,
+		"cluster":         s.cl.ClusterName(),
+		"uptime_s":        time.Since(startTime).Seconds(),
+		"protocol":        protocol.Version,
+		"protocol_window": protocol.Window(),
 	})
+}
+
+// protoStampTransport stamps our wire version on outbound /internal/*
+// requests. Public /api traffic is unversioned by design: the HTTP API
+// is versioned by its /v1 path prefix instead.
+type protoStampTransport struct {
+	base http.RoundTripper
+}
+
+func (t *protoStampTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasPrefix(req.URL.Path, "/internal/") {
+		req.Header.Set(protocol.Header, protocol.String())
+	}
+	return t.base.RoundTrip(req)
 }
 
 // migrateDoc returns a schema-migrated COPY of d if the collection
@@ -1780,7 +1822,15 @@ func (s *Server) handleCollectionStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]interface{}{"self": s.self, "peers": s.cl.Peers()})
+	// Incompatible peers are reported separately so an operator can
+	// tell "no peers" from "peers I refuse to talk to".
+	writeJSON(w, 200, map[string]interface{}{
+		"self":               s.self,
+		"peers":              s.cl.Peers(),
+		"protocol":           protocol.Version,
+		"protocol_window":    protocol.Window(),
+		"incompatible_peers": s.cl.Incompatible(),
+	})
 }
 
 // handleMetrics renders Prometheus text format with live gauges

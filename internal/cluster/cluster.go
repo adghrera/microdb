@@ -27,6 +27,7 @@ import (
 	"microdb/internal/hints"
 	"microdb/internal/merkle"
 	"microdb/internal/metrics"
+	"microdb/internal/protocol"
 	"microdb/internal/store"
 )
 
@@ -126,6 +127,10 @@ type Cluster struct {
 	// clears the tombstone so a restarted node on the same address is
 	// accepted.
 	left map[string]time.Time
+	// incompatible holds peers that answered outside our wire-version
+	// window [protocol.MinSupported, protocol.Version]; they are
+	// skipped rather than retried forever.
+	incompatible map[string]int
 	// clusterName guards against cross-cluster contamination.
 	clusterName string
 	// loads holds the most recently gossiped write-rate (writes/sec)
@@ -149,19 +154,25 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 		}
 		transport.TLSClientConfig = tlsCfg
 	}
-	return &Cluster{
-		self:   self,
-		peers:  map[string]time.Time{},
-		left:   map[string]time.Time{},
-		loads:  map[string]float64{},
-		st:     st,
-		client: &http.Client{Timeout: 30 * time.Second, Transport: transport},
-		stop:   make(chan struct{}),
-		// Bootstrap streams can be large; 30s client timeout covers
-		// them. Admission: serve at most 2 concurrent bootstrap
-		// streams as a seed.
-		maxBootstraps: 2,
-	}, nil
+	c := &Cluster{
+		self:         self,
+		peers:        map[string]time.Time{},
+		left:         map[string]time.Time{},
+		loads:        map[string]float64{},
+		incompatible: map[string]int{},
+		st:           st,
+		client:       &http.Client{Timeout: 30 * time.Second},
+		stop:         make(chan struct{}),
+		maxBootstraps: 2, // bootstrap streams can be large: 30s client
+		// timeout covers them; serve at most 2 concurrent streams
+		// as a seed (admission control on the join path).
+	}
+	// Every internal request this node makes carries the cluster name
+	// (when configured) and the wire protocol version, and every reply
+	// is checked for compatibility. Unconditional — not only when a
+	// cluster name happens to be set.
+	c.client.Transport = &clusterStampTransport{base: transport, c: c}
+	return c, nil
 }
 
 // SetClusterName stamps every internal request this node makes with
@@ -171,24 +182,92 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 // cluster and starting to replicate/fence against it.
 func (c *Cluster) SetClusterName(name string) {
 	c.clusterName = name
-	c.client.Transport = &clusterStampTransport{base: c.client.Transport, name: name}
+	if t, ok := c.client.Transport.(*clusterStampTransport); ok {
+		t.name = name
+		return
+	}
+	c.client.Transport = &clusterStampTransport{base: c.client.Transport, name: name, c: c}
+}
+
+// --- wire-protocol compatibility -----------------------------------
+
+// markIncompatible records a peer speaking a version we cannot talk
+// to, so gossip and replication skip it instead of retrying a
+// conversation that can never succeed.
+func (c *Cluster) markIncompatible(addr string, peerVersion int) {
+	c.mu.Lock()
+	_, known := c.incompatible[addr]
+	if !known {
+		c.incompatible[addr] = peerVersion
+	}
+	c.mu.Unlock()
+	if !known {
+		log.Printf("wire protocol: %s speaks version %d, outside our window [%d, %d] — skipping until an operator upgrades or rolls back",
+			addr, peerVersion, protocol.MinSupported, protocol.Version)
+		atomic.AddInt64(metrics.Default.Counter("microdb_incompatible_peers_total", "Peers skipped for wire-version mismatch"), 1)
+	}
+}
+
+// isIncompatible reports whether addr was seen speaking an
+// out-of-window version.
+func (c *Cluster) isIncompatible(addr string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.incompatible[addr]
+	return ok
+}
+
+// Incompatible returns addr -> peer version for every peer skipped for
+// a wire-version mismatch, so an operator can see WHY a node stopped
+// participating.
+func (c *Cluster) Incompatible() map[string]int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]int, len(c.incompatible))
+	for a, v := range c.incompatible {
+		out[a] = v
+	}
+	return out
+}
+
+// markFromResponse inspects a peer reply: an explicit 505 means it
+// refused OUR version, an out-of-window advertised version means it
+// ignored our header (a pre-versioning binary). Either way the peer is
+// unusable for internal traffic.
+func (c *Cluster) markFromResponse(addr string, resp *http.Response) {
+	pv, err := protocol.Parse(resp.Header.Get(protocol.Header))
+	if err != nil {
+		pv = -1
+	}
+	if resp.StatusCode == 505 || protocol.CheckResponse(pv) != nil {
+		c.markIncompatible(addr, pv)
+	}
 }
 
 // clusterNameOf returns the configured cluster name ("" = unguarded).
 func (c *Cluster) ClusterName() string { return c.clusterName }
 
-// clusterStampTransport adds the X-Microdb-Cluster header to every
-// outbound request, whatever the inner transport.
+// clusterStampTransport adds the X-Microdb-Cluster and
+// X-Microdb-Protocol headers to every outbound request, whatever the
+// inner transport, and checks every reply for wire compatibility.
 type clusterStampTransport struct {
 	base http.RoundTripper
 	name string
+	c    *Cluster
 }
 
 func (t *clusterStampTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.name != "" {
 		req.Header.Set("X-Microdb-Cluster", t.name)
 	}
-	return t.base.RoundTrip(req)
+	if strings.HasPrefix(req.URL.Path, "/internal/") {
+		req.Header.Set(protocol.Header, protocol.String())
+	}
+	resp, err := t.base.RoundTrip(req)
+	if err == nil && resp != nil && t.c != nil && strings.HasPrefix(req.URL.Path, "/internal/") {
+		t.c.markFromResponse(req.URL.Scheme+"://"+req.URL.Host, resp)
+	}
+	return resp, err
 }
 
 // Join contacts a known seed node and asks for its member list.
@@ -203,6 +282,11 @@ func (c *Cluster) Join(seed string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == 505 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("join %s refused: incompatible wire protocol (this node speaks %d, seed window is not compatible): %s",
+			seed, protocol.Version, strings.TrimSpace(string(body)))
+	}
 	// Non-2xx means the seed refused us (e.g. cluster name mismatch).
 	// Surface it instead of decoding the error body as a member list.
 	if resp.StatusCode != http.StatusOK {
@@ -598,6 +682,9 @@ func (c *Cluster) gossipRound() {
 		return
 	}
 	peer := peers[rand.Intn(len(peers))]
+	if c.isIncompatible(peer) {
+		return // known to speak an out-of-window wire version
+	}
 	changed := false
 	if c.seen(peer) {
 		changed = true
@@ -616,6 +703,12 @@ func (c *Cluster) gossipRound() {
 		return
 	}
 	defer resp.Body.Close()
+	// 505 = the peer refused our wire version (or advertised one we
+	// cannot read). The transport has already recorded it; stop here so
+	// its payload can never be merged into our membership view.
+	if resp.StatusCode == 505 || resp.StatusCode != http.StatusOK {
+		return
+	}
 	var out struct {
 		Members []Member          `json:"members"`
 		Epoch   int64           `json:"epoch"`
