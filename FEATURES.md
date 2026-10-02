@@ -2,6 +2,7 @@
 
 **Project:** `microdb` · Go 1.23 · stdlib-only distributed schema-less document store
 **Status:** all Tier 1–3 features + most Tier 4 shipped. Every "done" row is backed by a passing test or live run.
+**Next:** see [⚡ Fast / scalable / production-grade](#-fast-scalable-production-grade--the-remaining-gap) below — the ☐ gap plan to take microdb from "correct and elastic" to "serves real traffic".
 **Priority scale:** 10 = core correctness/foundation → 0 = nice-to-have polish.
 
 Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
@@ -83,6 +84,102 @@ Legend: ✅ shipped & verified · ⬜ not done · ⚠️ shipped with caveat
 | [ ] | Per-collection RF (vs global `--rf`) | 3 | Ring would need per-collection ownership maps |
 | [ ] | Durable change feed (persisted events) | 3 | Current feed is bounded in-memory by design |
 | [ ] | Range-partitioned queries pushed to shards | 2 | Scatter-gather is O(cluster) but correct |
+
+---
+
+# ⚡ Fast, scalable, production-grade — the remaining gap
+
+Everything above establishes **correctness and elasticity**: the ring moves, quorums hold,
+nodes join and leave, data survives restarts. None of it yet makes microdb *fast under load*,
+able to hold *more data than one cluster's RAM*, or *safe to operate on a Sunday night*.
+That is what this section is for.
+
+Every row below is ☐ — **no claim is made until it is verified.**
+
+### Ground rules for this tier
+
+| Rule | Why |
+|------|-----|
+| **Benchmark before you build** | Each F/S row names the number it moves. No baseline ⇒ no feature. "Fast" must be p99, not a vibe. |
+| **Measure the tail** | Report p50/p95/p99/max + ops/s + allocs/op. Averages hide exactly the latency users complain about. |
+| **Correctness is the merge gate** | Full suite green + `-race` clean stays mandatory. A perf change that weakens quorum, fencing, or idempotency semantics is rejected regardless of benchmark. |
+| **Observable or it didn't happen** | Every feature ships a metric or log line proving it works in production, not just in tests. |
+| **One feature per commit** | Matches the existing history discipline. |
+
+> **First finding (baseline, 2026):** the harness immediately exposed an O(n²)
+> path — `StorePointWrite` costs **3.18 ms/op** once a collection holds 10k docs
+> and `StoreOpenReplay` takes **1.0 s** for 5k documents, while point reads are
+> 196 ns. Writes scale with *collection size* because `index.Index.Remove` walks
+> every field/value bucket of the collection on every write instead of remembering
+> what one doc indexed. Fixed in the commit that follows the harness.
+
+## F. Speed — latency & throughput
+
+| ☐ | Feature | Pri | What it takes |
+|---|---------|-----|---------------|
+| [x] | **Benchmark harness + perf regression gate** | 10 | ✅ shipped — `bench/` Go benchmarks (store point read/write, fsync write, batch, replica apply, scan vs index, replay, HTTP write/read/query) + `cmd/microbench` closed-loop load driver (mixed/read/write/query, `-burst` step load) emitting JSON p50/p95/p99 + ops/s. `bench/README.md` defines the acceptance rule (benchstat before/after, no collateral regressions). 7 `loadgen` tests: nearest-rank percentile math, error accounting, burst, JSON round-trip. **Baseline (Ryzen 5700U):** PointWrite 3.18ms · PointWriteFsync 4.31ms · PointRead 196ns · PointReadParallel 54ns (scales with -cpu) · Batch100 41.7ms · ReplicaApply 231µs · ScanFilter 5.1ms · ScanIndexed 36µs · OpenReplay(5k) 1.0s · HTTPWrite 4.4ms · HTTPRead 779µs · HTTPQuery 1.08ms |
+| [ ] | **Group commit / write batching** | 9 | Coalesce concurrent `store.Apply` into one fsync inside a short (configurable, ~1ms) commit window instead of one fsync per write. Large throughput win under load for bounded latency; expose queue depth so the window can't mask a stall. |
+| [ ] | **Sharded store map (kill the global write lock)** | 9 | The in-memory document map is a single lock — point reads serialize under concurrency. Shard it (striped `RWMutex` / per-shard maps) so read throughput scales past `GOMAXPROCS`. Benchmark must show linear-ish scaling on N readers. |
+| [ ] | **Block/page store with sparse index (replace full JSON replay)** | 9 | JSONL re-parses every document on open and pins the whole dataset in RAM. Move to length-prefixed, CRC32C-checksummed segments + an in-memory key→offset sparse index: open becomes O(docs) seeks rather than O(bytes) parsing, and dataset size stops being bounded by heap. |
+| [ ] | **Segment compression** | 8 | `compress/flate` (stdlib, level 1) per segment cuts disk and network bytes — pays off directly on bootstrap streaming and anti-entropy, which currently ship raw JSON. |
+| [ ] | **Bloom filters per segment** | 8 | Negative point lookups become cheap disk-checks; also short-circuits Merkle subtree exchanges for keys a node provably does not hold. |
+| [ ] | **Operator pushdown into the scan** | 8 | Filters/sort evaluate inside the store scan rather than after materializing candidates in the API layer — the `limit` pushdown already proved this pattern on the wire. |
+| [ ] | **Parallel scatter-gather with a shared deadline** | 8 | Fan out shard queries concurrently instead of serially; per-shard partial results + one bounded wait. Turns query latency from O(shards × t) into O(max t). |
+| [ ] | **Aggregate pushdown** (`count/sum/min/max/group_by`) | 8 | Shards return partial aggregates, coordinator merges → O(shards) wire instead of streaming every document to be counted in Go. |
+| [ ] | **Multi-tier read cache (memory → local disk) + engine-level invalidation (C7)** | 7 | Extend `readcache` past the in-process LRU with a bounded disk tier, and let `microcompute` caches subscribe to the storage change feed for invalidation instead of TTL-guessing. |
+| [ ] | **Read-ahead on range scans & pagination** | 7 | Batched I/O for sequential `ScanPage`; prefetch the next partition on deep pagination instead of round-tripping per page. |
+| [ ] | **Framed persistent internal connections** | 6 | Replication, gossip, and anti-entropy currently do a request per message. Multiplex over a long-lived length-prefixed, versioned connection per peer with bounded per-peer write queues. |
+| [ ] | **End-to-end write-path backpressure** | 6 | `--max-inflight` sheds at the API today; propagate the signal into the commit queue, hint store, and GSI worker so a slow disk degrades gracefully instead of ballooning memory. |
+
+## S. Scale — more data, more nodes, more regions
+
+| ☐ | Feature | Pri | What it takes |
+|---|---------|-----|---------------|
+| [ ] | **Tiered storage: hot local SSD + cold object store** (C4) | 9 | Bounded hot window on local disk; older segments in S3-compatible storage (stdlib `net/http` against the S3 REST API — no SDK), fetched lazily and cached. Dataset size stops being coupled to cluster disk, IOPS scale independently of history. |
+| [ ] | **Membership that survives hundreds of nodes** | 8 | Gossip is full-mesh push/pull with every peer every tick — O(N²) traffic. Move to a partial-view protocol (active + passive peer set, random-walk join), batch member lists, and pair-randomized anti-entropy instead of all-pairs so chatter stays O(1) per node. |
+| [ ] | **Topology-aware placement (rack/zone)** | 8 | `--zones` map; replicas prefer distinct failure domains, anti-entropy pairs prefer same-zone. Stops RF=3 landing all replicas on one host or rack — the classic silent availability bug. |
+| [ ] | **Multi-region replication (D6) + causal merge** | 7 | Cross-region log shipping with conflict resolution **beyond LWW**: version vectors per document + explicit resolution hooks, and hybrid logical clocks so "last" is well-defined. LWW across regions silently drops concurrent edits under clock skew. |
+| [ ] | **Index service off the write path (C5)** | 7 | Move GSI maintenance out of the store process into a tier consuming the durable change feed; index cost and index failures stop being charged to the write path. |
+| [ ] | **Compute autoscaling (C6)** | 7 | Stateless `microcompute` behind a load balancer: scale out on CPU/queue depth in seconds, scale in by draining. `/ready` already exists as the readiness hook. |
+| [ ] | **Spill-to-disk query execution** | 6 | Sort/aggregation over large results spills to temp files under a bounded memory budget instead of buffering everything in the coordinator. |
+| [ ] | **Watermarks + capacity admission** | 6 | Per-node memory/disk high-water marks: shed or spill before OOM rather than after. `microctl capacity` reports headroom, time-to-full, and the cost of the next rebalance. |
+| [ ] | **Soak / chaos harness** | 6 | Scripted multi-hour run: random kills, slow disk, partitions, joins/leaves — then assert convergence, zero data loss, and p99 within budget. This is the row that *proves* "production-grade" instead of asserting it. |
+
+## P. Production-grade — operability, safety, security
+
+| ☐ | Feature | Pri | What it takes |
+|---|---------|-----|---------------|
+| [ ] | **Rolling-upgrade compatibility (N / N−1 wire)** | 10 | Version every internal envelope (gossip, replication, bootstrap stream, record API), negotiate on connect, reject incompatible peers cleanly. Without this a live cluster can never be upgraded without downtime — and unversioned messages are a silent-corruption risk. |
+| [ ] | **End-to-end integrity: checksums + `verify` + `repair`** | 9 | CRC32C per record on disk and per message on the wire; `microctl verify` walks segments and the ring reporting corrupt or divergent records, `microctl repair` re-fetches from peers. |
+| [ ] | **Scheduled, verified, offsite backups** | 8 | `microctl backup --target <dir|s3>` with retention policy + checksum manifest, and `microctl backup verify` restoring into a scratch dir and asserting counts. An untested backup is not a backup. |
+| [ ] | **Secrets & key rotation** | 8 | `--tls-*`, `--auth-token`, and encryption keys read from file/env (never argv), hot-reloaded on SIGHUP; per-record `key_id` so old records still decrypt under old keys after rotation. |
+| [ ] | **Audit log** | 8 | Structured append-only record of authn/authz decisions and mutations: who, which tenant/collection, when, from where. `tenants` already makes the decision — this preserves it. |
+| [ ] | **SLO metrics + error budget** | 8 | RED (rate/errors/duration) histograms per endpoint and a `% of requests over latency SLO` gauge, so alerts fire on user-visible pain rather than on CPU. |
+| [ ] | **Continuous profiling** | 7 | `--pprof` behind auth (stdlib `net/http/pprof`) plus CPU/heap snapshots on a timer, for post-hoc diagnosis of p99 regressions. |
+| [ ] | **Graceful shutdown that loses nothing** | 7 | SIGTERM → `/ready` 503 → drain in-flight → flush commit queue, hint store, durable feed → leave ring → exit 0, bounded by `--shutdown-timeout`. |
+| [ ] | **Validated config file + env overrides** | 6 | The flag surface is large enough now that a single config file with env overrides, strict unknown-key rejection, and `microctl config validate` beats a 30-arg command line. |
+| [ ] | **Kubernetes operator manifests** | 6 | StatefulSet + PVC + headless Service + PodDisruptionBudget + probes wired to `/ready`/`/health`, plus a Helm chart. Upgrades docker-compose from demo to deployable. |
+| [ ] | **Rejection & quota metrics per tenant** | 5 | Rate-limit and quota rejections already exist; export them with tenant labels so a noisy neighbour appears on a dashboard before it appears in a support ticket. |
+| [ ] | **Runbook in-repo** | 5 | `docs/runbook.md`: node loss, disk full, split brain, key rotation, restore-from-backup — each with exact commands and the observable outcome that confirms success. |
+
+## Definition of done for this tier
+
+A row flips to ✅ only when **all four** hold:
+
+1. a test that fails before and passes after, **or** a benchmark with checked-in before/after numbers;
+2. full suite green **and** `-race` clean;
+3. a metric or log line that makes the behavior observable in production;
+4. documented (default value, cost of enabling, failure mode) in `README.md` / runbook.
+
+## Suggested ordering for this tier
+
+| Phase | Theme | Items | Why this order |
+|-------|-------|-------|----------------|
+| **7** | Measure, then fix the hot path | F: bench harness → group commit → sharded map → block store | You cannot claim "fast" without a baseline; these four unlock every other perf row |
+| **8** | Never corrupt or lose data | P: wire versioning, checksums+verify/repair, graceful shutdown | Correctness blockers — must land before anyone runs this in production |
+| **9** | Scale the coordination layer | S: membership fanout, zone awareness, anti-entropy scheduling, aggregate pushdown | O(N²) gossip/repair chatter is the first wall a real cluster hits |
+| **10** | Cost & geography | S: tiered storage, multi-region, index service, compute autoscale | Cloud economics, once the coordination layer is sound |
+| **11** | Operate it | P: SLOs, pprof, audit, backups, k8s manifests, runbook | The difference between "it runs" and "you can be on call for it" |
 
 ---
 
