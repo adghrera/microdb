@@ -93,6 +93,29 @@ func BenchmarkStorePointWriteFsync(b *testing.B) {
 	}
 }
 
+// BenchmarkStorePointWriteFsyncParallel shows group commit under
+// load: concurrent durable writers share fsync passes instead of each
+// paying for one, so throughput should not collapse the way the
+// serial fsync benchmark does.
+func BenchmarkStorePointWriteFsyncParallel(b *testing.B) {
+	st, done := openStore(b)
+	defer done()
+	st.SetFsync(true)
+	seedDocs(b, st, "bench", writeKeyspace)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			id := fmt.Sprintf("k%06d", i%writeKeyspace)
+			if _, err := st.Apply("bench", id, map[string]interface{}{"n": i}); err != nil {
+				b.Errorf("apply: %v", err)
+				return
+			}
+			i++
+		}
+	})
+}
+
 func BenchmarkStorePointRead(b *testing.B) {
 	st, done := openStore(b)
 	defer done()
@@ -119,7 +142,8 @@ func BenchmarkStorePointReadParallel(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			if _, ok := st.Get("bench", fmt.Sprintf("k%06d", i%n)); !ok {
-				b.Fatalf("miss on key %d", i%n)
+				b.Errorf("miss on key %d", i%n)
+				return
 			}
 			i++
 		}

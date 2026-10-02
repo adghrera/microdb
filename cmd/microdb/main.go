@@ -39,6 +39,7 @@ func main() {
 	dir := flag.String("dir", "./data", "data directory")
 	join := flag.String("join", "", "comma-separated seed nodes, e.g. http://127.0.0.1:8002")
 	fsync := flag.Bool("fsync", false, "fsync every write to disk (durable, slower)")
+	commitWindow := flag.Duration("commit-window", 0, "group-commit window with --fsync: hold the first waiting write this long so more writes join the same fsync (0 = commit the batch as soon as it forms)")
 	tlsCert := flag.String("tls-cert", "", "PEM cert for TLS (enables https)")
 	tlsKey := flag.String("tls-key", "", "PEM key for TLS")
 	tlsCA := flag.String("tls-ca", "", "PEM CA bundle to verify peer certs (mutual TLS)")
@@ -75,6 +76,7 @@ func main() {
 		}
 	}
 	st.SetFsync(*fsync)
+	st.SetCommitWindow(*commitWindow)
 	defer st.Close()
 
 	// Durable shared commit log (C3): recover anything newer than our

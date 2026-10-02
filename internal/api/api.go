@@ -1846,6 +1846,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		atomic.StoreInt64(metrics.Default.Counter("microdb_cache_invalidations_total", "Read cache invalidations from the change feed"), inv)
 		atomic.StoreInt64(metrics.Default.Gauge("microdb_cache_entries", "Live read cache entries"), int64(s.rcache.Len()))
 	}
+	// Group commit: writes/fsync is the batch size — the number that
+	// shows whether writes are actually sharing durability passes.
+	passes, writes, failed := s.st.CommitStats()
+	atomic.StoreInt64(metrics.Default.Counter("microdb_group_fsyncs_total", "Group-commit fsync passes"), passes)
+	atomic.StoreInt64(metrics.Default.Counter("microdb_group_fsync_writes_total", "Writes made durable by those passes"), writes)
+	atomic.StoreInt64(metrics.Default.Counter("microdb_group_fsync_errors_total", "Group-commit fsync passes that failed"), failed)
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	w.Write([]byte(metrics.Default.Render()))
 }

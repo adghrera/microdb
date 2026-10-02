@@ -19,6 +19,7 @@ go test ./bench -bench . -benchmem -count=1
 | Benchmark | Path it isolates |
 |-----------|------------------|
 | `StorePointWrite` / `StorePointWriteFsync` | client write path, buffered vs durable |
+| `StorePointWriteFsyncParallel` | group commit: concurrent durable writers sharing log passes |
 | `StorePointRead` / `StorePointReadParallel` | point reads, and whether they scale with `-cpu` |
 | `StoreBatch100` | batch write path (one log record, one fsync) |
 | `StoreReplicaApply` | replication / anti-entropy apply |
