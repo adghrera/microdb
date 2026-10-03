@@ -6,6 +6,7 @@ package store
 import (
 	"bufio"
 	"bytes"
+	"container/heap"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -65,10 +66,10 @@ type Store struct {
 	// every write in exchange for fewer bytes on disk and less to
 	// replay at startup).
 	compress atomic.Bool
-	path   string       // absolute path of the JSONL commit log
-	f      *os.File
-	key    []byte      // encryption-at-rest key (nil = plaintext log)
-	fsync  atomic.Bool // sync to disk on every write (durability over throughput)
+	path     string // absolute path of the JSONL commit log
+	f        *os.File
+	key      []byte      // encryption-at-rest key (nil = plaintext log)
+	fsync    atomic.Bool // sync to disk on every write (durability over throughput)
 	// lw owns every append to the commit log: it batches records that
 	// arrive together into one write and one fsync (group commit), then
 	// releases the waiters (see commit.go).
@@ -1086,6 +1087,117 @@ func (s *Store) Scan(collection string, keep func(*Doc) bool) []*Doc {
 	return out
 }
 
+// topKDoc is one candidate in the bounded result heap.
+type topKDoc struct {
+	doc *Doc
+	key interface{} // the sort field's value (post-transform)
+}
+
+// topKHeap keeps the BEST n candidates reachable and the worst one at
+// the root, so a walk over a million matches keeps n documents instead
+// of materialising and sorting them all.
+type topKHeap struct {
+	items []*topKDoc
+	less  func(a, b *topKDoc) bool
+}
+
+func (h *topKHeap) Len() int           { return len(h.items) }
+func (h *topKHeap) Less(i, j int) bool { return h.less(h.items[i], h.items[j]) }
+func (h *topKHeap) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *topKHeap) Push(x interface{}) { h.items = append(h.items, x.(*topKDoc)) }
+func (h *topKHeap) Pop() interface{} {
+	last := h.items[len(h.items)-1]
+	h.items = h.items[:len(h.items)-1]
+	return last
+}
+
+// ScanTopK runs a query with sort and limit pushed INTO the scan.
+//
+// The API layer used to walk every match, sort the whole set and then
+// cut a window out of it — O(matches) memory and O(matches log matches)
+// CPU per shard, per query, to answer a request for twenty rows. This
+// keeps a bounded heap under the requested order instead: O(window)
+// memory, O(matches log window) time, and the first n results are
+// identical to the old sort-then-cut — ties break by id ascending,
+// which is exactly what a stable sort over Scan's id-ordered output
+// produced.
+//
+// transform runs on each match before it is ordered (the caller's
+// schema migration rewrites fields, and the sort must see what the
+// client will see). It returns (docs, truncated) where truncated means
+// more documents matched than the window holds.
+func (s *Store) ScanTopK(collection string, filter map[string]interface{}, transform func(*Doc) *Doc, sortField string, desc bool, n int) ([]*Doc, bool) {
+	if n <= 0 {
+		return nil, false
+	}
+	if transform == nil {
+		transform = func(d *Doc) *Doc { return d }
+	}
+	// Desired order: sortField (asc or desc), ties by id ascending.
+	// The heap is a MAX heap under this order so its root is the
+	// worst document we are currently holding.
+	// desired reports whether (aKey,aID) comes before (bKey,bID) in the
+	// requested order. It takes values, not wrappers: every candidate
+	// that would otherwise take its address escapes to the heap, and
+	// this runs once per matching document (measured: 20k allocs/query
+	// before it took values).
+	desired := func(aKey interface{}, aID string, bKey interface{}, bID string) bool {
+		c := CompareValues(aKey, bKey)
+		if c == 0 {
+			return aID < bID
+		}
+		if desc {
+			return c > 0
+		}
+		return c < 0
+	}
+	// container/heap is a MIN-heap over less, but this walk needs the
+	// WORST document at the root so it can be evicted the moment a
+	// better one arrives — so less is the inverse of the desired
+	// output order.
+	less := func(a, b *topKDoc) bool { return desired(b.key, b.doc.ID, a.key, a.doc.ID) }
+	h := &topKHeap{less: less}
+	truncated := false
+
+	matches := func(d *Doc) bool { return len(filter) == 0 || Matches(d, filter) }
+	s.rangeDocs(func(_ string, d *Doc) bool {
+		if d.Collection != collection || d.Deleted || !matches(d) {
+			return true
+		}
+		out := transform(d)
+		if h.Len() < n {
+			heap.Push(h, &topKDoc{doc: out, key: out.Fields[sortField]})
+			return true
+		}
+		// Heap is full: the root is the worst we hold. Anything better
+		// takes its slot (mutating in place, so a scan over a million
+		// matches allocates n wrappers, not one per replacement);
+		// anything worse is dropped on the floor — which is the whole
+		// point.
+		key := out.Fields[sortField]
+		truncated = true
+		root := h.items[0]
+		// If the root still comes before the candidate, the candidate
+		// is worse than everything we hold and is dropped.
+		if !desired(root.key, root.doc.ID, key, out.ID) {
+			root.doc = out
+			root.key = key
+			heap.Fix(h, 0)
+		}
+		return true
+	})
+
+	out := make([]*Doc, 0, h.Len())
+	for h.Len() > 0 {
+		out = append(out, heap.Pop(h).(*topKDoc).doc)
+	}
+	// Pop order is worst-first: reverse into best-first.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, truncated
+}
+
 // Prefilter answers one question cheaply: can this collection be ruled
 // out for this filter WITHOUT scanning it? It returns true only when
 // some exact-equality condition matches nothing in the collection's
@@ -1856,6 +1968,30 @@ func jsonEq(a, b interface{}) bool {
 // CompareValues orders two JSON-decoded values: numbers numerically,
 // strings lexicographically, missing values sort last. Mixed or
 // unorderable types compare equal (stable sort keeps insertion order).
+// numOf coerces the numeric types JSON decoding (float64) and
+// in-process writes (int/int64) produce into one comparable form.
+// Without it, a document written directly by a test or by an internal
+// path sorts and filters differently from the same document written
+// through the HTTP API — two representations of the same number.
+func numOf(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	}
+	return 0, false
+}
+
 func CompareValues(a, b interface{}) int {
 	if a == nil && b == nil {
 		return 0
@@ -1865,6 +2001,11 @@ func CompareValues(a, b interface{}) int {
 	}
 	if b == nil {
 		return -1
+	}
+	if af, ok := numOf(a); ok {
+		if bf, ok := numOf(b); ok {
+			return sign(af - bf)
+		}
 	}
 	switch av := a.(type) {
 	case float64:
@@ -1891,6 +2032,11 @@ func CompareValues(a, b interface{}) int {
 }
 
 func cmp(a, b interface{}, pred func(int) bool) bool {
+	if af, ok := numOf(a); ok {
+		if bf, ok := numOf(b); ok {
+			return pred(int(sign(af - bf)))
+		}
+	}
 	switch av := a.(type) {
 	case float64:
 		bv, ok := b.(float64)

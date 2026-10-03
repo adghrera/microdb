@@ -5,8 +5,8 @@ package api
 import (
 	"bytes"
 	"crypto/subtle"
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,14 +19,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"microdb/internal/cluster"
 	"microdb/internal/changelog"
+	"microdb/internal/cluster"
 	"microdb/internal/gsi"
 	"microdb/internal/metrics"
 	"microdb/internal/migrate"
 	"microdb/internal/protocol"
-	"microdb/internal/readcache"
 	"microdb/internal/ranges"
+	"microdb/internal/readcache"
 	"microdb/internal/ring"
 	"microdb/internal/storage"
 	"microdb/internal/store"
@@ -39,20 +39,20 @@ import (
 const maxInternalBody = 64 << 20
 
 type Server struct {
-	st      *store.Store
-	cl      *cluster.Cluster
-	ringMu  sync.RWMutex
-	ring    *ring.Ring
-	self    string
-	repl    chan replTask
-	mux     *http.ServeMux
+	st        *store.Store
+	cl        *cluster.Cluster
+	ringMu    sync.RWMutex
+	ring      *ring.Ring
+	self      string
+	repl      chan replTask
+	mux       *http.ServeMux
 	fwdClient *http.Client
-	rf      int // replication factor (ring owners consulted per write)
-	idem    *idempotencyCache
-	tenants *tenants.Registry
-	rcache  *readcache.Cache
-	rec     *storage.Local // storage-tier record boundary (fenced)
-	gsi     *gsi.Manager
+	rf        int // replication factor (ring owners consulted per write)
+	idem      *idempotencyCache
+	tenants   *tenants.Registry
+	rcache    *readcache.Cache
+	rec       *storage.Local // storage-tier record boundary (fenced)
+	gsi       *gsi.Manager
 	// Range map (load-adaptive contiguous ownership): nil until
 	// EnableRangeMap. rangeBuckets counts writes per token high
 	// byte; rangeEWMA is the smoothed writes/sec; rangePlan is the
@@ -121,10 +121,10 @@ func (s *Server) handleConfigCollection(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var in struct {
-		RF             int   `json:"rf"`
+		RF             int    `json:"rf"`
 		PartitionField string `json:"partition_field"`
 		SortField      string `json:"sort_field"`
-		MaxDocs        int64 `json:"max_docs"`
+		MaxDocs        int64  `json:"max_docs"`
 	}
 	if err := json.Unmarshal(body, &in); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "body must be {\"rf\": n, \"partition_field\": \"x\", \"sort_field\": \"y\"}"})
@@ -964,11 +964,11 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 			// The write IS applied locally and will converge via
 			// anti-entropy/hints, but we cannot promise durability — say so.
 			writeJSON(w, 503, map[string]interface{}{
-				"error":    "write quorum not reached",
-				"acked":    acked,
-				"need":     need,
-				"applied":  true,
-				"errors":   werrs,
+				"error":   "write quorum not reached",
+				"acked":   acked,
+				"need":    need,
+				"applied": true,
+				"errors":  werrs,
 			})
 			return
 		}
@@ -1213,22 +1213,18 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	gatherOne := func(m string) gatherResult {
 		if m == s.self {
-			docs := s.migrateDocs(col, s.st.ScanIndexed(col, filter))
-			trunc := false
+			// Pushdown: sort and window happen INSIDE the scan (a
+			// bounded heap over the walk), so a 20-row query never
+			// materialises or sorts every match on this shard. Schema
+			// migration runs on each candidate as it is ordered, so
+			// the sort sees the fields the client will see.
 			if pushdown {
-				sort.SliceStable(docs, func(i, j int) bool {
-					c := store.CompareValues(docs[i].Fields[sortField], docs[j].Fields[sortField])
-					if desc {
-						return c > 0
-					}
-					return c < 0
-				})
-				if len(docs) > capN {
-					docs = docs[:capN]
-					trunc = true
-				}
+				docs, trunc := s.st.ScanTopK(col, filter,
+					func(d *store.Doc) *store.Doc { return s.migrateDoc(col, d) },
+					sortField, desc, capN)
+				return gatherResult{docs: docs, truncated: trunc}
 			}
-			return gatherResult{docs: docs, truncated: trunc}
+			return gatherResult{docs: s.migrateDocs(col, s.st.ScanIndexed(col, filter)), truncated: false}
 		}
 		docs, trunc, err := s.gatherFrom(m, col, r.URL.Query().Get("filter"), sortField, desc, capN)
 		return gatherResult{docs: docs, truncated: trunc, err: err}
@@ -1322,8 +1318,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]interface{}{
 		"count":         len(out),
-		"total":       total,
-		"docs":        out,
+		"total":         total,
+		"docs":          out,
 		"nodes_queried": len(members),
 	}
 	// With pushdown the merged set may be a truncated view, so the
@@ -1367,7 +1363,7 @@ func (s *Server) gatherFrom(peer, col, filter string, sortField string, desc boo
 	defer resp.Body.Close()
 	var out struct {
 		Docs      []*store.Doc `json:"docs"`
-		Truncated bool       `json:"truncated"`
+		Truncated bool         `json:"truncated"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, false, err

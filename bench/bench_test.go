@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"testing"
 	"time"
 
@@ -231,6 +232,42 @@ func BenchmarkStoreScanMissFullScan(b *testing.B) {
 		if len(got) != 0 {
 			b.Fatalf("expected no matches, got %d", len(got))
 		}
+	}
+}
+
+// BenchmarkStoreScanTopK20 vs BenchmarkStoreScanSortAll20 is the
+// operator-pushdown claim: a 20-row window over 20k matches.
+func BenchmarkStoreScanTopK20(b *testing.B) {
+	st, done := openStore(b)
+	defer done()
+	seedDocs(b, st, "bench", benchScanDocs)
+	filter := map[string]interface{}{"n": map[string]interface{}{"$gt": -1}}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		docs, _ := st.ScanTopK("bench", filter, nil, "n", false, 20)
+		if len(docs) != 20 {
+			b.Fatalf("got %d docs", len(docs))
+		}
+	}
+}
+
+// BenchmarkStoreScanSortAll20 is the old shape: materialise every
+// match, sort it, cut the window.
+func BenchmarkStoreScanSortAll20(b *testing.B) {
+	st, done := openStore(b)
+	defer done()
+	seedDocs(b, st, "bench", benchScanDocs)
+	filter := map[string]interface{}{"n": map[string]interface{}{"$gt": -1}}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		docs := st.ScanIndexed("bench", filter)
+		sort.SliceStable(docs, func(x, y int) bool {
+			return store.CompareValues(docs[x].Fields["n"], docs[y].Fields["n"]) < 0
+		})
+		if len(docs) < 20 {
+			b.Fatalf("got %d docs", len(docs))
+		}
+		docs = docs[:20]
 	}
 }
 
