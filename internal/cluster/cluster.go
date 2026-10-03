@@ -7,6 +7,7 @@ package cluster
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -333,18 +334,52 @@ func (t *clusterStampTransport) RoundTrip(req *http.Request) (*http.Response, er
 	return resp, err
 }
 
+// minCompressBody is the size below which gzip framing costs more than
+// it saves. Internal messages are JSON: batches, bootstrap pages and
+// gossip with a few hundred members all compress well above this.
+const minCompressBody = 1024
+
+// maybeCompress gzips a body that is large enough to benefit. The
+// return value is the payload to send plus whether it was compressed —
+// small bodies go out as-is (no framing overhead, no decompressor on
+// the far side for a 200-byte gossip message).
+func maybeCompress(body []byte) ([]byte, bool) {
+	if len(body) < minCompressBody {
+		return body, false
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(body); err != nil {
+		return body, false
+	}
+	if err := gz.Close(); err != nil {
+		return body, false
+	}
+	if buf.Len() >= len(body) {
+		return body, false // incompressible: don't pay framing for nothing
+	}
+	return buf.Bytes(), true
+}
+
 // post sends an internal request, stamping the body's CRC32C so the
 // receiver can prove the bytes that arrived are the bytes that were
-// sent. Truncation or corruption on the wire is rejected before it can
-// be applied to replication or membership state.
+// sent — over the ORIGINAL body, before compression, so the checksum
+// still answers "did the right bytes arrive?" rather than "did gzip
+// round-trip?". Bodies above minCompressBody are gzipped: replication
+// and bootstrap used to ship raw JSON, which is the largest wire cost
+// a write amplification factor has.
 func (c *Cluster) post(url string, body []byte) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	payload, compressed := maybeCompress(body)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if len(body) > 0 {
 		req.Header.Set(protocol.CRCHeader, protocol.Checksum(body))
+		if compressed {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
 	}
 	return c.client.Do(req)
 }

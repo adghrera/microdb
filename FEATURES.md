@@ -251,7 +251,7 @@ before feature 1 landed.
 | 23 | Backup scheduler + retention | closes the ⚠️ on backups: RPO automation and bounded offsite growth | ⬜ |
 | 24 | TLS cert/key hot-reload | expired certs are a top self-inflicted outage; closes the ⚠️ on secrets | ✅ |
 | 25 | Index value encode fast path | `json.Marshal` per field per write measured at 61% of replay allocations | ✅ |
-| 26 | Wire compression (internal requests + responses) | closes both "the wire still ships JSON" scope notes | ⬜ |
+| 26 | Wire compression (internal requests + responses) | closes both "the wire still ships JSON" scope notes | ✅ |
 | 27 | Zone-local anti-entropy pairing | cross-zone repair traffic is money for no correctness gain | ✅ |
 | 28 | Soak / chaos harness | the only honest answer to "does it survive failures" | ⬜ |
 | 29 | Operability pack: k8s + Helm + compute autoscaling (C6) + alert rules + DR runbook | deploy, scale, alert, recover without reading the source | ⬜ |
@@ -305,6 +305,23 @@ before feature 1 landed.
   watch when the cross-AZ bill moves). Tests: first contact is always
   the same-zone peer across 6 fresh laps, the remainder of the lap covers
   every other peer exactly once, and the unzoned path keeps full coverage.
+
+- **26 ✅** the internal wire now compresses both directions, closing
+  both "the wire still ships JSON" scope notes (compression + tiered
+  storage rows). **Requests:** `cluster.post` gzips bodies ≥1KB — and only
+  when gzip actually shrinks them — stamping the CRC over the *original*
+  bytes so the checksum still answers "did the right bytes arrive?" rather
+  than "did gzip round-trip?". A repetitive 2.2KB replication payload went
+  **2211 → 101 bytes (95% smaller)** in the test. **Responses:**
+  `/internal/*` replies are gzipped when the caller sends
+  `Accept-Encoding: gzip`; Go's transport sets that itself and decompresses
+  transparently, so peers and the bootstrap client needed no code changes.
+  **Ordering is the whole trick** and is tested both ways: the receiver
+  decompresses *before* the checksum (a wrong-CRC body is rejected with
+  400, a truncated gzip stream is rejected, a body with no CRC — an older
+  peer — is accepted), and a manual `Accept-Encoding` request observes
+  real gzip bytes plus a JSON body after decompression. End-to-end: an 8KB
+  document crosses two real nodes through the compressed request path.
 
 **Still open after these 10, by design:** conflict resolution beyond LWW
 (version vectors / CRDTs — it changes consistency semantics and deserves its own

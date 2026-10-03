@@ -4,6 +4,7 @@ package api
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -331,6 +332,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Decompression comes FIRST: the sender checksums the original
+	// bytes and then gzips them, so the integrity check below must see
+	// the decompressed payload — otherwise a valid body would fail its
+	// own checksum the moment compression switched on.
+	if r.Body != nil && strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") &&
+		(r.Method == http.MethodPost || r.Method == http.MethodPut) {
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad gzip body"})
+			return
+		}
+		plain, err := io.ReadAll(io.LimitReader(gz, maxInternalBody+1))
+		gz.Close()
+		if err != nil || int64(len(plain)) > maxInternalBody {
+			writeJSON(w, 400, map[string]string{"error": "decompressed body too large"})
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(plain))
+		r.ContentLength = int64(len(plain))
+		r.Header.Del("Content-Encoding")
+	}
+
 	// Integrity: an internal body that declares a CRC32C must match it.
 	// The body is buffered and re-wrapped, so handlers see no
 	// difference — a truncated or corrupted payload is rejected before
@@ -354,6 +377,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Advertise our version on every reply so a peer can detect a
 	// mismatch even on a 200, and so operators can curl it.
 	w.Header().Set(protocol.Header, protocol.String())
+
+	// Internal responses are the other half of the wire: bootstrap
+	// pages, query gathers and anti-entropy leaf exchanges ship whole
+	// documents. Compress them when the caller asked for it (Go's
+	// transport sets Accept-Encoding: gzip and decompresses
+	// transparently, so peers need no code changes).
+	if strings.HasPrefix(r.URL.Path, "/internal/") &&
+		strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Del("Content-Length")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		w = &gzipResponseWriter{ResponseWriter: w, gz: gz}
+	}
 	// Cluster identity guard: internal traffic must carry our name.
 	// Prevents a misconfigured node from silently merging two
 	// clusters' data and rings.
@@ -665,6 +702,21 @@ func newTraceID() string {
 	n := traceCounter.Add(1)
 	return fmt.Sprintf("%x-%x", time.Now().UnixNano(), n)
 }
+
+// gzipResponseWriter compresses what handlers write. WriteHeader is
+// forwarded as-is (the Content-Encoding header is already set, before
+// the handler chose its status), and the gzip stream is closed by the
+// defer in ServeHTTP so the trailer is flushed even on error paths.
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz *gzip.Writer
+}
+
+func (g *gzipResponseWriter) Write(p []byte) (int, error) { return g.gz.Write(p) }
+
+// Flush pushes what is buffered so far without closing the stream —
+// handlers that flush to signal progress keep working.
+func (g *gzipResponseWriter) Flush() { g.gz.Flush() }
 
 // auditRW captures the status a handler chose so the deferred audit
 // record can report what actually happened.
