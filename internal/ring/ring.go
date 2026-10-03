@@ -17,9 +17,18 @@ type vnode struct {
 type Ring struct {
 	vnodes []vnode
 	epoch  int64
-	// zones maps node -> failure domain (rack/AZ). Empty means no
-	// topology information: selection then behaves exactly as before.
-	zones map[string]string
+	// topo maps node -> failure domains (region, then rack/AZ). Empty
+	// maps mean no topology: selection then behaves exactly as before.
+	topo Topology
+}
+
+// Topology is the failure-domain view used to spread replicas: region
+// first (surviving a region loss is the expensive property), then
+// zone. Either map may be nil — absence of information is not a
+// constraint, it is the absence of one.
+type Topology struct {
+	Zones   map[string]string
+	Regions map[string]string
 }
 
 func hash(s string) uint32 {
@@ -61,7 +70,12 @@ func BuildWeighted(nodes []string, weights map[string]float64, epoch int64) *Rin
 // the same ring from the same inputs, so zones arrive by gossip like
 // weights do.
 func BuildWeightedIn(nodes []string, weights map[string]float64, zones map[string]string, epoch int64) *Ring {
-	r := &Ring{epoch: epoch, zones: zones}
+	return BuildWeightedTopo(nodes, weights, Topology{Zones: zones}, epoch)
+}
+
+// BuildWeightedTopo is BuildWeightedIn with both failure-domain levels.
+func BuildWeightedTopo(nodes []string, weights map[string]float64, topo Topology, epoch int64) *Ring {
+	r := &Ring{epoch: epoch, topo: topo}
 	// Average weight over nodes that have one; baseline for the rest.
 	var sum float64
 	var cnt int
@@ -119,14 +133,18 @@ func itoa(i int) string {
 
 // Owners returns up to n distinct nodes responsible for a key,
 // starting from the first vnode at/after hash(key) and walking
-// clockwise — preferring nodes in failure domains not yet used, so
-// replicas of one key do not all live in one rack.
+// clockwise — preferring failure domains that are not yet used, so
+// the replicas of one key do not all live in one rack, or one region.
 //
-// Two passes: the first takes only nodes whose zone is new; if the
-// topology cannot supply n distinct zones (two AZs with RF=3, or no
-// zone data at all) the second pass fills the remainder with any node
-// not already chosen. With no zone information the first pass takes
-// everything, so this is byte-for-byte the old behaviour.
+// The preference cascades by the cost of losing it:
+//   - pass 0: a node in a region we have not used yet (a new region
+//     brings its zones with it, so zone diversity follows for free);
+//   - pass 1: a node in a zone we have not used yet, when the topology
+//     still has one — two AZs with RF=3 cannot supply three;
+//   - final pass: any node not already chosen, so RF is always met.
+//
+// With no topology at all the first pass takes everything: selection is
+// byte-for-byte what it was before regions existed.
 func (r *Ring) Owners(key string, n int) []string {
 	if len(r.vnodes) == 0 || n <= 0 {
 		return nil
@@ -136,18 +154,41 @@ func (r *Ring) Owners(key string, n int) []string {
 	out := make([]string, 0, n)
 	seen := make(map[string]bool, n)
 	seenZone := make(map[string]bool, n)
-	for pass := 0; pass < 2 && len(out) < n; pass++ {
+	seenRegion := make(map[string]bool, n)
+
+	passes := 1
+	if r.topo.hasZones() {
+		passes = 2
+	}
+	if r.topo.hasRegions() {
+		passes = 3
+	}
+	zonePass := 0
+	if r.topo.hasRegions() {
+		zonePass = 1
+	}
+	for pass := 0; pass < passes && len(out) < n; pass++ {
 		for i := 0; i < len(r.vnodes) && len(out) < n; i++ {
 			idx := (start + i) % len(r.vnodes)
 			node := r.vnodes[idx].node
 			if seen[node] {
 				continue
 			}
-			zone := r.zoneOf(node)
-			if pass == 0 && zone != "" && seenZone[zone] {
-				continue // defer same-domain nodes to the fill pass
+			region, zone := r.topo.regionOf(node), r.topo.zoneOf(node)
+			ok := true
+			if r.topo.hasRegions() && pass == 0 && region != "" && seenRegion[region] {
+				ok = false // this pass buys region diversity
+			}
+			if ok && r.topo.hasZones() && pass == zonePass && zone != "" && seenZone[zone] {
+				ok = false
+			}
+			if !ok {
+				continue
 			}
 			seen[node] = true
+			if region != "" {
+				seenRegion[region] = true
+			}
 			if zone != "" {
 				seenZone[zone] = true
 			}
@@ -157,10 +198,21 @@ func (r *Ring) Owners(key string, n int) []string {
 	return out
 }
 
-// zoneOf returns a node's failure domain ("" when topology is unknown).
-func (r *Ring) zoneOf(node string) string {
-	if r.zones == nil {
+// hasZones / hasRegions report whether the topology carries that level.
+func (t Topology) hasZones() bool   { return len(t.Zones) > 0 }
+func (t Topology) hasRegions() bool { return len(t.Regions) > 0 }
+
+// zoneOf / regionOf return a node's failure domain ("" when unknown).
+func (t Topology) zoneOf(node string) string {
+	if t.Zones == nil {
 		return ""
 	}
-	return r.zones[node]
+	return t.Zones[node]
+}
+
+func (t Topology) regionOf(node string) string {
+	if t.Regions == nil {
+		return ""
+	}
+	return t.Regions[node]
 }

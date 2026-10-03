@@ -103,10 +103,11 @@ func (o *TLSOptions) ServerTLS() (*tls.Config, error) {
 }
 
 type Member struct {
-	Addr string  `json:"addr"`           // http://host:port
-	TTL  int64   `json:"ttl"`            // unix millis; expired members are dropped
-	Load float64 `json:"load,omitempty"` // recent writes/sec (EWMA)
-	Zone string  `json:"zone,omitempty"` // failure domain (rack/AZ)
+	Addr   string  `json:"addr"`             // http://host:port
+	TTL    int64   `json:"ttl"`              // unix millis; expired members are dropped
+	Load   float64 `json:"load,omitempty"`   // recent writes/sec (EWMA)
+	Zone   string  `json:"zone,omitempty"`   // failure domain (rack/AZ)
+	Region string  `json:"region,omitempty"` // failure domain above zone
 }
 
 type Cluster struct {
@@ -150,10 +151,13 @@ type Cluster struct {
 	incompatible map[string]int
 	// clusterName guards against cross-cluster contamination.
 	clusterName string
-	// zone is this node's failure domain (--zone). It is gossiped so
-	// every node can build a topology-aware ring.
-	zone  string
-	zones map[string]string // peer addr -> zone, from gossip
+	// zone and region are this node's failure domains (--zone,
+	// --region). Both are gossiped so every node can build a ring that
+	// survives a rack AND a region loss.
+	zone    string
+	region  string
+	zones   map[string]string // peer addr -> zone, from gossip
+	regions map[string]string // peer addr -> region, from gossip
 	// loads holds the most recently gossiped write-rate (writes/sec)
 	// per node, including self. Used for load-aware weighted vnode
 	// placement: a node with 2x the average load gets ~2x the vnodes.
@@ -182,6 +186,7 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 		loads:         map[string]float64{},
 		incompatible:  map[string]int{},
 		zones:         map[string]string{},
+		regions:       map[string]string{},
 		ae:            &aeSchedule{},
 		aeFanout:      defaultAEFanout,
 		st:            st,
@@ -210,6 +215,45 @@ func (c *Cluster) SetZone(z string) {
 	c.mu.Lock()
 	c.zone = z
 	c.mu.Unlock()
+}
+
+// SetRegion records this node's region (the domain above a zone) and
+// makes it visible to gossip from the next round on.
+func (c *Cluster) SetRegion(r string) {
+	c.mu.Lock()
+	c.region = r
+	c.mu.Unlock()
+}
+
+// Region returns this node's configured region.
+func (c *Cluster) Region() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.region
+}
+
+// Regions returns addr -> region for every peer we know, plus self.
+// Reported by /api/cluster so an operator can see the topology the
+// ring is using.
+func (c *Cluster) Regions() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]string, len(c.regions)+1)
+	for k, v := range c.regions {
+		out[k] = v
+	}
+	out[c.self] = c.region
+	return out
+}
+
+// RegionOf returns a node's region ("" when unknown).
+func (c *Cluster) RegionOf(addr string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if addr == c.self {
+		return c.region
+	}
+	return c.regions[addr]
 }
 
 // Zone returns this node's configured failure domain.
@@ -967,9 +1011,11 @@ func (c *Cluster) gossipRound() {
 func (c *Cluster) memberList() []Member {
 	peers := c.Peers()
 	out := make([]Member, 0, len(peers)+1)
-	out = append(out, Member{Addr: c.self, TTL: time.Now().UnixMilli() + 15000, Load: c.SelfLoad(), Zone: c.Zone()})
+	out = append(out, Member{Addr: c.self, TTL: time.Now().UnixMilli() + 15000,
+		Load: c.SelfLoad(), Zone: c.Zone(), Region: c.Region()})
 	for _, p := range peers {
-		out = append(out, Member{Addr: p, TTL: time.Now().UnixMilli() + 15000, Load: c.LoadOf(p), Zone: c.ZoneOf(p)})
+		out = append(out, Member{Addr: p, TTL: time.Now().UnixMilli() + 15000,
+			Load: c.LoadOf(p), Zone: c.ZoneOf(p), Region: c.RegionOf(p)})
 	}
 	return out
 }
@@ -1517,6 +1563,9 @@ func (c *Cluster) HandleGossip(w http.ResponseWriter, r *http.Request) {
 			c.loads[m.Addr] = m.Load
 			if m.Zone != "" {
 				c.zones[m.Addr] = m.Zone
+			}
+			if m.Region != "" {
+				c.regions[m.Addr] = m.Region
 			}
 			c.mu.Unlock()
 			c.seen(m.Addr)

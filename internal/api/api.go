@@ -864,7 +864,8 @@ func (s *Server) rebuildRing(addrs []string) {
 	// load data (or equal loads) this is the uniform ring.
 	// Topology: gossiped zones spread a key's replicas across failure
 	// domains (rack/AZ) instead of stacking them on one rack.
-	s.ring = ring.BuildWeightedIn(nodes, s.cl.Loads(), s.cl.Zones(), s.cl.Epoch())
+	s.ring = ring.BuildWeightedTopo(nodes, s.cl.Loads(),
+		ring.Topology{Zones: s.cl.Zones(), Regions: s.cl.Regions()}, s.cl.Epoch())
 	// Keep the storage-tier fence at least as high as the ring epoch.
 	s.rec.ObserveEpoch(s.cl.Epoch())
 }
@@ -2405,6 +2406,7 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 		"protocol_window":    protocol.Window(),
 		"incompatible_peers": s.cl.Incompatible(),
 		"zones":              s.cl.Zones(),
+		"regions":            s.cl.Regions(),
 	})
 }
 
@@ -2431,6 +2433,17 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		metrics.Default.SetFloat("microdb_error_pct",
 			"Percentage of requests that returned 5xx since start", 100*float64(errs)/float64(total))
 		atomic.StoreInt64(metrics.Default.Gauge("microdb_slo_ms", "Latency SLO in milliseconds"), SLO())
+	}
+
+	// GSI lag: how far secondary indexes trail the primary write path,
+	// in events and in wall-clock age — the number that says whether a
+	// query served from an index is stale.
+	if s.gsi != nil {
+		processed, head, age := s.gsi.Lag()
+		metrics.Default.SetFloat("microdb_gsi_lag_events",
+			"Change-feed events the GSI worker has not indexed yet", float64(head-processed))
+		metrics.Default.SetFloat("microdb_gsi_lag_ms",
+			"Age of the oldest unindexed change-feed event", float64(age/time.Millisecond))
 	}
 
 	// Group commit: writes/fsync is the batch size — the number that

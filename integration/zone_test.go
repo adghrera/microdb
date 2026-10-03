@@ -117,3 +117,45 @@ func TestZoneIsGossipedAndReported(t *testing.T) {
 		return z[a.addr] == "eu-west-1a" && z[b.addr] == ""
 	}, "A's zone learned by B, B's empty zone reported as empty")
 }
+
+// TestRegionGossipedAndReported: the region is the domain above a
+// zone, and the ring cannot spread replicas across regions it has
+// never heard of — so it must arrive by gossip like the zone does.
+func TestRegionGossipedAndReported(t *testing.T) {
+	a := startNodeRF(t, t.TempDir()+"/a", 3)
+	a.cl.SetRegion("eu-west-1")
+	a.cl.SetZone("eu-west-1a")
+	b := startNodeRF(t, t.TempDir()+"/b", 3) // no region configured
+	if err := b.cl.Join(a.addr); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	eventually(t, 10*time.Second, func() bool {
+		zones := zonesOf(t, b.addr)
+		regions := regionsOf(t, b.addr)
+		return regions[a.addr] == "eu-west-1" && zones[a.addr] == "eu-west-1a" &&
+			regions[b.addr] == "" && zones[b.addr] == ""
+	}, "A's region and zone learned by B, B's empty ones reported as empty")
+
+	// The node that owns the topology reports it consistently with what
+	// it gossips (the ring is built from exactly this map).
+	if got := regionsOf(t, a.addr); got[a.addr] != "eu-west-1" {
+		t.Errorf("A reports region %q for itself", got[a.addr])
+	}
+}
+
+func regionsOf(t *testing.T, addr string) map[string]string {
+	t.Helper()
+	resp, err := client.Get(addr + "/api/cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Regions map[string]string `json:"regions"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("cluster view: %v (%s)", err, raw)
+	}
+	return out.Regions
+}

@@ -143,3 +143,74 @@ func TestNoZonesMeansNoBehaviourChange(t *testing.T) {
 		}
 	}
 }
+
+// TestOwnersSpreadAcrossRegions: losing a region must not take more
+// than one replica of a key — region diversity outranks zone diversity
+// because a region outage costs a region.
+func TestOwnersSpreadAcrossRegions(t *testing.T) {
+	nodes := []string{"a1", "a2", "b1", "b2", "c1", "c2"}
+	topo := Topology{
+		Regions: map[string]string{
+			"a1": "eu", "a2": "eu",
+			"b1": "us", "b2": "us",
+			"c1": "ap", "c2": "ap",
+		},
+		Zones: map[string]string{
+			"a1": "eu-a", "a2": "eu-b",
+			"b1": "us-a", "b2": "us-b",
+			"c1": "ap-a", "c2": "ap-b",
+		},
+	}
+	r := BuildWeightedTopo(nodes, nil, topo, 1)
+	for i := 0; i < 500; i++ {
+		owners := r.Owners("key-"+itoa(i), 3)
+		if len(owners) != 3 {
+			t.Fatalf("owners = %v", owners)
+		}
+		seenNodes := map[string]bool{}
+		regions := map[string]bool{}
+		zones := map[string]bool{}
+		for _, o := range owners {
+			if seenNodes[o] {
+				t.Fatalf("duplicate owner %s in %v", o, owners)
+			}
+			seenNodes[o] = true
+			regions[topo.Regions[o]] = true
+			zones[topo.Zones[o]] = true
+		}
+		if len(regions) != 3 {
+			t.Fatalf("key %d replicas span %d regions (%v), want 3", i, len(regions), owners)
+		}
+		// Region diversity plus zone diversity falls out of it here,
+		// but assert it: two nodes in different regions can still share
+		// a zone name in a badly labelled topology.
+		if len(zones) != 3 {
+			t.Fatalf("key %d replicas span %d zones (%v), want 3", i, len(zones), owners)
+		}
+	}
+}
+
+// TestOwnersMeetRFWhenRegionsRunOut: one region with RF=3 must still
+// return three DISTINCT nodes — diversity is a preference, RF is a
+// requirement.
+func TestOwnersMeetRFWhenRegionsRunOut(t *testing.T) {
+	nodes := []string{"e1", "e2", "e3", "e4"}
+	topo := Topology{
+		Regions: map[string]string{"e1": "eu", "e2": "eu", "e3": "eu", "e4": "eu"},
+		Zones:   map[string]string{"e1": "eu-a", "e2": "eu-b", "e3": "eu-c", "e4": "eu-d"},
+	}
+	r := BuildWeightedTopo(nodes, nil, topo, 1)
+	for i := 0; i < 300; i++ {
+		owners := r.Owners("k"+itoa(i), 3)
+		if len(owners) != 3 {
+			t.Fatalf("owners = %v, want 3 distinct nodes", owners)
+		}
+		seen := map[string]bool{}
+		for _, o := range owners {
+			if seen[o] {
+				t.Fatalf("duplicate owner %s in %v", o, owners)
+			}
+			seen[o] = true
+		}
+	}
+}

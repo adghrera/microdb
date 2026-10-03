@@ -255,7 +255,7 @@ before feature 1 landed.
 | 27 | Zone-local anti-entropy pairing | cross-zone repair traffic is money for no correctness gain | ✅ |
 | 28 | Soak / chaos harness | the only honest answer to "does it survive failures" | ⬜ |
 | 29 | Operability pack: k8s + Helm + compute autoscaling (C6) + alert rules + DR runbook | deploy, scale, alert, recover without reading the source | ⬜ |
-| 30 | Multi-region: region topology + region-spread replicas + GSI lag metrics | replicas surviving a region loss; ⚠️ until conflict resolution beyond LWW lands | ⬜ |
+| 30 | Multi-region: region topology + region-spread replicas + GSI lag metrics | replicas surviving a region loss; ⚠️ until conflict resolution beyond LWW lands | ⚠️ |
 
 - **24 ✅** certificate renewal is a file write, not a restart.
   `cluster.certCache` serves the leaf through `GetCertificate` /
@@ -362,6 +362,26 @@ before feature 1 landed.
   instead of paging an operator. 6 tests (probe sanity, deterministic
   disk shed, disabled/nil watermarks, heap shed, cache window, API
   contract incl. DELETE/GET exemptions).
+
+- **30 ⚠️** the placement half of multi-region is shipped, the conflict
+  half is not. `ring.Topology` now carries two levels — region above zone —
+  and `Owners` cascades its preference by the cost of losing the domain:
+  **pass 0 a region we have not used yet** (a new region brings its zones
+  with it, so zone diversity follows for free), pass 1 a zone we have not
+  used, final pass anything, so RF is always met. With no topology the
+  first pass takes everything: byte-for-byte the old behaviour, pinned by
+  `TestNoZonesMeansNoBehaviourChange`. `--region` gossips like `--zone`
+  (`Member.region`, visible on `/api/cluster` next to `zones`), and
+  `/metrics` gained `microdb_gsi_lag_events` / `microdb_gsi_lag_ms` — the
+  staleness of any query served from a secondary index. Tests: 500 keys
+  with 3 regions × 2 zones spread replicas across **all three regions**
+  (and all three zones), one region with RF=3 still returns three distinct
+  nodes, and gossip carries the region to a peer that has none.
+  **Not shipped, and the row says so:** conflict resolution *beyond* LWW
+  (version vectors / CRDTs) — concurrent edits across regions still
+  resolve last-writer-wins, which silently drops an edit under clock
+  skew. That changes consistency semantics and needs its own design
+  pass, not a slot in a list.
 
 **Still open after these 10, by design:** conflict resolution beyond LWW
 (version vectors / CRDTs — it changes consistency semantics and deserves its own

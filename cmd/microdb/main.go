@@ -86,6 +86,7 @@ func main() {
 	diskFreePct := flag.Float64("disk-free-pct", 5, "refuse new client writes when free disk drops below this percent (0 disables)")
 	heapLimitMB := flag.Int64("heap-limit-mb", 0, "refuse new client writes once the live heap exceeds this many MB (0 disables; size it to the container limit")
 	aeFanout := flag.Int("ae-fanout", 3, "peers contacted per anti-entropy round (bounds repair traffic as the cluster grows)")
+	region := flag.String("region", "", "failure domain above --zone (e.g. eu-west-1); gossiped so replicas spread across regions")
 	zone := flag.String("zone", "", "failure domain this node lives in (rack/AZ); gossiped so replicas spread across zones")
 	clusterName := flag.String("cluster-name", "", "cluster identity guard: nodes only join peers with the same name")
 	auditLog := flag.String("audit-log", "", "append-only audit log of mutations and authorization denials (rotates at 64MB, one generation kept)")
@@ -181,6 +182,9 @@ func main() {
 	}
 	if *zone != "" {
 		cl.SetZone(*zone)
+	}
+	if *region != "" {
+		cl.SetRegion(*region)
 	}
 	cl.SetAEFanout(*aeFanout)
 	srv := api.NewWithRF(self, st, cl, *rf)
