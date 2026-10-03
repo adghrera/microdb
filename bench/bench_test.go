@@ -93,6 +93,22 @@ func BenchmarkStorePointWriteFsync(b *testing.B) {
 	}
 }
 
+// BenchmarkStorePointWriteCompressed prices the compression flag:
+// what a compressible document costs per write versus the raw path.
+func BenchmarkStorePointWriteCompressed(b *testing.B) {
+	st, done := openStore(b)
+	defer done()
+	st.SetCompress(true)
+	seedDocs(b, st, "bench", writeKeyspace)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := fmt.Sprintf("k%06d", i%writeKeyspace)
+		if _, err := st.Apply("bench", id, map[string]interface{}{"n": i, "pad": "0123456789abcdef"}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkStorePointWriteFsyncParallel shows group commit under
 // load: concurrent durable writers share fsync passes instead of each
 // paying for one, so throughput should not collapse the way the

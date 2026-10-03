@@ -61,6 +61,10 @@ type Store struct {
 	// history lives in object storage.
 	tier   *tier.Archiver
 	tiered atomic.Int64 // segments archived since open
+	// compress deflates log records before encryption (opt-in: CPU on
+	// every write in exchange for fewer bytes on disk and less to
+	// replay at startup).
+	compress atomic.Bool
 	path   string       // absolute path of the JSONL commit log
 	f      *os.File
 	key    []byte      // encryption-at-rest key (nil = plaintext log)
@@ -317,10 +321,15 @@ var batchPrefix = []byte(`{"batch":`)
 // with no copy, so the streaming replay parses directly out of its
 // read buffer.
 func (s *Store) decodeLogLineBytes(line []byte) ([]byte, error) {
-	if bytes.HasPrefix(line, []byte(encPrefix)) {
-		return decryptRecord(s.key, string(line))
+	out := line
+	if bytes.HasPrefix(out, []byte(encPrefix)) {
+		plain, err := decryptRecord(s.key, string(out))
+		if err != nil {
+			return nil, err
+		}
+		out = plain
 	}
-	return line, nil
+	return inflateIfCompressed(out)
 }
 
 // lookup reads one document under a single shard's read lock. It never
@@ -386,6 +395,16 @@ func (s *Store) isNew(d *Doc) bool {
 	cur, ok := s.lookup(key(d.Collection, d.ID))
 	return !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS)
 }
+
+// SetCompress turns on per-record log compression. It only pays for
+// itself on records that are big or repetitive enough to shrink, so
+// encoding falls back to the raw record whenever compression does not
+// actually save bytes. Reading is unconditional: a store can always
+// replay a compressed log even when compression is currently off.
+func (s *Store) SetCompress(on bool) { s.compress.Store(on) }
+
+// Compressing reports whether new records are compressed.
+func (s *Store) Compressing() bool { return s.compress.Load() }
 
 // AttachTier wires the cold storage tier: compaction archives the raw
 // log to it before rewriting. A nil target disables tiering (default).
@@ -653,6 +672,12 @@ func (s *Store) appendRecord(w io.Writer, plain []byte) error {
 // as a decryption failure.
 func (s *Store) encodeRecord(plain []byte) ([]byte, error) {
 	payload := plain
+	if s.compress.Load() {
+		if c := compressRecord(plain); c != nil {
+			payload = c
+			atomic.AddInt64(metrics.Default.Counter("microdb_compressed_records_total", "Log records written compressed"), 1)
+		}
+	}
 	if s.key != nil {
 		enc, err := encryptRecord(s.key, plain)
 		if err != nil {
@@ -677,9 +702,13 @@ func (s *Store) decodeLogLine(line string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return string(plain), nil
+		line = string(plain)
 	}
-	return line, nil
+	out, err := inflateIfCompressed([]byte(line))
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // Open loads any existing JSONL log into memory and appends future writes.

@@ -40,6 +40,7 @@ func main() {
 	dir := flag.String("dir", "./data", "data directory")
 	join := flag.String("join", "", "comma-separated seed nodes, e.g. http://127.0.0.1:8002")
 	fsync := flag.Bool("fsync", false, "fsync every write to disk (durable, slower)")
+	compress := flag.Bool("compress", false, "deflate log records (CPU per write in exchange for smaller log and faster replay)")
 	tierTarget := flag.String("tier-target", "", "cold storage tier: archive the raw log here before each compaction (dir:///path or s3://bucket/prefix)")
 	commitWindow := flag.Duration("commit-window", 0, "group-commit window with --fsync: hold the first waiting write this long so more writes join the same fsync (0 = commit the batch as soon as it forms)")
 	tlsCert := flag.String("tls-cert", "", "PEM cert for TLS (enables https)")
@@ -79,6 +80,7 @@ func main() {
 	}
 	st.SetFsync(*fsync)
 	st.SetCommitWindow(*commitWindow)
+	st.SetCompress(*compress)
 	if *tierTarget != "" {
 		tgt, err := tier.Open(*tierTarget)
 		if err != nil {
