@@ -44,14 +44,16 @@ type TLSOptions struct {
 	CertFile string
 	KeyFile  string
 	CAFile   string
+	// cache holds the leaf certificate and re-reads the files when
+	// they change (see tlsreload.go).
+	cache *certCache
 }
 
 // ClientTLS builds the tls.Config used for peer-to-peer calls:
 // verifies peer certs against the CA and presents our cert so peers
 // can verify us back (mutual TLS).
 func (o *TLSOptions) ClientTLS() (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(o.CertFile, o.KeyFile)
-	if err != nil {
+	if _, err := o.loadEager(); err != nil {
 		return nil, fmt.Errorf("client cert/key: %w", err)
 	}
 	caPEM, err := os.ReadFile(o.CAFile)
@@ -62,18 +64,21 @@ func (o *TLSOptions) ClientTLS() (*tls.Config, error) {
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, fmt.Errorf("no certs in CA bundle")
 	}
+	// Present the CURRENT leaf on every handshake: a cert renewed on
+	// disk is picked up on the next connection, no restart.
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      pool,
-		MinVersion:   tls.VersionTLS12,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return o.certs().get()
+		},
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS12,
 	}, nil
 }
 
 // ServerTLS builds the tls.Config for serving internal endpoints:
 // requires and verifies client certs against the CA.
 func (o *TLSOptions) ServerTLS() (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(o.CertFile, o.KeyFile)
-	if err != nil {
+	if _, err := o.loadEager(); err != nil {
 		return nil, fmt.Errorf("server cert/key: %w", err)
 	}
 	caPEM, err := os.ReadFile(o.CAFile)
@@ -84,11 +89,15 @@ func (o *TLSOptions) ServerTLS() (*tls.Config, error) {
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, fmt.Errorf("no certs in CA bundle")
 	}
+	// Serve the CURRENT leaf on every handshake (see tlsreload.go):
+	// certificate renewal is a file write, not a restart.
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientCAs:    pool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		MinVersion:   tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return o.certs().get()
+		},
+		ClientCAs:  pool,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		MinVersion: tls.VersionTLS12,
 	}, nil
 }
 

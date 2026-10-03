@@ -249,13 +249,34 @@ before feature 1 landed.
 | 21 | CI verification gate + fix the flaky test | every claim above rests on a suite that must be runnable in one command and must not flap | ⬜ |
 | 22 | Capacity watermarks + admission (`microctl capacity`) | OOM and ENOSPC are the two ways databases die quietly | ⬜ |
 | 23 | Backup scheduler + retention | closes the ⚠️ on backups: RPO automation and bounded offsite growth | ⬜ |
-| 24 | TLS cert/key hot-reload | expired certs are a top self-inflicted outage; closes the ⚠️ on secrets | ⬜ |
+| 24 | TLS cert/key hot-reload | expired certs are a top self-inflicted outage; closes the ⚠️ on secrets | ✅ |
 | 25 | Index value encode fast path | `json.Marshal` per field per write measured at 61% of replay allocations | ⬜ |
 | 26 | Wire compression (internal requests + responses) | closes both "the wire still ships JSON" scope notes | ⬜ |
 | 27 | Zone-local anti-entropy pairing | cross-zone repair traffic is money for no correctness gain | ⬜ |
 | 28 | Soak / chaos harness | the only honest answer to "does it survive failures" | ⬜ |
 | 29 | Operability pack: k8s + Helm + compute autoscaling (C6) + alert rules + DR runbook | deploy, scale, alert, recover without reading the source | ⬜ |
 | 30 | Multi-region: region topology + region-spread replicas + GSI lag metrics | replicas surviving a region loss; ⚠️ until conflict resolution beyond LWW lands | ⬜ |
+
+- **24 ✅** certificate renewal is a file write, not a restart.
+  `cluster.certCache` serves the leaf through `GetCertificate` /
+  `GetClientCertificate` and re-reads the files when their stamp
+  (size + mtime of both) changes — checked **per handshake** (one
+  `stat()`), so there is no background timer, no signal (Go has no
+  portable SIGHUP) and no window where the old cert outlives the new
+  file. A file that fails to load — a writer mid-write, a mismatched
+  key — keeps serving the *previous* certificate and logs, so a botched
+  rotation degrades to "still the old cert" rather than "no TLS"; the
+  next handshake retries. Eager load at startup still fails fast.
+  `microdb_tls_cert_reloads_total` / `_reload_errors_total` record it.
+  **Live test:** a running HTTPS node, cert files replaced in place by
+  a new leaf signed by the same CA → the very next handshake presents
+  CN `microdb-node-renewed`, the metric moves exactly once, and the
+  following handshakes do not re-count a reload. The test closes idle
+  connections first — an existing keep-alive session correctly keeps its
+  old cert, which is TLS behaviour worth documenting. **Caveat:** the
+  *CA bundle* is still read once at startup (leaf renewal under the same
+  private CA — the common case — needs no CA change; rotating the CA
+  itself requires a restart).
 
 **Still open after these 10, by design:** conflict resolution beyond LWW
 (version vectors / CRDTs — it changes consistency semantics and deserves its own
