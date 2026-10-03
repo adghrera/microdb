@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"microdb/internal/api"
+	"microdb/internal/audit"
 	"microdb/internal/cluster"
 	"microdb/internal/secret"
 	"microdb/internal/sharedlog"
@@ -72,6 +73,7 @@ func main() {
 	aeFanout := flag.Int("ae-fanout", 3, "peers contacted per anti-entropy round (bounds repair traffic as the cluster grows)")
 	zone := flag.String("zone", "", "failure domain this node lives in (rack/AZ); gossiped so replicas spread across zones")
 	clusterName := flag.String("cluster-name", "", "cluster identity guard: nodes only join peers with the same name")
+	auditLog := flag.String("audit-log", "", "append-only audit log of mutations and authorization denials (rotates at 64MB, one generation kept)")
 	jsonLog := flag.Bool("json-log", false, "emit structured JSON logs")
 	idemTTL := flag.Duration("idempotency-ttl", 10*time.Minute, "dedupe window for Idempotency-Key retries (0 disables)")
 	durableFeed := flag.Bool("durable-feed", false, "persist the watch change feed to disk (cursors survive restart, 24h retention)")
@@ -105,6 +107,13 @@ func main() {
 		if err := st.EnableDurableFeed(); err != nil {
 			log.Fatalf("enable durable feed: %v", err)
 		}
+	}
+	if *auditLog != "" {
+		if err := audit.Default.Open(*auditLog, 0); err != nil {
+			log.Fatalf("audit log: %v", err)
+		}
+		defer audit.Default.Close()
+		log.Printf("audit: recording mutations and denials to %s", *auditLog)
 	}
 	st.SetFsync(*fsync)
 	st.SetCommitWindow(*commitWindow)

@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"microdb/internal/audit"
 	"microdb/internal/changelog"
 	"microdb/internal/cluster"
 	"microdb/internal/gsi"
@@ -266,6 +267,48 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Audit: record mutations (and every denial below) with the status
+	// they ended up with. Wrapping w and deferring covers every return
+	// path in this function, including the early ones.
+	if audit.Default.Enabled() && isAuditable(r) {
+		aw := &auditRW{ResponseWriter: w, status: http.StatusOK}
+		w = aw
+		col, id := apiPathParts(r.URL.Path)
+		e := audit.Event{
+			Kind:       "mutation",
+			Action:     r.Method,
+			Decision:   "allow",
+			Remote:     r.RemoteAddr,
+			Collection: col,
+			ID:         id,
+			Trace:      r.Header.Get("X-Trace-Id"),
+		}
+		if tok := r.Header.Get("Authorization"); tok != "" {
+			e.Actor = "bearer"
+			// Name the tenant when the bearer token is one: an audit
+			// record that cannot say WHO wrote something is half a
+			// record.
+			if s.tenants != nil {
+				if tn, ok := s.tenants.Lookup(strings.TrimPrefix(tok, "Bearer ")); ok && tn != nil {
+					e.Tenant = tn.Name
+					e.Actor = "tenant:" + tn.Name
+				}
+			}
+		} else {
+			e.Actor = "anonymous"
+		}
+		defer func() {
+			e.Status = aw.status
+			if aw.status >= 400 {
+				e.Decision = "deny"
+				if e.Detail == "" {
+					e.Detail = "rejected"
+				}
+			}
+			audit.Default.Log(e)
+		}()
+	}
+
 	// Wire-protocol negotiation (rolling upgrades). Internal traffic
 	// outside our version window is refused loudly, before any of it
 	// can be half-parsed into membership or data — a mixed-version mesh
@@ -335,6 +378,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		t, ok := s.tenants.Lookup(tok)
 		if !ok {
+			auditDeny(r, "auth", "", "", "unknown tenant token", 401)
 			writeJSON(w, 401, map[string]string{"error": "unknown tenant token"})
 			return
 		}
@@ -342,6 +386,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// — PathValue is only populated after mux routing, which hasn't
 		// happened yet at this point in ServeHTTP.
 		if col := collectionFromPath(r.URL.Path); col != "" && !tenants.PrefixAllowed(t, col) {
+			auditDeny(r, "auth", t.Name, col, "collection outside tenant namespace", 403)
 			writeJSON(w, 403, map[string]string{"error": fmt.Sprintf("collection %q is outside tenant %q namespace", col, t.Name)})
 			return
 		}
@@ -537,6 +582,64 @@ func newTraceID() string {
 	return fmt.Sprintf("%x-%x", time.Now().UnixNano(), n)
 }
 
+// auditRW captures the status a handler chose so the deferred audit
+// record can report what actually happened.
+type auditRW struct {
+	http.ResponseWriter
+	status int
+}
+
+func (a *auditRW) WriteHeader(code int) {
+	a.status = code
+	a.ResponseWriter.WriteHeader(code)
+}
+
+// isAuditable is true for client-facing mutations: admin commands and
+// document writes. Reads and liveness probes are not audited (they
+// would drown the log in noise).
+func isAuditable(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodDelete:
+	default:
+		return false
+	}
+	return strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/v1/api/")
+}
+
+// apiPathParts pulls (collection, id) out of the canonical document
+// routes: /api/collections/{col}/docs/{id}. Anything else yields
+// empty strings rather than a wrong guess.
+func apiPathParts(p string) (col, id string) {
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	// .../collections/{col}/docs/{id}
+	if len(parts) >= 4 && parts[len(parts)-2] == "docs" && parts[len(parts)-4] == "collections" {
+		return parts[len(parts)-3], parts[len(parts)-1]
+	}
+	if len(parts) >= 3 && parts[len(parts)-3] == "collections" {
+		return parts[len(parts)-2], ""
+	}
+	return "", ""
+}
+
+// auditDeny records an authorization failure (always on: denials are
+// the events an audit log exists for).
+func auditDeny(r *http.Request, kind, tenant, collection, detail string, status int) {
+	if !audit.Default.Enabled() {
+		return
+	}
+	audit.Default.Log(audit.Event{
+		Kind:       kind,
+		Action:     r.Method,
+		Decision:   "deny",
+		Status:     status,
+		Remote:     r.RemoteAddr,
+		Tenant:     tenant,
+		Collection: collection,
+		Trace:      r.Header.Get("X-Trace-Id"),
+		Detail:     detail,
+	})
+}
+
 // Token holds the API bearer token so it can be rotated at runtime.
 // Secrets that only change on restart are secrets operators avoid
 // rotating; the holder lets a reloaded token file take effect on the
@@ -581,6 +684,7 @@ func RequireAPIAuth(tok *Token, next http.Handler) http.Handler {
 		}
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			auditDeny(r, "auth", "", "", "invalid bearer token", 401)
 			writeJSON(w, 401, map[string]string{"error": "missing or invalid bearer token"})
 			return
 		}
