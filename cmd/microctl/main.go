@@ -6,12 +6,14 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"microdb/internal/store"
@@ -33,12 +35,13 @@ func main() {
 	url := fs.String("url", "http://127.0.0.1:8001", "node base URL (status)")
 	target := fs.String("target", "", "tier target URI: dir:///path or s3://bucket/prefix (tier)")
 	key := fs.String("key", "", "object key to fetch from the tier (tier)")
+	backupFile := fs.String("backup", "", "backup file to check (verify)")
 	fs.Parse(os.Args[2:])
 
 	switch cmd {
 	case "backup":
-		if *out == "" {
-			fmt.Fprintln(os.Stderr, "backup requires --out <file>")
+		if *out == "" && *target == "" {
+			fmt.Fprintln(os.Stderr, "backup requires --out <file> or --target <uri>")
 			os.Exit(2)
 		}
 		st, err := store.Open(*dir)
@@ -46,15 +49,57 @@ func main() {
 			fatal(err)
 		}
 		defer st.Close()
-		f, err := os.Create(*out)
+		// Write through a temp file so the manifest records the final
+		// byte count, and so an object-store upload always has a known
+		// Content-Length (chunked uploads are not portable across S3
+		// implementations).
+		tmp, err := os.CreateTemp("", "microdb-backup-*.jsonl")
 		if err != nil {
 			fatal(err)
 		}
-		defer f.Close()
-		if err := st.Backup(f); err != nil {
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName)
+		manifest, err := st.BackupWithManifest(tmp)
+		if err != nil {
+			tmp.Close()
 			fatal(err)
 		}
-		fmt.Printf("backup of %s -> %s (%d docs)\n", *dir, *out, st.DocCount())
+		if err := tmp.Close(); err != nil {
+			fatal(err)
+		}
+		if fi, err := os.Stat(tmpName); err == nil {
+			manifest.Bytes = fi.Size()
+		}
+		if *out != "" {
+			if err := copyFile(tmpName, *out); err != nil {
+				fatal(err)
+			}
+			if err := manifest.WriteManifestFile(*out); err != nil {
+				fatal(err)
+			}
+			fmt.Println("backup of " + *dir + " -> " + *out)
+			fmt.Printf("  %d docs, %d bytes, sha256 %s\n", manifest.Docs, manifest.Bytes, manifest.SHA256[:16])
+			fmt.Println("  manifest: " + store.ManifestPath(*out))
+			fmt.Println("  check it with: microctl verify --backup <file>")
+		}
+		if *target != "" {
+			tgt, err := tier.Open(*target)
+			if err != nil {
+				fatal(err)
+			}
+			base := fmt.Sprintf("backup-%d", manifest.CreatedUnixM)
+			if err := putFile(tgt, base+".jsonl", tmpName); err != nil {
+				fatal(err)
+			}
+			mb, _ := json.MarshalIndent(manifest, "", "  ")
+			if err := tgt.Put(base+".jsonl.manifest.json", strings.NewReader(string(mb)+"\n"), int64(len(mb)+1)); err != nil {
+				fatal(err)
+			}
+			fmt.Println("backup of " + *dir + " -> " + tgt.Name())
+			fmt.Printf("  %d docs, %d bytes, sha256 %s\n", manifest.Docs, manifest.Bytes, manifest.SHA256[:16])
+			fmt.Printf("  object: %s.jsonl (+ .manifest.json)\n", base)
+			fmt.Printf("  fetch with: microctl tier --target <uri> --key %s.jsonl --out <file>\n", base)
+		}
 	case "restore":
 		if *in == "" {
 			fmt.Fprintln(os.Stderr, "restore requires --in <file>")
@@ -124,6 +169,29 @@ func main() {
 			fmt.Printf("fetched %s -> %s (%d bytes)\n", *key, *out, n)
 		}
 	case "verify":
+		if *backupFile != "" {
+			// Backup mode: prove the file still matches the manifest it
+			// was written with. An unverifiable backup is not a backup.
+			rep, err := store.VerifyBackup(*backupFile)
+			if err != nil {
+				fatal(err)
+			}
+			fmt.Println("backup  " + rep.Path)
+			fmt.Printf("size    %d bytes\n", rep.Bytes)
+			fmt.Printf("docs    %d\n", rep.Docs)
+			if rep.Manifest != nil {
+				fmt.Println("created " + time.UnixMilli(rep.Manifest.CreatedUnixM).Format(time.RFC3339))
+				fmt.Printf("sha256  %s (manifest %s)\n", rep.SHA256[:16], rep.Manifest.SHA256[:16])
+			}
+			if len(rep.Problems) == 0 && rep.Manifest != nil {
+				fmt.Println("verified OK")
+				return
+			}
+			for _, p := range rep.Problems {
+				fmt.Println("PROBLEM  " + p)
+			}
+			os.Exit(1)
+		}
 		// Offline integrity scan of the commit log: every record's
 		// CRC32C is checked without loading the store. Exit code 1 if
 		// anything other than a torn final record is damaged, so it can
@@ -244,6 +312,46 @@ func printStatus(base string) {
 		resp.Body.Close()
 		fmt.Printf("%-14s %s\n", ep, string(body))
 	}
+}
+
+// copyFile copies src over dst atomically enough for a backup: write
+// to a temp sibling first, then rename, so a crash mid-copy cannot
+// leave a half-written file that later verifies as a backup.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".part"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+
+// putFile streams a local file to a tier target under key.
+func putFile(t tier.Target, key, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return t.Put(key, f, fi.Size())
 }
 
 func usage() {
