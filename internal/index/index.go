@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"microdb/internal/bloom"
 )
 
 // Index is a thread-safe inverted index for one collection.
@@ -24,6 +26,36 @@ type Index struct {
 	fields  map[string]map[string]map[string]bool // field -> encoded value -> doc ids
 	indexed map[string]bool                       // fields we index (nil = all)
 	byID    map[string]map[string]string          // doc id -> field -> encoded value
+	// values is a counting Bloom filter over "field=value" tokens. It
+	// answers the only question a filter can answer safely: "can I rule
+	// this collection out entirely?" — which turns the full-scan
+	// fallback of a compound query into an instant empty result when
+	// one of its equality conditions matches nothing here.
+	values *bloom.Filter
+}
+
+// bloomStartItems is the filter's initial capacity; it doubles when
+// the live token count passes half of it, so the false-positive rate
+// stays near target as the collection grows.
+const bloomStartItems = 8192
+
+// valueToken builds the filter token for one indexed field value.
+// It must be byte-identical to what Add inserts and Remove deletes.
+//
+// The value is truncated: a token is only ever compared for exact
+// equality with itself, so a prefix is enough to separate values, and
+// without truncation a 50KB document field would be copied into the
+// filter on every write AND every update (measured: replay allocations
+// tripled before this). Two values sharing a 128-byte prefix collapse
+// into one token — a false positive, which the filter is allowed to
+// make; the reverse would be a false negative, which it is not.
+const maxTokenValue = 128
+
+func valueToken(field, encoded string) string {
+	if len(encoded) > maxTokenValue {
+		encoded = encoded[:maxTokenValue]
+	}
+	return field + "\x00" + encoded
 }
 
 func New() *Index {
@@ -54,8 +86,11 @@ func (ix *Index) SetIndexedFields(fs []string) {
 		}
 	}
 	for id, fv := range ix.byID {
-		for f := range fv {
+		for f, val := range fv {
 			if !next[f] {
+				if ix.values != nil {
+					ix.values.Remove(valueToken(f, val))
+				}
 				delete(fv, f)
 			}
 		}
@@ -100,6 +135,13 @@ func (ix *Index) addLocked(id string, fields map[string]interface{}) {
 				ix.unindex(id, f, old)
 			}
 		}
+		if ix.values == nil {
+			ix.values = bloom.New(bloomStartItems, 0.01)
+		}
+		ix.values.Add(valueToken(f, val))
+		if ix.values.Len() > ix.values.Cap()/2 {
+			ix.growBloomLocked()
+		}
 		byVal, ok := ix.fields[f]
 		if !ok {
 			byVal = map[string]map[string]bool{}
@@ -122,6 +164,9 @@ func (ix *Index) addLocked(id string, fields map[string]interface{}) {
 
 // unindex drops one (field, value) membership. Caller holds the lock.
 func (ix *Index) unindex(id, field, val string) {
+	if ix.values != nil {
+		ix.values.Remove(valueToken(field, val))
+	}
 	byVal := ix.fields[field]
 	if byVal == nil {
 		return
@@ -134,6 +179,42 @@ func (ix *Index) unindex(id, field, val string) {
 	if len(byVal) == 0 {
 		delete(ix.fields, field)
 	}
+}
+
+// ProbablyHasValue reports whether at least one document in this
+// collection MIGHT have field == value. A false answer is guaranteed
+// correct (nothing in the collection has it); a true answer only means
+// "look". A nil filter answers true — never rule anything out.
+func (ix *Index) ProbablyHasValue(field string, v interface{}) bool {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return ix.ProbablyHasEncoded(field, encodeValue(v))
+}
+
+// ProbablyHasEncoded is ProbablyHasValue for an already-encoded value.
+func (ix *Index) ProbablyHasEncoded(field, encoded string) bool {
+	if encoded == "" {
+		return true
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return ix.values.Has(valueToken(field, encoded))
+}
+
+// growBloomLocked rebuilds the filter at double the capacity so the
+// false-positive rate does not decay as the collection fills up.
+func (ix *Index) growBloomLocked() {
+	if ix.values == nil {
+		return
+	}
+	grown := bloom.New(ix.values.Cap()*2, 0.01)
+	for id, fv := range ix.byID {
+		_ = id
+		for f, val := range fv {
+			grown.Add(valueToken(f, val))
+		}
+	}
+	ix.values = grown
 }
 
 // Remove drops all index entries for a doc id in O(fields on that doc)

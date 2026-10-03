@@ -1086,6 +1086,37 @@ func (s *Store) Scan(collection string, keep func(*Doc) bool) []*Doc {
 	return out
 }
 
+// Prefilter answers one question cheaply: can this collection be ruled
+// out for this filter WITHOUT scanning it? It returns true only when
+// some exact-equality condition matches nothing in the collection's
+// Bloom filter — a "no" that cannot be wrong. Everything else (ranges,
+// regex, compound without an equality, an unfiltered scan) returns
+// false and lets the normal path run.
+//
+// This is what turns the full-scan fallback of a compound query — the
+// one the inverted-index fast path cannot serve — into an instant empty
+// result on a shard that simply does not hold the value.
+func (s *Store) Prefilter(collection string, filter map[string]interface{}) bool {
+	if len(filter) == 0 {
+		return false
+	}
+	// Compact swaps the index set; read the reference under the lock
+	// the same way ScanIndexed does.
+	s.mu.RLock()
+	idx := s.idx
+	s.mu.RUnlock()
+	ix := idx.For(collection)
+	for field, cond := range filter {
+		if _, isCond := cond.(map[string]interface{}); isCond {
+			continue // operators have no Bloom answer
+		}
+		if !ix.ProbablyHasValue(field, cond) {
+			return true
+		}
+	}
+	return false
+}
+
 // ScanIndexed is Scan with an index fast path: if the filter is a single
 // exact-match condition on an indexed field, resolve candidate ids via
 // the inverted index instead of scanning the whole collection. Falls
@@ -1109,6 +1140,13 @@ func (s *Store) ScanIndexed(collection string, filter map[string]interface{}) []
 				return out
 			}
 		}
+	}
+	if s.Prefilter(collection, filter) {
+		// Nothing in this collection can satisfy an equality the Bloom
+		// filter says we never stored: skip the walk entirely.
+		atomic.AddInt64(metrics.Default.Counter("microdb_scan_shortcircuits_total",
+			"Full scans skipped because the collection cannot match"), 1)
+		return nil
 	}
 	return s.Scan(collection, func(d *Doc) bool {
 		return len(filter) == 0 || Matches(d, filter)

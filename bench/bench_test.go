@@ -201,6 +201,39 @@ func BenchmarkStoreReplicaApply(b *testing.B) {
 
 const benchScanDocs = 20000
 
+// BenchmarkStoreScanMissCompound is the bloom filter's payoff: a
+// compound query whose equality matches nothing used to walk the whole
+// collection; it now costs a filter probe. Measured side by side with
+// the equivalent full scan.
+func BenchmarkStoreScanMissCompound(b *testing.B) {
+	st, done := openStore(b)
+	defer done()
+	seedDocs(b, st, "bench", benchScanDocs)
+	filter := map[string]interface{}{"name": "nobody-at-all", "n": 7}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := st.ScanIndexed("bench", filter); len(got) != 0 {
+			b.Fatalf("expected no matches, got %d", len(got))
+		}
+	}
+}
+
+// BenchmarkStoreScanMissFullScan is the same query without the bloom
+// short-circuit — what it cost before.
+func BenchmarkStoreScanMissFullScan(b *testing.B) {
+	st, done := openStore(b)
+	defer done()
+	seedDocs(b, st, "bench", benchScanDocs)
+	filter := map[string]interface{}{"name": "nobody-at-all", "n": 7}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		got := st.Scan("bench", func(d *store.Doc) bool { return store.Matches(d, filter) })
+		if len(got) != 0 {
+			b.Fatalf("expected no matches, got %d", len(got))
+		}
+	}
+}
+
 func BenchmarkStoreScanFilter(b *testing.B) {
 	st, done := openStore(b)
 	defer done()
