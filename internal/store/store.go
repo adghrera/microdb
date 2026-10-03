@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"os"
 	"path/filepath"
@@ -41,12 +42,20 @@ type Doc struct {
 }
 
 type Store struct {
-	mu    sync.RWMutex
-	docs  map[string]*Doc // key = collection + "\x00" + id
-	path  string          // absolute path of the JSONL commit log
-	f     *os.File
-	key   []byte      // encryption-at-rest key (nil = plaintext log)
-	fsync atomic.Bool // sync to disk on every write (durability over throughput)
+	mu sync.RWMutex
+	// shards holds every document (including tombstones), keyed by
+	// collection+keySep+id. Striping the map is what keeps the point
+	// read path off the store mutex: a reader locks ONE shard (a
+	// cache line of its own) instead of contending with every write
+	// and with other readers, and compaction no longer stalls reads
+	// for its whole run. Writers still serialise on mu, which is the
+	// barrier compaction needs.
+	shards [numShards]docShard
+	nDocs  atomic.Int64 // keys in shards, tombstones included
+	path   string       // absolute path of the JSONL commit log
+	f      *os.File
+	key    []byte      // encryption-at-rest key (nil = plaintext log)
+	fsync  atomic.Bool // sync to disk on every write (durability over throughput)
 	// lw owns every append to the commit log: it batches records that
 	// arrive together into one write and one fsync (group commit), then
 	// releases the waiters (see commit.go).
@@ -246,11 +255,88 @@ func RecoverSharedLog(s *Store, c *sharedlog.Client) (int, error) {
 	return applied, nil
 }
 
+// numShards is the stripe count for the document map (power of two).
+// Each shard has its own RWMutex and map, so concurrent point reads
+// land on independent cache lines instead of one shared lock word.
+const numShards = 64
+
+// docShard is one stripe of the document map.
+type docShard struct {
+	mu   sync.RWMutex
+	docs map[string]*Doc
+}
+
+// shardSeed is a per-process hash seed: it randomises stripe
+// placement (so hot keys cannot be predicted onto one shard) and lets
+// shardOf use the runtime's SIMD hash instead of a byte-at-a-time one.
+var shardSeed = maphash.MakeSeed()
+
+// shardOf maps a document key to its stripe.
+func shardOf(k string) uint32 {
+	return uint32(maphash.String(shardSeed, k)) & (numShards - 1)
+}
+
+// lookup reads one document under a single shard's read lock. It never
+// touches the store mutex, so point reads keep running while writes,
+// replay or compaction hold it.
+func (s *Store) lookup(k string) (*Doc, bool) {
+	sh := &s.shards[shardOf(k)]
+	sh.mu.RLock()
+	d, ok := sh.docs[k]
+	sh.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	return d, true
+}
+
+// put installs a document in its shard (caller holds the store lock).
+func (s *Store) put(k string, d *Doc) {
+	sh := &s.shards[shardOf(k)]
+	sh.mu.Lock()
+	sh.docs[k] = d
+	sh.mu.Unlock()
+}
+
+// rangeDocs walks every document under each shard's read lock. Locking
+// per stripe (rather than the whole map) keeps writers moving; the
+// caller normally already holds the store lock, which is what makes
+// the walk a consistent snapshot.
+func (s *Store) rangeDocs(fn func(k string, d *Doc) bool) {
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		for k, d := range sh.docs {
+			if !fn(k, d) {
+				sh.mu.RUnlock()
+				return
+			}
+		}
+		sh.mu.RUnlock()
+	}
+}
+
+// mutateDocs walks every document with the stripe write-locked, so the
+// callback may delete what it is looking at.
+func (s *Store) mutateDocs(fn func(k string, d *Doc) bool) {
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		for k, d := range sh.docs {
+			if !fn(k, d) {
+				sh.mu.Unlock()
+				return
+			}
+		}
+		sh.mu.Unlock()
+	}
+}
+
 // isNew reports whether doc d would change stored state under the
 // LWW merge rule. Caller holds the lock; used to decide whether a
 // write is worth a durable shared-log append before applying it.
 func (s *Store) isNew(d *Doc) bool {
-	cur, ok := s.docs[key(d.Collection, d.ID)]
+	cur, ok := s.lookup(key(d.Collection, d.ID))
 	return !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS)
 }
 
@@ -518,7 +604,10 @@ func OpenWithKey(dir, keyHex string) (*Store, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, "data.jsonl")
-	s := &Store{docs: map[string]*Doc{}, path: path, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute), colStats: map[string]*ColStats{}}
+	s := &Store{path: path, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute), colStats: map[string]*ColStats{}}
+	for i := range s.shards {
+		s.shards[i].docs = map[string]*Doc{}
+	}
 	if keyHex != "" {
 		if err := s.SetEncryptionKey(keyHex); err != nil {
 			return nil, err
@@ -595,7 +684,7 @@ func OpenWithKey(dir, keyHex string) (*Store, error) {
 // the same write to the same node many times.
 func (s *Store) merge(d *Doc) bool {
 	k := key(d.Collection, d.ID)
-	cur, ok := s.docs[k]
+	cur, ok := s.lookup(k)
 	if !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS) {
 		// Maintain the per-collection live count across the state
 		// transition (this is the only place docs change state).
@@ -616,7 +705,10 @@ func (s *Store) merge(d *Doc) bool {
 		} else if !wasLive && nowLive {
 			st.Live.Add(1)
 		}
-		s.docs[k] = d
+		s.put(k, d)
+		if !ok {
+			s.nDocs.Add(1) // first record for this key
+		}
 		return true
 	}
 	return false
@@ -647,7 +739,7 @@ func (s *Store) applyLocked(collection, id string, fields map[string]interface{}
 	defer s.mu.Unlock()
 	k := key(collection, id)
 	ver := int64(1)
-	if cur, ok := s.docs[k]; ok {
+	if cur, ok := s.lookup(k); ok {
 		ver = cur.Ver + 1
 	}
 	d = &Doc{ID: id, Ver: ver, TS: time.Now().UnixMilli(), Collection: collection, Fields: fields}
@@ -694,7 +786,7 @@ func (s *Store) applyBatchLocked(collection string, docs map[string]map[string]i
 	changed := make([]*Doc, 0, len(docs))
 	for id, fields := range docs {
 		ver := int64(1)
-		if cur, ok := s.docs[key(collection, id)]; ok {
+		if cur, ok := s.lookup(key(collection, id)); ok {
 			ver = cur.Ver + 1
 		}
 		d := &Doc{ID: id, Ver: ver, TS: time.Now().UnixMilli(), Collection: collection, Fields: fields}
@@ -757,10 +849,11 @@ func (s *Store) applyRemoteLocked(d *Doc) (line []byte, err error) {
 	return line, nil
 }
 
+// Get returns a live document. It takes no store lock: the map read
+// itself is lock-free, so point reads scale with cores instead of
+// queueing behind every write.
 func (s *Store) Get(collection, id string) (*Doc, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	d, ok := s.docs[key(collection, id)]
+	d, ok := s.lookup(key(collection, id))
 	if !ok || d.Deleted {
 		return nil, false
 	}
@@ -780,7 +873,7 @@ func (s *Store) deleteLocked(collection, id string) (line []byte, err error) {
 	defer s.mu.Unlock()
 	k := key(collection, id)
 	ver := int64(1)
-	if cur, ok := s.docs[k]; ok {
+	if cur, ok := s.lookup(k); ok {
 		ver = cur.Ver + 1
 	}
 	d := &Doc{ID: id, Ver: ver, TS: time.Now().UnixMilli(), Collection: collection, Deleted: true}
@@ -810,14 +903,15 @@ func (s *Store) Scan(collection string, keep func(*Doc) bool) []*Doc {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []*Doc{}
-	for _, d := range s.docs {
+	s.rangeDocs(func(_ string, d *Doc) bool {
 		if d.Collection != collection || d.Deleted {
-			continue
+			return true
 		}
 		if keep == nil || keep(d) {
 			out = append(out, d)
 		}
-	}
+		return true
+	})
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
@@ -836,7 +930,7 @@ func (s *Store) ScanIndexed(collection string, filter map[string]interface{}) []
 				idx := s.idx
 				out := make([]*Doc, 0, 8)
 				for _, id := range idx.For(collection).Lookup(field, cond) {
-					if d, ok := s.docs[key(collection, id)]; ok && !d.Deleted {
+					if d, ok := s.lookup(key(collection, id)); ok && !d.Deleted {
 						out = append(out, d)
 					}
 				}
@@ -886,16 +980,18 @@ func (s *Store) Compact(gcWindow time.Duration) (int, error) {
 	defer s.mu.Unlock()
 
 	cutoff := time.Now().Add(-gcWindow).UnixMilli()
-	live := make([]*Doc, 0, len(s.docs))
+	live := make([]*Doc, 0, s.nDocs.Load())
 	dropped := 0
-	for k, d := range s.docs {
+	s.mutateDocs(func(k string, d *Doc) bool {
 		if d.Deleted && d.TS <= cutoff {
-			delete(s.docs, k)
+			delete(s.shards[shardOf(k)].docs, k)
+			s.nDocs.Add(-1)
 			dropped++
-			continue
+			return true
 		}
 		live = append(live, d)
-	}
+		return true
+	})
 	// Rebuild indexes from scratch: cheap and guarantees no stale entries.
 	s.idx = index.NewSet(s.idx.Enabled())
 	for _, d := range live {
@@ -956,9 +1052,7 @@ func (s *Store) Compact(gcWindow time.Duration) (int, error) {
 
 // DocCount returns the number of docs held (including tombstones).
 func (s *Store) DocCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.docs)
+	return int(s.nDocs.Load())
 }
 
 // Collections lists all collection names present in the store
@@ -967,9 +1061,10 @@ func (s *Store) Collections() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	set := map[string]bool{}
-	for _, d := range s.docs {
+	s.rangeDocs(func(_ string, d *Doc) bool {
 		set[d.Collection] = true
-	}
+		return true
+	})
 	out := make([]string, 0, len(set))
 	for c := range set {
 		out = append(out, c)
@@ -986,15 +1081,16 @@ func (s *Store) StreamCollection(collection, after string, limit int) []*Doc {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	all := make([]*Doc, 0, 64)
-	for _, d := range s.docs {
+	s.rangeDocs(func(_ string, d *Doc) bool {
 		if d.Collection != collection {
-			continue
+			return true
 		}
 		if after != "" && d.ID <= after {
-			continue
+			return true
 		}
 		all = append(all, d)
-	}
+		return true
+	})
 	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
 	if len(all) > limit {
 		all = all[:limit]
@@ -1008,12 +1104,13 @@ func (s *Store) Leaves(collection string) []merkle.Leaf {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]merkle.Leaf, 0, 16)
-	for _, d := range s.docs {
+	s.rangeDocs(func(_ string, d *Doc) bool {
 		if d.Collection != collection {
-			continue
+			return true
 		}
 		out = append(out, merkle.Leaf{ID: d.ID, Hash: merkle.HashDoc(d)})
-	}
+		return true
+	})
 	return out
 }
 
@@ -1023,7 +1120,7 @@ func (s *Store) DocsByIDs(collection string, ids []string) []*Doc {
 	defer s.mu.RUnlock()
 	out := make([]*Doc, 0, len(ids))
 	for _, id := range ids {
-		if d, ok := s.docs[key(collection, id)]; ok {
+		if d, ok := s.lookup(key(collection, id)); ok {
 			out = append(out, d)
 		}
 	}
@@ -1040,10 +1137,11 @@ func (s *Store) DocsByIDs(collection string, ids []string) []*Doc {
 func (s *Store) AllDocs() []*Doc {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	docs := make([]*Doc, 0, len(s.docs))
-	for _, d := range s.docs {
+	docs := make([]*Doc, 0, s.nDocs.Load())
+	s.rangeDocs(func(_ string, d *Doc) bool {
 		docs = append(docs, d)
-	}
+		return true
+	})
 	sort.Slice(docs, func(i, j int) bool {
 		if docs[i].Collection != docs[j].Collection {
 			return docs[i].Collection < docs[j].Collection
@@ -1195,11 +1293,12 @@ func (s *Store) CountUnder(prefix string) int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var n int64
-	for _, d := range s.docs {
+	s.rangeDocs(func(_ string, d *Doc) bool {
 		if !d.Deleted && strings.HasPrefix(d.Collection, prefix) {
 			n++
 		}
-	}
+		return true
+	})
 	return n
 }
 
@@ -1283,7 +1382,10 @@ func ReplayUntilKey(r io.Reader, until int64, dir, keyHex string) (*Store, int, 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, 0, err
 	}
-	s := &Store{docs: map[string]*Doc{}, idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute), path: filepath.Join(dir, "data.jsonl")}
+	s := &Store{idx: index.NewSet(true), log: changelog.New(10000, 5*time.Minute), path: filepath.Join(dir, "data.jsonl")}
+	for i := range s.shards {
+		s.shards[i].docs = map[string]*Doc{}
+	}
 	if keyHex != "" {
 		if err := s.SetEncryptionKey(keyHex); err != nil {
 			return nil, 0, err
@@ -1389,10 +1491,11 @@ func ReplayUntilKey(r io.Reader, until int64, dir, keyHex string) (*Store, int, 
 func (s *Store) Backup(w io.Writer) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	docs := make([]*Doc, 0, len(s.docs))
-	for _, d := range s.docs {
+	docs := make([]*Doc, 0, s.nDocs.Load())
+	s.rangeDocs(func(_ string, d *Doc) bool {
 		docs = append(docs, d)
-	}
+		return true
+	})
 	sort.Slice(docs, func(i, j int) bool {
 		if docs[i].Collection != docs[j].Collection {
 			return docs[i].Collection < docs[j].Collection

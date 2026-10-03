@@ -103,7 +103,7 @@ Every row below is ☐ — **no claim is made until it is verified.**
 | 1 | F | Benchmark harness + perf regression gate | 10 | ✅ |
 | 2 | P | Rolling-upgrade wire versioning (N / N−1) | 10 | ✅ |
 | 3 | F | Group commit / write batching | 9 | ✅ |
-| 4 | F | Sharded store map (kill the global write lock) | 9 | ⬜ |
+| 4 | F | Sharded store map (kill the global read lock) | 9 | ✅ |
 | 5 | P | End-to-end integrity: checksums + `verify` + `repair` | 9 | ⬜ |
 | 6 | F | Block/page store with sparse index | 9 | ⬜ |
 | 7 | S | Tiered storage: hot local + cold object store | 9 | ⬜ |
@@ -124,7 +124,7 @@ Every row below is ☐ — **no claim is made until it is verified.**
 *(Plus one unplanned blocker the harness forced: making write cost
 independent of data size — shipped with #1.)*
 
-**Progress: 3 / 20 built.**
+**Progress: 4 / 20 built.**
 
 ### Ground rules for this tier
 
@@ -156,7 +156,7 @@ independent of data size — shipped with #1.)*
 |---|---------|-----|---------------|
 | [x] | **Benchmark harness + perf regression gate** | 10 | ✅ shipped — `bench/` Go benchmarks (store point read/write, fsync write, batch, replica apply, scan vs index, replay, HTTP write/read/query) + `cmd/microbench` closed-loop load driver (mixed/read/write/query, `-burst` step load) emitting JSON p50/p95/p99 + ops/s. `bench/README.md` defines the acceptance rule (benchstat before/after, no collateral regressions). 7 `loadgen` tests: nearest-rank percentile math, error accounting, burst, JSON round-trip. **Baseline (Ryzen 5700U):** PointWrite 3.18ms · PointWriteFsync 4.31ms · PointRead 196ns · PointReadParallel 54ns (scales with -cpu) · Batch100 41.7ms · ReplicaApply 231µs · ScanFilter 5.1ms · ScanIndexed 36µs · OpenReplay(5k) 1.0s · HTTPWrite 4.4ms · HTTPRead 779µs · HTTPQuery 1.08ms |
 | [x] | **Group commit / write batching** | 9 | ✅ shipped — dedicated **log writer** (`internal/store/commit.go`): writers encode their record and queue it; ONE goroutine merges everything queued into a single `Write` + single `fsync`, then releases the waiters. `submit` returns only after a pass that started *after* it was queued ⇒ acknowledged ⇒ durable. Writers never touch the file, which is what makes batching survive Windows serialising `WriteFile` against `FlushFileBuffers` (proved first-hand: a writer appending during a flush stalls 8ms). `--commit-window N` holds the first record open to gather a bigger batch (0 = flush as soon as it forms); `wmu` is the single-writer slot that keeps the inline (fsync-off) path mutually exclusive with batched appends, so the **default path stays at 8.2µs/op** — no queue tax when there is nothing to batch. `Store.CommitStats()` → `/metrics` (`microdb_group_fsync_{passes,writes,errors}_total`). **Numbers:** fsync serial **897µs/op → 115µs/op parallel (7.8×)**; 160 concurrent store writes → **21 log passes (7.6×)**; synthetic 64 waiters → 2 passes (32×). 7 tests (no-overlap, error propagation, shutdown release, byte-exactness, real-path concurrency + reopen durability), `-race` clean |
-| [ ] | **Sharded store map (kill the global write lock)** | 9 | The in-memory document map is a single lock — point reads serialize under concurrency. Shard it (striped `RWMutex` / per-shard maps) so read throughput scales past `GOMAXPROCS`. Benchmark must show linear-ish scaling on N readers. |
+| [x] | **Sharded store map (kill the global read lock)** | 9 | ✅ shipped — the document map is striped across **64 shards** (`docShard{mu, docs}`, `maphash` stripe over the collection+key). `Store.Get` takes one shard's RLock and never touches the store mutex, so point reads keep running while compaction, replay or writes hold it (previously a compaction stalled every read for its whole run). Iteration walks stripe-by-stripe (`rangeDocs` / `mutateDocs`), and an atomic `nDocs` replaces `len(map)` for O(1) `DocCount`. **A/B vs HEAD, `-cpu 16`, `-count 3`, median:** `StorePointReadParallel` **77 → 47 ns/op (1.6×)**, ~4.3× scaling across 16 threads; `StoreScanFilter` 7.4 → 6.4ms; single-thread `PointRead`/`PointWrite`/`StoreBatch100` unchanged (231ns / 9.6µs / 297µs). Full suite + `-race` clean |
 | [ ] | **Block/page store with sparse index (replace full JSON replay)** | 9 | JSONL re-parses every document on open and pins the whole dataset in RAM. Move to length-prefixed, CRC32C-checksummed segments + an in-memory key→offset sparse index: open becomes O(docs) seeks rather than O(bytes) parsing, and dataset size stops being bounded by heap. |
 | [ ] | **Segment compression** | 8 | `compress/flate` (stdlib, level 1) per segment cuts disk and network bytes — pays off directly on bootstrap streaming and anti-entropy, which currently ship raw JSON. |
 | [ ] | **Bloom filters per segment** | 8 | Negative point lookups become cheap disk-checks; also short-circuits Merkle subtree exchanges for keys a node provably does not hold. |
