@@ -10,9 +10,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
-	"fmt"
 	"math"
 	"math/rand"
 	"net/http"
@@ -93,19 +93,20 @@ func (o *TLSOptions) ServerTLS() (*tls.Config, error) {
 }
 
 type Member struct {
-	Addr string  `json:"addr"` // http://host:port
-	TTL  int64   `json:"ttl"`  // unix millis; expired members are dropped
+	Addr string  `json:"addr"`           // http://host:port
+	TTL  int64   `json:"ttl"`            // unix millis; expired members are dropped
 	Load float64 `json:"load,omitempty"` // recent writes/sec (EWMA)
+	Zone string  `json:"zone,omitempty"` // failure domain (rack/AZ)
 }
 
 type Cluster struct {
-	self    string
-	peers   map[string]time.Time // addr -> last seen (alive)
-	mu      sync.RWMutex
-	epoch   int64 // membership epoch; bumped on every membership change
-	st      *store.Store
-	client  *http.Client
-	stop    chan struct{}
+	self   string
+	peers  map[string]time.Time // addr -> last seen (alive)
+	mu     sync.RWMutex
+	epoch  int64 // membership epoch; bumped on every membership change
+	st     *store.Store
+	client *http.Client
+	stop   chan struct{}
 	// hints is the hinted-handoff store; nil until EnableHints is called.
 	hints *hints.Store
 	// draining marks a node that has begun graceful decommission: it
@@ -133,13 +134,17 @@ type Cluster struct {
 	incompatible map[string]int
 	// clusterName guards against cross-cluster contamination.
 	clusterName string
+	// zone is this node's failure domain (--zone). It is gossiped so
+	// every node can build a topology-aware ring.
+	zone  string
+	zones map[string]string // peer addr -> zone, from gossip
 	// loads holds the most recently gossiped write-rate (writes/sec)
 	// per node, including self. Used for load-aware weighted vnode
 	// placement: a node with 2x the average load gets ~2x the vnodes.
 	loads map[string]float64
 	// writeTicks counts client writes since the last EWMA update;
 	// selfLoad is the EWMA of writes/sec fed into the gossiped load.
-	lastWrites atomic.Int64 // last sampled store.WriteCount
+	lastWrites atomic.Int64  // last sampled store.WriteCount
 	selfLoad   atomic.Uint64 // float64 bits
 	// OnPeersChanged is called with the live peer list whenever membership changes.
 	OnPeersChanged func(addrs []string)
@@ -155,14 +160,15 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 		transport.TLSClientConfig = tlsCfg
 	}
 	c := &Cluster{
-		self:         self,
-		peers:        map[string]time.Time{},
-		left:         map[string]time.Time{},
-		loads:        map[string]float64{},
-		incompatible: map[string]int{},
-		st:           st,
-		client:       &http.Client{Timeout: 30 * time.Second},
-		stop:         make(chan struct{}),
+		self:          self,
+		peers:         map[string]time.Time{},
+		left:          map[string]time.Time{},
+		loads:         map[string]float64{},
+		incompatible:  map[string]int{},
+		zones:         map[string]string{},
+		st:            st,
+		client:        &http.Client{Timeout: 30 * time.Second},
+		stop:          make(chan struct{}),
 		maxBootstraps: 2, // bootstrap streams can be large: 30s client
 		// timeout covers them; serve at most 2 concurrent streams
 		// as a seed (admission control on the join path).
@@ -180,6 +186,46 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 // the request outright — this prevents the classic operational
 // disaster of a misconfigured node joining the wrong production
 // cluster and starting to replicate/fence against it.
+// SetZone records this node's failure domain and makes it visible to
+// gossip from the next round on. Empty means "no topology" (default).
+func (c *Cluster) SetZone(z string) {
+	c.mu.Lock()
+	c.zone = z
+	c.mu.Unlock()
+}
+
+// Zone returns this node's configured failure domain.
+func (c *Cluster) Zone() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.zone
+}
+
+// ZoneOf returns a node's failure domain ("" when unknown), including
+// this node's own.
+func (c *Cluster) ZoneOf(addr string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if addr == c.self {
+		return c.zone
+	}
+	return c.zones[addr]
+}
+
+// Zones returns addr -> zone for every peer we know, plus self. Used
+// to build the topology-aware ring; also reported by /api/cluster so
+// an operator can see where replicas landed.
+func (c *Cluster) Zones() map[string]string {
+	c.mu.RLock()
+	out := make(map[string]string, len(c.zones)+1)
+	for k, v := range c.zones {
+		out[k] = v
+	}
+	out[c.self] = c.zone
+	c.mu.RUnlock()
+	return out
+}
+
 func (c *Cluster) SetClusterName(name string) {
 	c.clusterName = name
 	if t, ok := c.client.Transport.(*clusterStampTransport); ok {
@@ -473,11 +519,11 @@ func (c *Cluster) antiEntropyAll() {
 
 // RepairReport is what an explicit repair pass did.
 type RepairReport struct {
-	Peers      int    `json:"peers"`
+	Peers       int   `json:"peers"`
 	Collections int   `json:"collections_attempted"`
-	Synced     int    `json:"collections_synced"`
-	Failed     int    `json:"collections_failed"`
-	DurationMs int64  `json:"duration_ms"`
+	Synced      int   `json:"collections_synced"`
+	Failed      int   `json:"collections_failed"`
+	DurationMs  int64 `json:"duration_ms"`
 }
 
 // RepairAll runs a full anti-entropy pass against every peer RIGHT
@@ -775,8 +821,8 @@ func (c *Cluster) gossipRound() {
 		return
 	}
 	var out struct {
-		Members []Member          `json:"members"`
-		Epoch   int64           `json:"epoch"`
+		Members []Member         `json:"members"`
+		Epoch   int64            `json:"epoch"`
 		Left    map[string]int64 `json:"left"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&out) != nil {
@@ -821,9 +867,9 @@ func (c *Cluster) gossipRound() {
 func (c *Cluster) memberList() []Member {
 	peers := c.Peers()
 	out := make([]Member, 0, len(peers)+1)
-	out = append(out, Member{Addr: c.self, TTL: time.Now().UnixMilli() + 15000, Load: c.SelfLoad()})
+	out = append(out, Member{Addr: c.self, TTL: time.Now().UnixMilli() + 15000, Load: c.SelfLoad(), Zone: c.Zone()})
 	for _, p := range peers {
-		out = append(out, Member{Addr: p, TTL: time.Now().UnixMilli() + 15000, Load: c.LoadOf(p)})
+		out = append(out, Member{Addr: p, TTL: time.Now().UnixMilli() + 15000, Load: c.LoadOf(p), Zone: c.ZoneOf(p)})
 	}
 	return out
 }
@@ -1266,9 +1312,9 @@ func (c *Cluster) HandleStream(w http.ResponseWriter, r *http.Request) {
 // HandleBootstrapStatus reports this node's bootstrap state.
 func (c *Cluster) HandleBootstrapStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
-		"streaming":         c.Streaming(),
-		"active_serves":     c.activeBootstraps.Load(),
-		"max_bootstraps":    c.maxBootstraps,
+		"streaming":      c.Streaming(),
+		"active_serves":  c.activeBootstraps.Load(),
+		"max_bootstraps": c.maxBootstraps,
 	})
 }
 
@@ -1348,6 +1394,9 @@ func (c *Cluster) HandleGossip(w http.ResponseWriter, r *http.Request) {
 		if m.Addr != c.self && m.TTL > now {
 			c.mu.Lock()
 			c.loads[m.Addr] = m.Load
+			if m.Zone != "" {
+				c.zones[m.Addr] = m.Zone
+			}
 			c.mu.Unlock()
 			c.seen(m.Addr)
 		}

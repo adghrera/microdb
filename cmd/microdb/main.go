@@ -31,8 +31,8 @@ import (
 	"microdb/internal/cluster"
 	"microdb/internal/sharedlog"
 	"microdb/internal/store"
-	"microdb/internal/tier"
 	"microdb/internal/tenants"
+	"microdb/internal/tier"
 )
 
 func main() {
@@ -53,6 +53,7 @@ func main() {
 	maxInflight := flag.Int64("max-inflight", 0, "shed load with 429 above this many concurrent requests (0 = unlimited)")
 	traceSlowMs := flag.Int64("trace-slow-ms", 500, "log requests slower than this with their trace id")
 	encKey := flag.String("encryption-key", "", "64-hex-char (32-byte) AES-256-GCM key for encryption at rest")
+	zone := flag.String("zone", "", "failure domain this node lives in (rack/AZ); gossiped so replicas spread across zones")
 	clusterName := flag.String("cluster-name", "", "cluster identity guard: nodes only join peers with the same name")
 	jsonLog := flag.Bool("json-log", false, "emit structured JSON logs")
 	idemTTL := flag.Duration("idempotency-ttl", 10*time.Minute, "dedupe window for Idempotency-Key retries (0 disables)")
@@ -126,6 +127,9 @@ func main() {
 	}
 	if *clusterName != "" {
 		cl.SetClusterName(*clusterName)
+	}
+	if *zone != "" {
+		cl.SetZone(*zone)
 	}
 	srv := api.NewWithRF(self, st, cl, *rf)
 	cl.Start()

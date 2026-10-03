@@ -67,3 +67,79 @@ func TestWeightedOwnershipSkew(t *testing.T) {
 		t.Fatalf("ownership not skewed to hot: %v", own)
 	}
 }
+
+// TestOwnersSpreadAcrossZones is the rack-awareness claim: replicas of
+// one key must not all land in one failure domain when the topology
+// has enough of them.
+func TestOwnersSpreadAcrossZones(t *testing.T) {
+	nodes := []string{"n0", "n1", "n2", "n3", "n4", "n5"}
+	zones := map[string]string{
+		"n0": "az-a", "n1": "az-a",
+		"n2": "az-b", "n3": "az-b",
+		"n4": "az-c", "n5": "az-c",
+	}
+	r := BuildWeightedIn(nodes, nil, zones, 1)
+
+	for i := 0; i < 500; i++ {
+		owners := r.Owners("key-"+itoa(i), 3)
+		if len(owners) != 3 {
+			t.Fatalf("owners = %d, want 3", len(owners))
+		}
+		seen := map[string]bool{}
+		for _, o := range owners {
+			if seen[o] {
+				t.Fatalf("duplicate owner %s in %v", o, owners)
+			}
+			seen[o] = true
+		}
+		used := map[string]bool{}
+		for _, o := range owners {
+			used[zones[o]] = true
+		}
+		if len(used) != 3 {
+			t.Fatalf("key %d replicas span %d zones (%v), want 3", i, len(used), owners)
+		}
+	}
+}
+
+// TestOwnersFillWhenZonesRunOut: two AZs with RF=3 cannot give three
+// distinct domains — the ring must still return three DISTINCT NODES
+// rather than three copies on one.
+func TestOwnersFillWhenZonesRunOut(t *testing.T) {
+	nodes := []string{"a0", "a1", "b0", "b1"}
+	zones := map[string]string{"a0": "az-a", "a1": "az-a", "b0": "az-b", "b1": "az-b"}
+	r := BuildWeightedIn(nodes, nil, zones, 1)
+	for i := 0; i < 300; i++ {
+		owners := r.Owners("k"+itoa(i), 3)
+		if len(owners) != 3 {
+			t.Fatalf("owners = %v, want 3 distinct nodes", owners)
+		}
+		seen := map[string]bool{}
+		for _, o := range owners {
+			if seen[o] {
+				t.Fatalf("duplicate owner %s in %v", o, owners)
+			}
+			seen[o] = true
+		}
+	}
+}
+
+// TestNoZonesMeansNoBehaviourChange: without topology data the ring
+// must pick exactly what it picked before zones existed.
+func TestNoZonesMeansNoBehaviourChange(t *testing.T) {
+	nodes := []string{"n0", "n1", "n2", "n3"}
+	before := BuildWeighted(nodes, nil, 7)
+	after := BuildWeightedIn(nodes, nil, nil, 7)
+	for i := 0; i < 200; i++ {
+		k := "k" + itoa(i)
+		a, b := before.Owners(k, 3), after.Owners(k, 3)
+		if len(a) != len(b) {
+			t.Fatalf("length changed for %s: %v vs %v", k, a, b)
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				t.Fatalf("placement changed for %s: %v vs %v", k, a, b)
+			}
+		}
+	}
+}

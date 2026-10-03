@@ -17,6 +17,9 @@ type vnode struct {
 type Ring struct {
 	vnodes []vnode
 	epoch  int64
+	// zones maps node -> failure domain (rack/AZ). Empty means no
+	// topology information: selection then behaves exactly as before.
+	zones map[string]string
 }
 
 func hash(s string) uint32 {
@@ -50,7 +53,15 @@ func BuildWithEpoch(nodes []string, epoch int64) *Ring {
 // (nodes, weights, epoch) triple — weights must arrive via gossip,
 // not local guesses, or ownership views diverge.
 func BuildWeighted(nodes []string, weights map[string]float64, epoch int64) *Ring {
-	r := &Ring{epoch: epoch}
+	return BuildWeightedIn(nodes, weights, nil, epoch)
+}
+
+// BuildWeightedIn is BuildWeighted plus topology: zones spreads
+// replicas across failure domains (see Owners). Every node must build
+// the same ring from the same inputs, so zones arrive by gossip like
+// weights do.
+func BuildWeightedIn(nodes []string, weights map[string]float64, zones map[string]string, epoch int64) *Ring {
+	r := &Ring{epoch: epoch, zones: zones}
 	// Average weight over nodes that have one; baseline for the rest.
 	var sum float64
 	var cnt int
@@ -106,8 +117,16 @@ func itoa(i int) string {
 	return string(b[pos:])
 }
 
-// Owners returns up to n distinct nodes responsible for a key, starting
-// from the first vnode at/after hash(key) and walking clockwise.
+// Owners returns up to n distinct nodes responsible for a key,
+// starting from the first vnode at/after hash(key) and walking
+// clockwise — preferring nodes in failure domains not yet used, so
+// replicas of one key do not all live in one rack.
+//
+// Two passes: the first takes only nodes whose zone is new; if the
+// topology cannot supply n distinct zones (two AZs with RF=3, or no
+// zone data at all) the second pass fills the remainder with any node
+// not already chosen. With no zone information the first pass takes
+// everything, so this is byte-for-byte the old behaviour.
 func (r *Ring) Owners(key string, n int) []string {
 	if len(r.vnodes) == 0 || n <= 0 {
 		return nil
@@ -116,13 +135,32 @@ func (r *Ring) Owners(key string, n int) []string {
 	start := sort.Search(len(r.vnodes), func(i int) bool { return r.vnodes[i].h >= h })
 	out := make([]string, 0, n)
 	seen := make(map[string]bool, n)
-	for i := 0; i < len(r.vnodes) && len(out) < n; i++ {
-		idx := (start + i) % len(r.vnodes)
-		node := r.vnodes[idx].node
-		if !seen[node] {
+	seenZone := make(map[string]bool, n)
+	for pass := 0; pass < 2 && len(out) < n; pass++ {
+		for i := 0; i < len(r.vnodes) && len(out) < n; i++ {
+			idx := (start + i) % len(r.vnodes)
+			node := r.vnodes[idx].node
+			if seen[node] {
+				continue
+			}
+			zone := r.zoneOf(node)
+			if pass == 0 && zone != "" && seenZone[zone] {
+				continue // defer same-domain nodes to the fill pass
+			}
 			seen[node] = true
+			if zone != "" {
+				seenZone[zone] = true
+			}
 			out = append(out, node)
 		}
 	}
 	return out
+}
+
+// zoneOf returns a node's failure domain ("" when topology is unknown).
+func (r *Ring) zoneOf(node string) string {
+	if r.zones == nil {
+		return ""
+	}
+	return r.zones[node]
 }

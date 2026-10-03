@@ -563,7 +563,9 @@ func (s *Server) rebuildRing(addrs []string) {
 	// each node's gossiped write-rate, so a hot node takes a bigger
 	// share of the keyspace and a cold node a smaller one. With no
 	// load data (or equal loads) this is the uniform ring.
-	s.ring = ring.BuildWeighted(nodes, s.cl.Loads(), s.cl.Epoch())
+	// Topology: gossiped zones spread a key's replicas across failure
+	// domains (rack/AZ) instead of stacking them on one rack.
+	s.ring = ring.BuildWeightedIn(nodes, s.cl.Loads(), s.cl.Zones(), s.cl.Epoch())
 	// Keep the storage-tier fence at least as high as the ring epoch.
 	s.rec.ObserveEpoch(s.cl.Epoch())
 }
@@ -2088,6 +2090,7 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 		"protocol":           protocol.Version,
 		"protocol_window":    protocol.Window(),
 		"incompatible_peers": s.cl.Incompatible(),
+		"zones":              s.cl.Zones(),
 	})
 }
 
