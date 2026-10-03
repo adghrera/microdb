@@ -1409,8 +1409,17 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	//   all          — block until every RF owner acked
 	consistency := r.URL.Query().Get("consistency")
 	if consistency == "quorum" || consistency == "all" || consistency == "local_quorum" {
-		members := s.placementOwners(key, s.rfFor(col))
-		need := len(members)/2 + 1 // W = majority of the RF-owner set
+		rf := s.rfFor(col)
+		members := s.placementOwners(key, rf)
+		// W = majority of the CONFIGURED replication factor — never of
+		// the member count we happen to hold. During churn a node's ring
+		// can transiently collapse (peers not yet converged / one node
+		// isolated), and deriving the bar from len(members) would let a
+		// shrunken ring satisfy it with a single local apply: a
+		// "quorum" write touching one node, lost the moment that node
+		// dies. Anchoring the bar to the configured RF keeps
+		// "quorum-acked" meaning "on a majority of the intended owners".
+		need := rf/2 + 1
 		if consistency == "all" {
 			need = len(members)
 		}
@@ -1562,7 +1571,16 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 	if body != nil {
 		rdr = bytes.NewReader(body)
 	}
-	req, err := http.NewRequest(method, owner[0]+path, rdr)
+	// Preserve the query string. It carries the write's consistency
+	// contract (?consistency=quorum|all); dropping it silently degraded
+	// a quorum write that arrived at a non-owner into a single-copy
+	// "one" write on the owner — the client was told quorum while the
+	// doc lived on exactly one node, lost the moment that node died.
+	target := owner[0] + path
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	req, err := http.NewRequest(method, target, rdr)
 	if err != nil {
 		writeJSON(w, 502, map[string]string{"error": err.Error()})
 		return

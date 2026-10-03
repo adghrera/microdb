@@ -78,9 +78,10 @@ func TestSoakKillRestart(t *testing.T) {
 	)
 
 	type slot struct {
-		n     *node
-		dir   string
-		alive bool
+		n        *node
+		dir      string
+		alive    bool
+		restarts int
 	}
 	base := t.TempDir()
 	slots := make([]*slot, total)
@@ -174,6 +175,7 @@ func TestSoakKillRestart(t *testing.T) {
 				hostPort := strings.TrimPrefix(s.n.addr, "http://")
 				s.n = startNodeAt(t, hostPort, s.dir, rf, false)
 				s.alive = true
+				s.restarts++
 				if err := s.n.cl.Join(alive()[0].n.addr); err != nil {
 					t.Errorf("rejoin after restart: %v", err)
 				}
@@ -255,6 +257,12 @@ func TestSoakKillRestart(t *testing.T) {
 		}
 	}
 	if len(lost) > 0 {
+		var reads []string
+		for _, s := range up {
+			reads = append(reads, fmt.Sprintf("%s=%d", s.n.addr, getDoc(s.n.addr, col, lost[0])))
+		}
+		t.Logf("soak diagnostic: %d/%d acked writes lost; first=%s per-node reads=%v",
+			len(lost), len(acked), lost[0], reads)
 		t.Fatalf("lost %d acknowledged quorum writes (e.g. %v) — a majority ack must survive one node death",
 			len(lost), lost[:min(len(lost), 5)])
 	}

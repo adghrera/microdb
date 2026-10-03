@@ -1886,7 +1886,17 @@ func (c *Cluster) HandleReplicate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	c.st.ApplyRemote(&d)
+	// Acknowledge ONLY when the apply actually landed in the durable log.
+	// ApplyRemote returns false if the log write failed (e.g. this node's
+	// log is closed because it is shutting down or was killed). Returning
+	// 200 anyway would let a quorum ack rest on a single surviving copy:
+	// the sender counts this fake ack, the write looks committed, and it
+	// is lost for good the moment that one copy dies. Honesty here is
+	// what makes "quorum-acked" mean "on more than one live node".
+	if !c.st.ApplyRemote(&d) {
+		writeJSON(w, 500, map[string]string{"error": "apply failed (log not durable)"})
+		return
+	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
