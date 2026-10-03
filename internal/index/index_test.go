@@ -1,7 +1,10 @@
 package index
 
 import (
+	"encoding/json"
 	"fmt"
+	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -149,3 +152,63 @@ func TestSetIndexedFieldsPurgesDroppedField(t *testing.T) {
 }
 
 func docID(i int) string { return fmt.Sprintf("d%06d", i) }
+
+// TestEncodeValueMatchesMarshal is the contract the fast path must
+// never break: the index stores one encoding and queries encode with
+// the other, so any divergence is a silently missed match.
+func TestEncodeValueMatchesMarshal(t *testing.T) {
+	long := strings.Repeat("x", 10000)
+	cases := []interface{}{
+		nil, true, false,
+		0, -1, 42, 1 << 40, -9223372036854775808,
+		"", "plain", "with spaces", "user-000123",
+		`has "quotes"`, `back\slash`, "tab\there", "new\nline",
+		"<html>&", "a+b=c", "ünïcode", "emoji 🚀", " line",
+		1.5, 0.0, 1e21, -2.5e-9, json.Number("123.45"),
+		long, "trailing space ",
+	}
+	for i, c := range cases {
+		want, err := json.Marshal(c)
+		if err != nil {
+			t.Fatalf("case %d: marshal: %v", i, err)
+		}
+		got := encodeValue(c)
+		if got != string(want) {
+			t.Errorf("case %d (%#v): encodeValue = %s, json.Marshal = %s", i, c, got, want)
+		}
+	}
+	// Randomised: mostly-plain strings with an occasional hostile byte.
+	rnd := rand.New(rand.NewSource(1))
+	alphabet := "abcXYZ019 \t\"\\<>&/\n" + "\u00e9\u2028"
+	for i := 0; i < 500; i++ {
+		n := rnd.Intn(24)
+		var b strings.Builder
+		for j := 0; j < n; j++ {
+			b.WriteByte(alphabet[rnd.Intn(len(alphabet))])
+		}
+		s := b.String()
+		want, _ := json.Marshal(s)
+		if got := encodeValue(s); got != string(want) {
+			t.Fatalf("random case %d: %q -> %s, want %s", i, s, got, want)
+		}
+	}
+}
+
+func BenchmarkEncodeValueString(b *testing.B) {
+	v := strings.Repeat("user-profile-field-value/", 40)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if encodeValue(v) == "" {
+			b.Fatal("empty")
+		}
+	}
+}
+
+func BenchmarkEncodeValueInt(b *testing.B) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if encodeValue(i) == "" {
+			b.Fatal("empty")
+		}
+	}
+}

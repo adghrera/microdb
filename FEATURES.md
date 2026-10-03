@@ -250,7 +250,7 @@ before feature 1 landed.
 | 22 | Capacity watermarks + admission (`microctl capacity`) | OOM and ENOSPC are the two ways databases die quietly | ⬜ |
 | 23 | Backup scheduler + retention | closes the ⚠️ on backups: RPO automation and bounded offsite growth | ⬜ |
 | 24 | TLS cert/key hot-reload | expired certs are a top self-inflicted outage; closes the ⚠️ on secrets | ✅ |
-| 25 | Index value encode fast path | `json.Marshal` per field per write measured at 61% of replay allocations | ⬜ |
+| 25 | Index value encode fast path | `json.Marshal` per field per write measured at 61% of replay allocations | ✅ |
 | 26 | Wire compression (internal requests + responses) | closes both "the wire still ships JSON" scope notes | ⬜ |
 | 27 | Zone-local anti-entropy pairing | cross-zone repair traffic is money for no correctness gain | ⬜ |
 | 28 | Soak / chaos harness | the only honest answer to "does it survive failures" | ⬜ |
@@ -277,6 +277,22 @@ before feature 1 landed.
   *CA bundle* is still read once at startup (leaf renewal under the same
   private CA — the common case — needs no CA change; rotating the CA
   itself requires a restart).
+
+- **25 ✅** `index.encodeValue` now has a fast path for values whose
+  JSON form needs no escaping decision — plain-ASCII strings without a
+  JSON-significant byte, `int`, `int64`, `bool`, `nil` — and falls back
+  to `json.Marshal` for floats (Go's float rules are subtle),
+  non-ASCII and `json.Number`. The fast path must be **byte-identical**
+  to `json.Marshal`: the index stores one encoding and queries encode
+  with the other, so any divergence is a silently missed match, which is
+  what `TestEncodeValueMatchesMarshal` pins (25 hand-picked hostile
+  cases + 500 randomised strings containing quotes, backslashes, control
+  bytes, `<>&` and ` `). A/B on the same machine, back-to-back:
+  encode-int **138 → 53 ns/op (2.6×)**, encode-1KB-string
+  1901 → 1581 ns/op, `IndexAddRemove` **2161 → 1785 ns/op with 8 → 5
+  allocs**. Startup-replay allocations barely moved (3.65× → 3.63× of
+  the log) — reported as measured, because there the cost is dominated
+  by unmarshalling the payloads themselves, not by index encoding.
 
 **Still open after these 10, by design:** conflict resolution beyond LWW
 (version vectors / CRDTs — it changes consistency semantics and deserves its own

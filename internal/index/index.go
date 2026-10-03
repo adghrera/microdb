@@ -7,6 +7,7 @@ package index
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -101,12 +102,67 @@ func (ix *Index) SetIndexedFields(fs []string) {
 	ix.indexed = next
 }
 
+// encodeValue renders an indexed value as its JSON form. Every write
+// calls it once per field, and every query calls it again for the
+// value it is looking for, so the fast path matters: json.Marshal is
+// reflection plus a growing buffer plus an escaping scan, measured at
+// 61% of replay allocations before this.
+//
+// The fast path must be byte-identical to json.Marshal for the values
+// it accepts — the index stores one form and queries encode with the
+// other, and any divergence silently turns into a missed match. It
+// therefore only handles values whose JSON form it can produce without
+// an escaping decision: plain ASCII strings with no JSON-significant
+// byte (quote, backslash, control, or the HTML escapes Go always
+// applies), ints, int64s, bools and nil. Everything else — floats
+// (Go's float formatting rules are subtle), non-ASCII, json.Number —
+// goes to json.Marshal, which is the correctness answer, not the fast
+// one. TestEncodeValueMatchesMarshal pins the equivalence.
 func encodeValue(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return "null"
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case int:
+		return strconv.Itoa(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case string:
+		if plainJSONString(x) {
+			var b []byte
+			b = append(b, '"')
+			b = append(b, x...)
+			b = append(b, '"')
+			return string(b)
+		}
+	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return ""
 	}
 	return string(b)
+}
+
+// plainJSONString reports whether s needs no JSON escaping at all.
+// json.Marshal always escapes quote, backslash, control bytes and
+// <, >, & (HTML), and passes other ASCII through untouched; anything
+// outside printable ASCII takes the slow path rather than guessing.
+func plainJSONString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7e {
+			return false
+		}
+		switch c {
+		case '"', '\\', '<', '>', '&':
+			return false
+		}
+	}
+	return true
 }
 
 // Add indexes a doc's fields under its id. Self-correcting: if the
