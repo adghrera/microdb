@@ -246,7 +246,7 @@ before feature 1 landed.
 
 | # | Feature | Why it matters | Status |
 |---|---------|----------------|--------|
-| 21 | CI verification gate + fix the flaky test | every claim above rests on a suite that must be runnable in one command and must not flap | ⬜ |
+| 21 | CI verification gate + fix the flaky test | every claim above rests on a suite that must be runnable in one command and must not flap | ✅ |
 | 22 | Capacity watermarks + admission (`microctl capacity`) | OOM and ENOSPC are the two ways databases die quietly | ✅ |
 | 23 | Backup scheduler + retention | closes the ⚠️ on backups: RPO automation and bounded offsite growth | ✅ |
 | 24 | TLS cert/key hot-reload | expired certs are a top self-inflicted outage; closes the ⚠️ on secrets | ✅ |
@@ -404,6 +404,56 @@ before feature 1 landed.
   survivor, survivors converged, no panic. Membership-sensitive
   integration tests (leave-tombstone, epoch, fencing, decommission,
   bootstrap, zone/region) stay green.
+
+- **21 ✅** the suite is now runnable in one command and does not flap.
+  `scripts/verify.sh` is the gate (default = build + vet + full suite +
+  `-race`; `--soak` adds the chaos harness). "Fix the flaky test" turned
+  out to be four real bugs the soak harness kept rediscovering, each of
+  which could lose a quorum-acked write or strand a node:
+
+  **(a) Zone placement was half-disabled.** `Topology.hasZones`/
+  `hasRegions` tested `len(map) > 0`, but `Cluster.Zones()/Regions()`
+  always insert a self entry whose value may be empty — so both were
+  permanently true. That forced `Ring.Owners` into its 3-pass path with
+  the zone pass demoted to pass 1: pass 0 became a *region* pass that
+  enforces no zone diversity (all regions empty), filled the owner set,
+  and the zone pass never ran. Replicas stacked in one zone for ~half the
+  keyspace depending on hash position — the cause of the intermittent
+  zone-placement failures. Both helpers now require a non-empty value.
+
+  **(b) A node could be orphaned forever.** Gossip is epidemic: it only
+  pushes addresses it already holds, so a node whose whole peer set aged
+  out had nobody to push to and could never rejoin — and a node that
+  outlived its peers had no address left. Every successfully-contacted
+  peer is now remembered as a seed, persisted to `<dir>/seeds.json`
+  (atomic, throttled, capped, flushed on `Stop`); an empty-view node
+  probes remembered addresses until one answers (throttled to one probe
+  per 5s, so a healthy cluster pays nothing and a permanently orphaned
+  one is cheap). The soak also restarts a killed node on its **original
+  address** — a real restart keeps its endpoint — instead of a fresh
+  random port that stranded every restart on an island no survivor could
+  reach.
+
+  **(c) A quorum write silently degraded to one copy.** `forwardBytes`
+  rebuilt the routed request from the path alone, dropping the query
+  string — and `?consistency=quorum|all` lives in the query. A quorum
+  write aimed at a non-owner was forwarded to the owner, which applied it
+  as a default `one` write: one node, acked 200, replicas reached only by
+  the async fanout. The query is now carried through.
+
+  **(d) A dying node could satisfy quorum with a copy that did not
+  exist.** `HandleReplicate` ignored `ApplyRemote`'s result and always
+  answered 200, even when the replica's log was closed and nothing was
+  persisted. It now answers 500 unless the apply is durable. Relatedly,
+  the quorum bar `W = len(members)/2+1` was computed from however many
+  nodes the ring happened to hold — under churn a collapsed ring lowered
+  it to a single local apply — so `W` is now anchored to the configured
+  RF.
+
+  Regression tests: owner-store durability check for the forward (fails
+  on old code with 1/3 owners, passes on new), plus 4 cluster unit tests
+  for the seed bookkeeping. **Live-verified**: 25 consecutive soak runs,
+  0 convergence failures, 0 lost writes. Full suite green, `-race` clean.
 
 - **30 ⚠️** the placement half of multi-region is shipped, the conflict
   half is not. `ring.Topology` now carries two levels — region above zone —
