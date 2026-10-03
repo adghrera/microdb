@@ -53,6 +53,7 @@ func main() {
 	maxInflight := flag.Int64("max-inflight", 0, "shed load with 429 above this many concurrent requests (0 = unlimited)")
 	traceSlowMs := flag.Int64("trace-slow-ms", 500, "log requests slower than this with their trace id")
 	encKey := flag.String("encryption-key", "", "64-hex-char (32-byte) AES-256-GCM key for encryption at rest")
+	aeFanout := flag.Int("ae-fanout", 3, "peers contacted per anti-entropy round (bounds repair traffic as the cluster grows)")
 	zone := flag.String("zone", "", "failure domain this node lives in (rack/AZ); gossiped so replicas spread across zones")
 	clusterName := flag.String("cluster-name", "", "cluster identity guard: nodes only join peers with the same name")
 	jsonLog := flag.Bool("json-log", false, "emit structured JSON logs")
@@ -131,6 +132,7 @@ func main() {
 	if *zone != "" {
 		cl.SetZone(*zone)
 	}
+	cl.SetAEFanout(*aeFanout)
 	srv := api.NewWithRF(self, st, cl, *rf)
 	cl.Start()
 	defer cl.Stop()

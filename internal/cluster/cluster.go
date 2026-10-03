@@ -128,6 +128,12 @@ type Cluster struct {
 	// clears the tombstone so a restarted node on the same address is
 	// accepted.
 	left map[string]time.Time
+	// ae schedules anti-entropy contacts: a shuffled lap over the peer
+	// set, `fanout` peers per round. Without it every node synced with
+	// EVERY peer every round — O(N^2) messages cluster-wide per
+	// interval, which is the first wall a few hundred nodes hit.
+	ae       *aeSchedule
+	aeFanout int
 	// incompatible holds peers that answered outside our wire-version
 	// window [protocol.MinSupported, protocol.Version]; they are
 	// skipped rather than retried forever.
@@ -166,6 +172,8 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 		loads:         map[string]float64{},
 		incompatible:  map[string]int{},
 		zones:         map[string]string{},
+		ae:            &aeSchedule{},
+		aeFanout:      defaultAEFanout,
 		st:            st,
 		client:        &http.Client{Timeout: 30 * time.Second},
 		stop:          make(chan struct{}),
@@ -496,9 +504,42 @@ func (c *Cluster) Start() {
 }
 
 // antiEntropyAll syncs every collection with every live peer.
+// defaultAEFanout bounds anti-entropy traffic per round: small
+// clusters (the ones in the test suite) still cover every peer in one
+// round, while a 300-node cluster repairs with three meetings per node
+// per interval instead of three hundred.
+const defaultAEFanout = 3
+
+// SetAEFanout sets how many peers one anti-entropy round contacts
+// (<=0 restores the default).
+func (c *Cluster) SetAEFanout(n int) {
+	c.mu.Lock()
+	if n <= 0 {
+		n = defaultAEFanout
+	}
+	c.aeFanout = n
+	c.mu.Unlock()
+}
+
+// AEFanout returns the current anti-entropy fanout.
+func (c *Cluster) AEFanout() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.aeFanout
+}
+
+// antiEntropyAll runs one scheduled round: the next `fanout` peers of a
+// shuffled lap, so every peer is visited exactly once per lap and a
+// round costs a bounded number of messages no matter how large the
+// cluster grows.
 func (c *Cluster) antiEntropyAll() {
 	collections := c.st.Collections()
-	for _, peer := range c.Peers() {
+	c.mu.RLock()
+	fanout := c.aeFanout
+	c.mu.RUnlock()
+	for _, peer := range c.ae.next(c.Peers(), fanout) {
+		atomic.AddInt64(metrics.Default.Counter("microdb_ae_peers_contacted_total",
+			"Peers contacted by anti-entropy rounds"), 1)
 		for _, col := range collections {
 			if err := c.syncCollection(peer, col); err != nil {
 				log.Printf("anti-entropy %s <-> %s: %v", col, peer, err)
