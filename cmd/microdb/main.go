@@ -65,6 +65,7 @@ func main() {
 	archiveDir := flag.String("archive-dir", "", "continuously archive the raw commit log here (PITR)")
 	archiveInterval := flag.Duration("archive-interval", 60*time.Second, "how often to write a raw-log archive (with --archive-dir)")
 	maxInflight := flag.Int64("max-inflight", 0, "shed load with 429 above this many concurrent requests (0 = unlimited)")
+	sloMs := flag.Int64("slo-ms", 500, "latency objective for the SLO gauges on /metrics (milliseconds)")
 	traceSlowMs := flag.Int64("trace-slow-ms", 500, "log requests slower than this with their trace id")
 	encKey := flag.String("encryption-key", "", "64-hex-char (32-byte) AES-256-GCM key for encryption at rest (prefer --encryption-key-file)")
 	encKeyFile := flag.String("encryption-key-file", "", "read the encryption key from a file (env MICRODB_ENCRYPTION_KEY is the fallback)")
@@ -302,6 +303,7 @@ func main() {
 	if *maxInflight > 0 {
 		handler = api.Backpressure(*maxInflight, handler)
 	}
+	api.SetSLO(*sloMs)
 	handler = api.Tracing(*traceSlowMs, handler) // outermost: every request gets a trace id
 	if tlsOpts != nil {
 		handler = api.RequireInternalTLS(handler)

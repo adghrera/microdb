@@ -548,6 +548,64 @@ func Backpressure(maxInflight int64, next http.Handler) http.Handler {
 // X-Trace-Id from the client for cross-service correlation), times the
 // request, logs slow requests, and echoes the ID back. Latency is
 // bucketed into metrics so tail causes are findable.
+// sloMs is the latency objective the SLO gauges are measured against
+// (--slo-ms). Requests beyond it are counted so /metrics can report
+// the percentage of traffic that violated it.
+var sloMs int64 = 500
+
+// SetSLO sets the latency objective in milliseconds (<=0 keeps the
+// default of 500).
+func SetSLO(ms int64) {
+	if ms > 0 {
+		atomic.StoreInt64(&sloMs, ms)
+	}
+}
+
+// SLO returns the current objective in milliseconds.
+func SLO() int64 { return atomic.LoadInt64(&sloMs) }
+
+// routeLabel collapses a request path into the handful of route
+// classes operators chart: one histogram per class keeps /metrics
+// bounded while still separating reads, writes, queries and internal
+// traffic.
+func routeLabel(method, path string) string {
+	switch {
+	case path == "/health" || path == "/ready":
+		return "health"
+	case path == "/version":
+		return "version"
+	case path == "/metrics":
+		return "metrics"
+	case strings.HasPrefix(path, "/internal/"):
+		return "internal"
+	case strings.HasSuffix(path, "/docs"):
+		return "query"
+	case strings.HasSuffix(path, "/watch"):
+		return "watch"
+	case strings.Contains(path, "/docs/batch"):
+		return "batch"
+	case strings.Contains(path, "/docs/"):
+		switch {
+		case strings.HasSuffix(path, "/schema"):
+			return "schema"
+		case strings.HasSuffix(path, "/gsi"):
+			return "gsi"
+		}
+		return strings.ToLower(method) + "_doc"
+	case strings.Contains(path, "/collections"):
+		return "collection_admin"
+	case strings.Contains(path, "/cluster"):
+		return "cluster"
+	case strings.Contains(path, "/stats"):
+		return "stats"
+	default:
+		return "other"
+	}
+}
+
+// Tracing stamps a trace id and records RED metrics: a duration
+// histogram per route class, error and over-SLO counters, and the
+// gauges derived from them at scrape time.
 func Tracing(slowMs int64, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -556,9 +614,26 @@ func Tracing(slowMs int64, next http.Handler) http.Handler {
 			traceID = newTraceID()
 		}
 		w.Header().Set("X-Trace-Id", traceID)
-		next.ServeHTTP(w, r)
+		rec := &auditRW{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
 		elapsed := time.Since(start)
+
+		route := routeLabel(r.Method, r.URL.Path)
+		// Duration histogram for this route class, in milliseconds.
+		metrics.Default.Histogram(
+			"microdb_request_duration_ms_"+route,
+			"Request duration in ms for the "+route+" route class",
+			metrics.DefaultLatencyBounds,
+		).Observe(float64(elapsed) / float64(time.Millisecond))
+
 		atomic.AddInt64(metrics.Default.Counter("microdb_requests_total", "Requests served"), 1)
+		if rec.status >= 500 {
+			atomic.AddInt64(metrics.Default.Counter("microdb_request_errors_total", "Requests that failed (5xx)"), 1)
+			atomic.AddInt64(metrics.Default.Counter("microdb_request_errors_"+route+"_total", "5xx on the "+route+" route class"), 1)
+		}
+		if elapsed > time.Duration(SLO())*time.Millisecond {
+			atomic.AddInt64(metrics.Default.Counter("microdb_requests_over_slo_total", "Requests slower than the latency SLO"), 1)
+		}
 		// Rough latency buckets: fast (<50ms), slow (<500ms), very slow.
 		switch {
 		case elapsed < 50*time.Millisecond:
@@ -2244,6 +2319,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		atomic.StoreInt64(metrics.Default.Counter("microdb_cache_invalidations_total", "Read cache invalidations from the change feed"), inv)
 		atomic.StoreInt64(metrics.Default.Gauge("microdb_cache_entries", "Live read cache entries"), int64(s.rcache.Len()))
 	}
+	// SLO and error budgets: fractions of traffic, not raw counts, so
+	// an alert can fire on user-visible pain instead of on CPU.
+	if total := atomic.LoadInt64(metrics.Default.Counter("microdb_requests_total", "Requests served")); total > 0 {
+		overSLO := atomic.LoadInt64(metrics.Default.Counter("microdb_requests_over_slo_total", "Requests slower than the latency SLO"))
+		errs := atomic.LoadInt64(metrics.Default.Counter("microdb_request_errors_total", "Requests that failed (5xx)"))
+		metrics.Default.SetFloat("microdb_slo_violation_pct",
+			"Percentage of requests slower than the latency SLO since start", 100*float64(overSLO)/float64(total))
+		metrics.Default.SetFloat("microdb_error_pct",
+			"Percentage of requests that returned 5xx since start", 100*float64(errs)/float64(total))
+		atomic.StoreInt64(metrics.Default.Gauge("microdb_slo_ms", "Latency SLO in milliseconds"), SLO())
+	}
+
 	// Group commit: writes/fsync is the batch size — the number that
 	// shows whether writes are actually sharing durability passes.
 	passes, writes, failed := s.st.CommitStats()

@@ -11,10 +11,12 @@ import (
 )
 
 type Registry struct {
-	mu    sync.Mutex
-	docs  map[string]string
-	count map[string]*int64
-	gauge map[string]*int64
+	mu     sync.Mutex
+	docs   map[string]string
+	count  map[string]*int64
+	gauge  map[string]*int64
+	hist   map[string]*Histogram
+	fgauge map[string]*fgBits
 }
 
 // Default is the process-wide registry used by store/cluster/api.
@@ -22,9 +24,11 @@ var Default = NewRegistry()
 
 func NewRegistry() *Registry {
 	return &Registry{
-		docs:  map[string]string{},
-		count: map[string]*int64{},
-		gauge: map[string]*int64{},
+		docs:   map[string]string{},
+		count:  map[string]*int64{},
+		gauge:  map[string]*int64{},
+		hist:   map[string]*Histogram{},
+		fgauge: map[string]*fgBits{},
 	}
 }
 
@@ -75,5 +79,9 @@ func (r *Registry) Render() string {
 			b.WriteString(fmt.Sprintf("%s %d\n", n, atomic.LoadInt64(r.gauge[n])))
 		}
 	}
+	// Histograms and float gauges render after the integer metrics;
+	// both sorted so /metrics output is stable across scrapes.
+	r.renderHistograms(&b)
+	r.renderFloatGauges(&b)
 	return b.String()
 }
