@@ -1124,6 +1124,34 @@ func (c *Cluster) Draining() bool {
 //
 // Returns how many docs were handed off. After it returns the process
 // can exit; remaining nodes converge on the new ring.
+// SetDraining marks this node as not accepting new work — /ready
+// flips to 503 while /health stays 200 — without touching any data.
+// It is the first step of both a decommission and a graceful shutdown.
+func (c *Cluster) SetDraining(on bool) {
+	c.mu.Lock()
+	c.draining = on
+	c.mu.Unlock()
+}
+
+// Leave tells every peer we're departing: they drop us from their
+// member set and bump the epoch immediately, instead of waiting out the
+// 15s TTL. It moves no data (that is Decommission's job) — it is the
+// cheap half, used by graceful shutdown where the replicas already
+// hold everything. Returns how many peers were reached.
+func (c *Cluster) Leave() int {
+	peers := c.Peers()
+	for _, p := range peers {
+		b, _ := json.Marshal(map[string]interface{}{"addr": c.self, "epoch": c.Epoch()})
+		resp, err := c.post(p+"/internal/leave", b)
+		if err != nil {
+			continue
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	return len(peers)
+}
+
 func (c *Cluster) Decommission() (int, error) {
 	c.mu.Lock()
 	c.draining = true
@@ -1159,14 +1187,7 @@ func (c *Cluster) Decommission() (int, error) {
 	}
 	// Tell everyone we're leaving: they drop us from their member set
 	// right away and bump the epoch.
-	for _, p := range peers {
-		b, _ := json.Marshal(map[string]interface{}{"addr": c.self, "epoch": c.Epoch()})
-		resp, err := c.post(p+"/internal/leave", b)
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-	}
+	c.Leave()
 	return handedOff, nil
 }
 

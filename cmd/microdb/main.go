@@ -23,8 +23,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"microdb/internal/api"
@@ -65,6 +67,7 @@ func main() {
 	archiveDir := flag.String("archive-dir", "", "continuously archive the raw commit log here (PITR)")
 	archiveInterval := flag.Duration("archive-interval", 60*time.Second, "how often to write a raw-log archive (with --archive-dir)")
 	maxInflight := flag.Int64("max-inflight", 0, "shed load with 429 above this many concurrent requests (0 = unlimited)")
+	shutdownTimeout := flag.Duration("shutdown-timeout", 15*time.Second, "how long graceful shutdown waits for in-flight requests before exiting anyway")
 	sloMs := flag.Int64("slo-ms", 500, "latency objective for the SLO gauges on /metrics (milliseconds)")
 	traceSlowMs := flag.Int64("trace-slow-ms", 500, "log requests slower than this with their trace id")
 	encKey := flag.String("encryption-key", "", "64-hex-char (32-byte) AES-256-GCM key for encryption at rest (prefer --encryption-key-file)")
@@ -303,6 +306,40 @@ func main() {
 	if *maxInflight > 0 {
 		handler = api.Backpressure(*maxInflight, handler)
 	}
+	// Graceful shutdown: SIGTERM (or Ctrl-C) must lose nothing.
+	//   1. flip /ready to 503 so a load balancer stops sending work,
+	//      while /health stays 200 (liveness must not fail during a
+	//      deliberate stop or the supervisor kills us mid-flush);
+	//   2. wait for in-flight requests, bounded by --shutdown-timeout;
+	//   3. close the store — which drains the log-writer queue, fsyncs,
+	//      and closes the durable feed;
+	//   4. tell peers we're leaving so they rebuild their rings now
+	//      instead of waiting out the membership TTL;
+	//   5. exit 0.
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		s := <-sig
+		start := time.Now()
+		log.Printf("shutdown: %v — readiness off, draining", s)
+		cl.SetDraining(true)
+		deadline := time.Now().Add(*shutdownTimeout)
+		for api.Inflight() > 0 && time.Now().Before(deadline) {
+			time.Sleep(25 * time.Millisecond)
+		}
+		if n := api.Inflight(); n > 0 {
+			log.Printf("shutdown: %d request(s) still in flight after %s — exiting anyway", n, *shutdownTimeout)
+		}
+		if err := st.Close(); err != nil {
+			log.Printf("shutdown: store close: %v", err)
+		}
+		if n := cl.Leave(); n > 0 {
+			log.Printf("shutdown: left %d peer(s); they rebuild their rings now", n)
+		}
+		log.Printf("shutdown: complete in %s", time.Since(start).Round(time.Millisecond))
+		os.Exit(0)
+	}()
+
 	api.SetSLO(*sloMs)
 	handler = api.Tracing(*traceSlowMs, handler) // outermost: every request gets a trace id
 	if tlsOpts != nil {

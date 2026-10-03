@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -47,6 +48,13 @@ func TestTracingRecordsREDMetrics(t *testing.T) {
 		return w.Code
 	}
 
+	// Counters are process-global (other tests in this package also pass
+	// through Tracing), so assert DELTAS and the gauge's derivation
+	// rather than absolutes another test would shift.
+	reqBefore := counterOf("microdb_requests_total")
+	errBefore := counterOf("microdb_request_errors_total")
+	overBefore := counterOf("microdb_requests_over_slo_total")
+
 	if code := do(http.MethodPut, "/api/collections/c/docs/a"); code != 200 {
 		t.Fatalf("write: %d", code)
 	}
@@ -59,15 +67,21 @@ func TestTracingRecordsREDMetrics(t *testing.T) {
 	}
 
 	out := metrics.Default.Render()
+	if got := counterOf("microdb_requests_total") - reqBefore; got != 3 {
+		t.Errorf("requests_total delta = %d, want 3", got)
+	}
+	if got := counterOf("microdb_request_errors_total") - errBefore; got != 1 {
+		t.Errorf("errors_total delta = %d, want 1", got)
+	}
+	if got := counterOf("microdb_requests_over_slo_total") - overBefore; got != 2 {
+		t.Errorf("over_slo_total delta = %d, want 2 (the two 5ms requests)", got)
+	}
 	for _, want := range []string{
 		"# TYPE microdb_request_duration_ms_put_doc histogram",
 		"microdb_request_duration_ms_put_doc_bucket",
 		"# TYPE microdb_request_duration_ms_get_doc histogram",
 		"microdb_request_duration_ms_get_doc_bucket",
-		"microdb_requests_total 3",
-		"microdb_request_errors_total 1",
-		"microdb_request_errors_put_doc_total 1",
-		"microdb_requests_over_slo_total 2", // the two 5ms requests; the immediate 500 is inside the SLO
+		"microdb_request_errors_put_doc_total",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("/metrics missing %q", want)
@@ -97,8 +111,17 @@ func TestTracingRecordsREDMetrics(t *testing.T) {
 	if !strings.Contains(body, "# TYPE microdb_slo_violation_pct gauge") {
 		t.Error("SLO violation gauge missing from /metrics")
 	}
-	if v := gaugeValue(t, body, "microdb_slo_violation_pct"); v < 60 || v > 70 {
-		t.Errorf("SLO violation percentage = %v, want ~66.7 (2 of 3 requests)", v)
+	// The gauge is derived from the same counters, so assert the
+	// derivation (absolute values would shift with every other test
+	// that serves a request in this package).
+	total := counterOf("microdb_requests_total")
+	over := counterOf("microdb_requests_over_slo_total")
+	wantPct := 100 * float64(over) / float64(total)
+	if v := gaugeValue(t, body, "microdb_slo_violation_pct"); math.Abs(v-wantPct) > 0.01 {
+		t.Errorf("SLO violation percentage = %v, want %v (derived from %d/%d)", v, wantPct, over, total)
+	}
+	if total == 0 || over == 0 {
+		t.Fatalf("counters empty: total=%d over=%d — the test traffic vanished", total, over)
 	}
 	if !strings.Contains(body, "# TYPE microdb_error_pct gauge") {
 		t.Errorf("error percentage missing:\n%s", grepLines(body, "microdb_error"))
@@ -111,6 +134,11 @@ func TestTracingRecordsREDMetrics(t *testing.T) {
 	if !strings.Contains(body, "microdb_request_duration_ms_put_doc_sum") {
 		t.Error("histogram sum missing from /metrics")
 	}
+}
+
+// counterOf reads a counter from the process-global registry.
+func counterOf(name string) int64 {
+	return atomic.LoadInt64(metrics.Default.Counter(name, "counter"))
 }
 
 // gaugeValue pulls one gauge sample out of a Prometheus text body.

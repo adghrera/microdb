@@ -564,6 +564,13 @@ func SetSLO(ms int64) {
 // SLO returns the current objective in milliseconds.
 func SLO() int64 { return atomic.LoadInt64(&sloMs) }
 
+// inflight counts requests currently inside the handler — the number a
+// graceful shutdown waits for before closing the log file.
+var inflight int64
+
+// Inflight returns how many requests are being served right now.
+func Inflight() int64 { return atomic.LoadInt64(&inflight) }
+
 // routeLabel collapses a request path into the handful of route
 // classes operators chart: one histogram per class keeps /metrics
 // bounded while still separating reads, writes, queries and internal
@@ -614,6 +621,8 @@ func Tracing(slowMs int64, next http.Handler) http.Handler {
 			traceID = newTraceID()
 		}
 		w.Header().Set("X-Trace-Id", traceID)
+		atomic.AddInt64(&inflight, 1)
+		defer atomic.AddInt64(&inflight, -1)
 		rec := &auditRW{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		elapsed := time.Since(start)
