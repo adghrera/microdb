@@ -104,7 +104,7 @@ Every row below is ☐ — **no claim is made until it is verified.**
 | 2 | P | Rolling-upgrade wire versioning (N / N−1) | 10 | ✅ |
 | 3 | F | Group commit / write batching | 9 | ✅ |
 | 4 | F | Sharded store map (kill the global read lock) | 9 | ✅ |
-| 5 | P | End-to-end integrity: checksums + `verify` + `repair` | 9 | ⬜ |
+| 5 | P | End-to-end integrity: checksums + `verify` + `repair` | 9 | ✅ |
 | 6 | F | Block/page store with sparse index | 9 | ⬜ |
 | 7 | S | Tiered storage: hot local + cold object store | 9 | ⬜ |
 | 8 | F | Segment compression | 8 | ⬜ |
@@ -124,7 +124,7 @@ Every row below is ☐ — **no claim is made until it is verified.**
 *(Plus one unplanned blocker the harness forced: making write cost
 independent of data size — shipped with #1.)*
 
-**Progress: 4 / 20 built.**
+**Progress: 5 / 20 built.**
 
 ### Ground rules for this tier
 
@@ -187,7 +187,7 @@ independent of data size — shipped with #1.)*
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
 | [x] | **Rolling-upgrade compatibility (N / N−1 wire)** | 10 | ✅ shipped — new `internal/protocol`: `X-Microdb-Protocol` stamped on every `/internal/*` request (cluster `clusterStampTransport`, api `protoStampTransport`) and advertised on every reply. Requests outside `[MinSupported, Version]` are refused with **505 + a structured body** (`peer_version`/`min_supported`/`max_supported`/`server_version`) *before* any of it is parsed into membership or data; an absent header means `LegacyVersion` (a pre-versioning binary), never "whatever we are today" — so the window survives the first version bump. Out-of-window peers are recorded in `Cluster.Incompatible()`, skipped by gossip, and surfaced in `/api/cluster` and `microctl status` (which now prints `/version`, incl. `protocol` + `protocol_window`). Joining an incompatible seed fails with a diagnosis and leaves zero partial membership. 5 `protocol` unit tests + 4 integration tests (negotiation matrix incl. malformed header, public API unaffected, clean join failure, `/version`) |
-| [ ] | **End-to-end integrity: checksums + `verify` + `repair`** | 9 | CRC32C per record on disk and per message on the wire; `microctl verify` walks segments and the ring reporting corrupt or divergent records, `microctl repair` re-fetches from peers. |
+| [x] | **End-to-end integrity: checksums + `verify` + `repair`** | 9 | ✅ shipped — **disk:** every log record is wrapped in `CRC1:<crc32c>:<payload>`; the envelope sits *outside* the `ENC1` encryption so rot is detectable without the key. Compaction and PITR replay emit it too; pre-existing records are accepted as legacy. Replay tolerates a torn tail (crash mid-append), skips + counts mid-file damage (`microdb_corrupt_records_total`) instead of bricking the node, and anti-entropy refills it. **wire:** `X-Microdb-Crc32c` stamped on every internal POST by `cluster.post`, verified centrally in `api.ServeHTTP` (64MB cap) → **400 before the body reaches membership/replication state**; absent header = older peer. **`microctl verify --dir`** scans offline without loading the store, reports `line N @ byte M` and exits 1 on damage (tolerating a torn tail) — live-verified: legacy log → `integrity OK`; tampered record → `line 2 @ byte 87: crc32c mismatch`, exit 1. **`microctl repair --url`** → `POST /internal/repair` runs anti-entropy on demand — live test: a document node A never had is pulled in one pass. Metrics: `microdb_checksum_rejections_total`, `microdb_corrupt_records_total`. Tests: 4 store (checksum round-trip, middle corruption skipped, torn tail, verify report) + 2 integration (4-case checksum matrix, repair pull). **Downgrade caveat:** a pre-CRC binary cannot parse `CRC1:` records — roll back *before* writing data with a newer binary, or restore from backup |
 | [ ] | **Scheduled, verified, offsite backups** | 8 | `microctl backup --target <dir|s3>` with retention policy + checksum manifest, and `microctl backup verify` restoring into a scratch dir and asserting counts. An untested backup is not a backup. |
 | [ ] | **Secrets & key rotation** | 8 | `--tls-*`, `--auth-token`, and encryption keys read from file/env (never argv), hot-reloaded on SIGHUP; per-record `key_id` so old records still decrypt under old keys after rotation. |
 | [ ] | **Audit log** | 8 | Structured append-only record of authn/authz decisions and mutations: who, which tenant/collection, when, from where. `tenants` already makes the decision — this preserves it. |

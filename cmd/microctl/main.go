@@ -74,6 +74,55 @@ func main() {
 		fmt.Printf("restored %d docs into %s\n", n, *dir)
 	case "status":
 		printStatus(*url)
+	case "verify":
+		// Offline integrity scan of the commit log: every record's
+		// CRC32C is checked without loading the store. Exit code 1 if
+		// anything other than a torn final record is damaged, so it can
+		// gate a backup or a cron.
+		rep, err := store.VerifyDir(*dir)
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Printf("log      %s (%d bytes)\n", rep.Path, rep.Bytes)
+		fmt.Printf("records  %d total, %d checksummed, %d legacy\n",
+			rep.Records, rep.ChecksummedRecords, rep.LegacyRecords)
+		if rep.Encrypted {
+			fmt.Println("format   encrypted (ENC1)")
+		}
+		if rep.TornTail {
+			fmt.Println("tail     torn final record (crash mid-append) - tolerated by replay")
+		}
+		if len(rep.Corrupt) > 0 {
+			fmt.Printf("CORRUPT  %d record(s):\n", len(rep.Corrupt))
+			for _, c := range rep.Corrupt {
+				fmt.Printf("  line %d @ byte %d: %s\n", c.Line, c.Offset, c.Reason)
+			}
+			fmt.Println("run microctl repair --url <node> to re-fetch affected documents from peers")
+		} else {
+			fmt.Println("integrity OK")
+		}
+		if !rep.OK() {
+			os.Exit(1)
+		}
+	case "repair":
+		// Force an anti-entropy pass against every peer NOW: the
+		// recovery step after verify finds damage (or after a disk is
+		// replaced). Anything this node lost is re-fetched from a peer
+		// that still holds it.
+		req, err := http.NewRequest("POST", *url+"/internal/repair", nil)
+		if err != nil {
+			fatal(err)
+		}
+		resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+		if err != nil {
+			fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			fatal(fmt.Errorf("repair failed (%d): %s", resp.StatusCode, body))
+		}
+		fmt.Printf("repair of %s\n%s", *url, string(body))
 	case "hints":
 		resp, err := httpGet(*url + "/internal/hints")
 		if err != nil {
@@ -154,7 +203,7 @@ func usage() {
 commands:
   backup  --dir <data-dir> --out <file>    snapshot current state to JSONL
   restore --dir <data-dir> --in <file>     apply a JSONL backup (LWW merge)
-  status  --url <node-url>                health + cluster view
+  status  --url <node-url>                health + cluster view\n  verify  --dir <data-dir>                check every log record's CRC32C (exit 1 on damage)\n  repair  --url <node-url>                force anti-entropy now: re-fetch anything this node lost
   hints   --url <node-url>                hinted-handoff debt (pending/delivered/dropped)
   decommission --url <node-url>          drain a node: hand off data + broadcast leave`)
 }

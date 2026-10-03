@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"hash/maphash"
 	"io"
 	"os"
@@ -274,6 +275,18 @@ var shardSeed = maphash.MakeSeed()
 // shardOf maps a document key to its stripe.
 func shardOf(k string) uint32 {
 	return uint32(maphash.String(shardSeed, k)) & (numShards - 1)
+}
+
+// tailRecord reports whether recs[i] is the last non-empty record in
+// the file — i.e. whether a bad checksum there is a torn final write
+// rather than damage in the middle of the log.
+func tailRecord(recs []string, i int) bool {
+	for j := i + 1; j < len(recs); j++ {
+		if strings.TrimSpace(recs[j]) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // lookup reads one document under a single shard's read lock. It never
@@ -563,19 +576,30 @@ func (s *Store) appendRecord(w io.Writer, plain []byte) error {
 	return err
 }
 
-// encodeRecord renders one log line (including its newline),
-// encrypting it when a key is set. It does no I/O — the log writer
-// owns the file — so the expensive part of a write (the fsync) can be
-// shared by every record queued while it runs.
+// encodeRecord renders one log line (including its newline): encrypt
+// when a key is set, then wrap in the CRC32C envelope. It does no I/O
+// — the log writer owns the file — so the expensive part of a write
+// (the fsync) can be shared by every record queued while it runs.
+//
+// The checksum sits OUTSIDE the encryption so integrity can be checked
+// without the key: a bit-rotted record is reported as corruption, not
+// as a decryption failure.
 func (s *Store) encodeRecord(plain []byte) ([]byte, error) {
+	payload := plain
 	if s.key != nil {
 		enc, err := encryptRecord(s.key, plain)
 		if err != nil {
 			return nil, err
 		}
-		return append(enc, '\n'), nil
+		payload = enc
 	}
-	return append(plain, '\n'), nil
+	out := make([]byte, 0, len(payload)+24)
+	out = append(out, crcPrefix...)
+	out = strconv.AppendUint(out, uint64(crc32.Checksum(payload, castagnoli)), 16)
+	out = append(out, ':')
+	out = append(out, payload...)
+	out = append(out, '\n')
+	return out, nil
 }
 
 // decodeLogLine turns one raw log line into plaintext JSON,
@@ -627,14 +651,28 @@ func OpenWithKey(dir, keyHex string) (*Store, error) {
 			break
 		}
 	}
-	for _, raw := range strings.Split(string(buf), "\n") {
+	recs := strings.Split(string(buf), "\n")
+	var corrupt int64
+	for i, raw := range recs {
 		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
+		// Integrity first: a record whose CRC does not match is not
+		// data. Damage at EOF is a torn write from a crash and is
+		// tolerated exactly like a partial JSON line; damage anywhere
+		// else is skipped (counted + metered) so one bad sector cannot
+		// brick the node — anti-entropy refills it from peers.
+		payload, intact := verifyRecord(line)
+		if !intact {
+			if !tailRecord(recs, i) {
+				corrupt++
+			}
+			continue
+		}
 		// Transparently decrypt ENC1 records (error = wrong/missing
 		// key: fail loudly rather than silently dropping data).
-		line, err := s.decodeLogLine(line)
+		line, err := s.decodeLogLine(payload)
 		if err != nil {
 			f.Close()
 			return nil, fmt.Errorf("log replay: %w", err)
@@ -665,6 +703,10 @@ func OpenWithKey(dir, keyHex string) (*Store, error) {
 				}
 			}
 		}
+	}
+	if corrupt > 0 {
+		atomic.AddInt64(metrics.Default.Counter("microdb_corrupt_records_total",
+			"Corrupt log records skipped during replay"), corrupt)
 	}
 	if _, err := f.Seek(0, 2); err != nil {
 		f.Close()
@@ -1405,7 +1447,14 @@ func ReplayUntilKey(r io.Reader, until int64, dir, keyHex string) (*Store, int, 
 		if len(line) > 0 {
 			trimmed := strings.TrimSpace(string(line))
 			if trimmed != "" {
-				trimmed, derr := s.decodeLogLine(trimmed)
+				// Verify the archive record's checksum before doing anything
+				// else with it: the envelope sits outside the ciphertext, so
+				// no key is needed to spot a bit-rotted record.
+				payload, intact := verifyRecord(trimmed)
+				if !intact {
+					continue
+				}
+				trimmed, derr := s.decodeLogLine(payload)
 				if derr != nil {
 					f.Close()
 					return nil, 0, fmt.Errorf("archive replay: %w", derr)
@@ -1436,9 +1485,10 @@ func ReplayUntilKey(r io.Reader, until int64, dir, keyHex string) (*Store, int, 
 								// Persist the replayed record so the
 								// recovered store survives restart.
 								if b, err := json.Marshal(d); err == nil {
-									bw.Write(b)
-									bw.WriteByte('\n')
+									if ln, lerr := s.encodeRecord(b); lerr == nil {
+										bw.Write(ln)
 								}
+									}
 								applied++
 							}
 						}
@@ -1460,9 +1510,10 @@ func ReplayUntilKey(r io.Reader, until int64, dir, keyHex string) (*Store, int, 
 							}
 							s.log.Append(d.Collection, d.ID, kind, fld)
 							if b, err := json.Marshal(d); err == nil {
-								bw.Write(b)
-								bw.WriteByte('\n')
+								if ln, lerr := s.encodeRecord(b); lerr == nil {
+									bw.Write(ln)
 							}
+								}
 							applied++
 						}
 					}

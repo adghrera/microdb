@@ -270,14 +270,29 @@ func (t *clusterStampTransport) RoundTrip(req *http.Request) (*http.Response, er
 	return resp, err
 }
 
+// post sends an internal request, stamping the body's CRC32C so the
+// receiver can prove the bytes that arrived are the bytes that were
+// sent. Truncation or corruption on the wire is rejected before it can
+// be applied to replication or membership state.
+func (c *Cluster) post(url string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if len(body) > 0 {
+		req.Header.Set(protocol.CRCHeader, protocol.Checksum(body))
+	}
+	return c.client.Do(req)
+}
+
 // Join contacts a known seed node and asks for its member list.
 func (c *Cluster) Join(seed string) error {
 	// We are (re)joining under our own address: clear any local
 	// tombstone for it so a restarted node is accepted cluster-wide
 	// once the seed propagates our presence.
 	c.ClearLeave(c.self)
-	resp, err := c.client.Post(seed+"/internal/join", "application/json",
-		bytes.NewReader([]byte(`{"addr":"`+c.self+`"}`)))
+	resp, err := c.post(seed+"/internal/join", []byte(`{"addr":"`+c.self+`"}`))
 	if err != nil {
 		return err
 	}
@@ -456,6 +471,56 @@ func (c *Cluster) antiEntropyAll() {
 	}
 }
 
+// RepairReport is what an explicit repair pass did.
+type RepairReport struct {
+	Peers      int    `json:"peers"`
+	Collections int   `json:"collections_attempted"`
+	Synced     int    `json:"collections_synced"`
+	Failed     int    `json:"collections_failed"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
+// RepairAll runs a full anti-entropy pass against every peer RIGHT
+// NOW. This is the "re-fetch anything this node lost" button: after a
+// corrupt record is dropped at replay (or a disk is replaced), one
+// repair brings every missing document back from the peers that still
+// hold it.
+func (c *Cluster) RepairAll() RepairReport {
+	start := time.Now()
+	rep := RepairReport{}
+	peers := c.Peers()
+	collections := c.st.Collections()
+	rep.Peers = len(peers)
+	for _, peer := range peers {
+		cols := collections
+		if extra, err := c.fetchCollectionsList(peer); err == nil {
+			for _, col := range extra {
+				if col != "" && !contains(cols, col) {
+					cols = append(cols, col)
+				}
+			}
+		}
+		for _, col := range cols {
+			rep.Collections++
+			if err := c.syncCollection(peer, col); err != nil {
+				rep.Failed++
+				log.Printf("repair %s <-> %s: %v", col, peer, err)
+			} else {
+				rep.Synced++
+			}
+		}
+	}
+	rep.DurationMs = time.Since(start).Milliseconds()
+	return rep
+}
+
+// HandleRepair is POST /internal/repair: run the anti-entropy pass on
+// demand instead of waiting for the timer.
+func (c *Cluster) HandleRepair(w http.ResponseWriter, r *http.Request) {
+	rep := c.RepairAll()
+	writeJSON(w, 200, rep)
+}
+
 func contains(xs []string, x string) bool {
 	for _, v := range xs {
 		if v == x {
@@ -562,7 +627,7 @@ func (c *Cluster) syncCollection(peer, col string) error {
 
 	// Pull their versions.
 	body, _ := json.Marshal(map[string]interface{}{"collection": col, "ids": ids})
-	presp, err := c.client.Post(peer+"/internal/antientropy", "application/json", bytes.NewReader(body))
+	presp, err := c.post(peer+"/internal/antientropy", body)
 	if err != nil {
 		return err
 	}
@@ -596,7 +661,7 @@ func (c *Cluster) syncCollection(peer, col string) error {
 	}
 	if len(toPush) > 0 {
 		pb, _ := json.Marshal(map[string]interface{}{"docs": toPush})
-		sresp, err := c.client.Post(peer+"/internal/replicate_bulk", "application/json", bytes.NewReader(pb))
+		sresp, err := c.post(peer+"/internal/replicate_bulk", pb)
 		if err != nil {
 			return err
 		}
@@ -698,7 +763,7 @@ func (c *Cluster) gossipRound() {
 	}
 	c.mu.RUnlock()
 	body, _ := json.Marshal(map[string]interface{}{"addr": c.self, "members": members, "epoch": c.Epoch(), "left": left})
-	resp, err := c.client.Post(peer+"/internal/gossip", "application/json", bytes.NewReader(body))
+	resp, err := c.post(peer+"/internal/gossip", body)
 	if err != nil {
 		return
 	}
@@ -927,7 +992,7 @@ func (c *Cluster) replayHints() {
 // by the replay loop to avoid recursion on failure).
 func (c *Cluster) postReplicate(peer string, d *store.Doc) error {
 	b, _ := json.Marshal(d)
-	resp, err := c.client.Post(peer+"/internal/replicate", "application/json", bytes.NewReader(b))
+	resp, err := c.post(peer+"/internal/replicate", b)
 	if err != nil {
 		return err
 	}
@@ -991,7 +1056,7 @@ func (c *Cluster) Decommission() (int, error) {
 		}
 		b, _ := json.Marshal(map[string]interface{}{"docs": docs[i:end]})
 		for _, p := range peers {
-			resp, err := c.client.Post(p+"/internal/replicate_bulk", "application/json", bytes.NewReader(b))
+			resp, err := c.post(p+"/internal/replicate_bulk", b)
 			if err != nil {
 				// Peer down mid-drain: stash as hints so a later
 				// return still gets the data.
@@ -1009,7 +1074,7 @@ func (c *Cluster) Decommission() (int, error) {
 	// right away and bump the epoch.
 	for _, p := range peers {
 		b, _ := json.Marshal(map[string]interface{}{"addr": c.self, "epoch": c.Epoch()})
-		resp, err := c.client.Post(p+"/internal/leave", "application/json", bytes.NewReader(b))
+		resp, err := c.post(p+"/internal/leave", b)
 		if err == nil {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
@@ -1214,7 +1279,7 @@ func (c *Cluster) Replicate(peer string, d *store.Doc) error {
 	atomic.AddInt64(metrics.Default.Counter("microdb_replication_sends_total", "Replication push attempts"), 1)
 	b, _ := json.Marshal(d)
 	for attempt := 0; attempt < 2; attempt++ {
-		resp, err := c.client.Post(peer+"/internal/replicate", "application/json", bytes.NewReader(b))
+		resp, err := c.post(peer+"/internal/replicate", b)
 		if err == nil {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()

@@ -33,6 +33,11 @@ import (
 	"microdb/internal/tenants"
 )
 
+// maxInternalBody bounds a checksummed internal payload: enough for
+// the largest replication batch, small enough that a hostile or
+// broken peer cannot make us buffer without limit.
+const maxInternalBody = 64 << 20
+
 type Server struct {
 	st      *store.Store
 	cl      *cluster.Cluster
@@ -232,6 +237,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	s.mux.HandleFunc("GET /internal/merkle/{col}/node", cl.HandleMerkleNode)
 	s.mux.HandleFunc("GET /internal/merkle/{col}/leaf", cl.HandleMerkleLeaf)
 	s.mux.HandleFunc("POST /internal/antientropy", cl.HandleAntiEntropy)
+	s.mux.HandleFunc("POST /internal/repair", cl.HandleRepair)
 	s.mux.HandleFunc("POST /internal/leave", cl.HandleLeave)
 	s.mux.HandleFunc("POST /internal/decommission", cl.HandleDecommission)
 	s.mux.HandleFunc("GET /internal/stream/{col}", cl.HandleStream)
@@ -279,6 +285,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+	}
+	// Integrity: an internal body that declares a CRC32C must match it.
+	// The body is buffered and re-wrapped, so handlers see no
+	// difference — a truncated or corrupted payload is rejected before
+	// it reaches replication, anti-entropy or membership state.
+	if r.Body != nil && r.Header.Get(protocol.CRCHeader) != "" &&
+		(r.Method == http.MethodPost || r.Method == http.MethodPut) {
+		body, err := protocol.VerifyBody(r, maxInternalBody)
+		if err != nil {
+			atomic.AddInt64(metrics.Default.Counter("microdb_checksum_rejections_total",
+				"Internal requests rejected for body checksum mismatch"), 1)
+			w.Header().Set(protocol.Header, protocol.String())
+			writeJSON(w, 400, map[string]interface{}{
+				"error":  "internal request body failed its checksum",
+				"detail": err.Error(),
+			})
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
 	}
 	// Advertise our version on every reply so a peer can detect a
 	// mismatch even on a 200, and so operators can curl it.

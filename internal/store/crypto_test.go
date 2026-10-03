@@ -29,8 +29,15 @@ func TestEncryptionRoundTrip(t *testing.T) {
 	if strings.Contains(text, "classified") {
 		t.Fatal("plaintext leaked into encrypted log")
 	}
-	if !strings.HasPrefix(text, encPrefix) {
-		t.Fatalf("log records not in ENC1 form: %.40s", text)
+	// Records are CRC-wrapped, then encrypted: the envelope sits
+	// outside the ciphertext so rot can be spotted without a key.
+	firstLine := strings.SplitN(text, "\n", 2)[0]
+	payload, intact := verifyRecord(firstLine)
+	if !intact {
+		t.Fatalf("first log record failed its checksum: %.60s", firstLine)
+	}
+	if !strings.HasPrefix(payload, encPrefix) {
+		t.Fatalf("log records not in ENC1 form: %.60s", payload)
 	}
 
 	// Reopen with the right key: full state recovered.
