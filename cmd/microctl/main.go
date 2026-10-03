@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"microdb/internal/store"
+	"microdb/internal/tier"
 )
 
 func main() {
@@ -30,6 +31,8 @@ func main() {
 	until := fs.String("until", "", "recovery point: unix millis or RFC3339 (pitr)")
 	encKey := fs.String("encryption-key", "", "64-hex-char key if the archive is encrypted (pitr)")
 	url := fs.String("url", "http://127.0.0.1:8001", "node base URL (status)")
+	target := fs.String("target", "", "tier target URI: dir:///path or s3://bucket/prefix (tier)")
+	key := fs.String("key", "", "object key to fetch from the tier (tier)")
 	fs.Parse(os.Args[2:])
 
 	switch cmd {
@@ -74,6 +77,52 @@ func main() {
 		fmt.Printf("restored %d docs into %s\n", n, *dir)
 	case "status":
 		printStatus(*url)
+	case "tier":
+		// List or fetch what the cold tier holds. This is the recovery
+		// path for history that compaction archived off the local disk.
+		if *target == "" {
+			fmt.Fprintln(os.Stderr, "tier requires --target <uri> (dir:///path or s3://bucket/prefix)")
+			os.Exit(2)
+		}
+		tgt, err := tier.Open(*target)
+		if err != nil {
+			fatal(err)
+		}
+		if *key == "" {
+			keys, err := tgt.List()
+			if err != nil {
+				fatal(err)
+			}
+			fmt.Printf("tier %s: %d object(s)\n", tgt.Name(), len(keys))
+			for _, k := range keys {
+				fmt.Println("  " + k)
+			}
+			if len(keys) == 0 {
+				return
+			}
+			return
+		}
+		rc, err := tgt.Get(*key)
+		if err != nil {
+			fatal(err)
+		}
+		defer rc.Close()
+		var w io.Writer = os.Stdout
+		if *out != "" {
+			f, err := os.Create(*out)
+			if err != nil {
+				fatal(err)
+			}
+			defer f.Close()
+			w = f
+		}
+		n, err := io.Copy(w, rc)
+		if err != nil {
+			fatal(err)
+		}
+		if *out != "" {
+			fmt.Printf("fetched %s -> %s (%d bytes)\n", *key, *out, n)
+		}
 	case "verify":
 		// Offline integrity scan of the commit log: every record's
 		// CRC32C is checked without loading the store. Exit code 1 if
@@ -203,7 +252,8 @@ func usage() {
 commands:
   backup  --dir <data-dir> --out <file>    snapshot current state to JSONL
   restore --dir <data-dir> --in <file>     apply a JSONL backup (LWW merge)
-  status  --url <node-url>                health + cluster view\n  verify  --dir <data-dir>                check every log record's CRC32C (exit 1 on damage)\n  repair  --url <node-url>                force anti-entropy now: re-fetch anything this node lost
+  status  --url <node-url>                health + cluster view\n  tier     --target <uri> [--key <k> --out <f>]  list/fetch cold-tier archives
+  verify  --dir <data-dir>                check every log record's CRC32C (exit 1 on damage)\n  repair  --url <node-url>                force anti-entropy now: re-fetch anything this node lost
   hints   --url <node-url>                hinted-handoff debt (pending/delivered/dropped)
   decommission --url <node-url>          drain a node: hand off data + broadcast leave`)
 }

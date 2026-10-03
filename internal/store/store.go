@@ -27,20 +27,21 @@ import (
 
 	"microdb/internal/changelog"
 	"microdb/internal/index"
-	"microdb/internal/metrics"
 	"microdb/internal/merkle"
+	"microdb/internal/metrics"
 	"microdb/internal/migrate"
 	"microdb/internal/sharedlog"
 	"microdb/internal/storage"
+	"microdb/internal/tier"
 )
 
 type Doc struct {
-	ID        string                 `json:"id"`
-	Ver       int64                  `json:"ver"`
-	TS        int64                  `json:"ts"` // unix millis
-	Deleted   bool                   `json:"deleted,omitempty"`
-	Collection string                `json:"collection"`
-	Fields    map[string]interface{} `json:"fields"`
+	ID         string                 `json:"id"`
+	Ver        int64                  `json:"ver"`
+	TS         int64                  `json:"ts"` // unix millis
+	Deleted    bool                   `json:"deleted,omitempty"`
+	Collection string                 `json:"collection"`
+	Fields     map[string]interface{} `json:"fields"`
 }
 
 type Store struct {
@@ -54,6 +55,12 @@ type Store struct {
 	// barrier compaction needs.
 	shards [numShards]docShard
 	nDocs  atomic.Int64 // keys in shards, tombstones included
+	// tier is the cold half of storage: when attached, every
+	// compaction archives the raw log there BEFORE the rewrite throws
+	// history away, so local disk tracks the live dataset while PITR
+	// history lives in object storage.
+	tier   *tier.Archiver
+	tiered atomic.Int64 // segments archived since open
 	path   string       // absolute path of the JSONL commit log
 	f      *os.File
 	key    []byte      // encryption-at-rest key (nil = plaintext log)
@@ -378,6 +385,39 @@ func (s *Store) mutateDocs(fn func(k string, d *Doc) bool) {
 func (s *Store) isNew(d *Doc) bool {
 	cur, ok := s.lookup(key(d.Collection, d.ID))
 	return !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS)
+}
+
+// AttachTier wires the cold storage tier: compaction archives the raw
+// log to it before rewriting. A nil target disables tiering (default).
+func (s *Store) AttachTier(a *tier.Archiver) { s.tier = a }
+
+// TierArchives reports how many segments this store has pushed cold
+// since it opened.
+func (s *Store) TierArchives() int64 { return s.tiered.Load() }
+
+// archiveToTier streams the current log file to the cold tier under a
+// timestamped key. Called by Compact while the file is still intact.
+func (s *Store) archiveToTier(path string) error {
+	if s.tier == nil {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("tier archive: %w", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("tier archive: %w", err)
+	}
+	seg, err := s.tier.Put(f, fi.Size())
+	if err != nil {
+		return err
+	}
+	s.tiered.Add(1)
+	atomic.AddInt64(metrics.Default.Counter("microdb_tier_archives_total", "Raw log segments archived to the cold tier"), 1)
+	atomic.AddInt64(metrics.Default.Counter("microdb_tier_bytes_total", "Bytes pushed to the cold tier"), seg.Size)
+	return nil
 }
 
 // SetFsync enables fsync-on-write. With it enabled every Apply/Delete
@@ -1135,6 +1175,15 @@ func (s *Store) Compact(gcWindow time.Duration) (int, error) {
 		return 0, err
 	}
 	oldName := s.f.Name()
+	// Cold tier: preserve history BEFORE the rewrite discards it. If
+	// the tier is unreachable we refuse to compact — the local log is
+	// the only remaining copy of that history, and a compaction that
+	// cannot archive is a compaction that would destroy it.
+	if err := s.archiveToTier(oldName); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return 0, fmt.Errorf("refusing to compact without archiving: %w", err)
+	}
 	// Windows cannot rename over an open handle — close first (lock held,
 	// so no writes can slip through), rename, then reopen for appending.
 	if err := s.f.Close(); err != nil {
@@ -1259,10 +1308,10 @@ const ConfigCollection = "_config"
 
 // CollectionConfig is the per-collection settings doc.
 type CollectionConfig struct {
-	RF            int    `json:"rf,omitempty"`            // 0 = use the node default
+	RF             int    `json:"rf,omitempty"`              // 0 = use the node default
 	PartitionField string `json:"partition_field,omitempty"` // route by this field's value, not doc id
-	SortField     string `json:"sort_field,omitempty"`      // within-partition ordering field
-	MaxDocs     int64  `json:"max_docs,omitempty"`      // live-doc quota for this collection (0 = unlimited)
+	SortField      string `json:"sort_field,omitempty"`      // within-partition ordering field
+	MaxDocs        int64  `json:"max_docs,omitempty"`        // live-doc quota for this collection (0 = unlimited)
 }
 
 // SetCollectionConfig stores per-collection settings. The returned
@@ -1778,7 +1827,7 @@ func cmp(a, b interface{}, pred func(int) bool) bool {
 	switch av := a.(type) {
 	case float64:
 		bv, ok := b.(float64)
-		return ok && pred(int(sign(av - bv)))
+		return ok && pred(int(sign(av-bv)))
 	case string:
 		bv, ok := b.(string)
 		return ok && pred(strings.Compare(av, bv))

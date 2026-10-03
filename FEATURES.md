@@ -106,7 +106,7 @@ Every row below is ☐ — **no claim is made until it is verified.**
 | 4 | F | Sharded store map (kill the global read lock) | 9 | ✅ |
 | 5 | P | End-to-end integrity: checksums + `verify` + `repair` | 9 | ✅ |
 | 6 | F | Streaming log replay + self-healing tail (re-scoped from block/page store) | 9 | ✅ |
-| 7 | S | Tiered storage: hot local + cold object store | 9 | ⬜ |
+| 7 | S | Tiered storage: hot local + cold object store | 9 | ⚠️ |
 | 8 | F | Segment compression | 8 | ⬜ |
 | 9 | F | Bloom filters per segment | 8 | ⬜ |
 | 10 | F | Operator pushdown into the scan | 8 | ⬜ |
@@ -124,7 +124,7 @@ Every row below is ☐ — **no claim is made until it is verified.**
 *(Plus one unplanned blocker the harness forced: making write cost
 independent of data size — shipped with #1.)*
 
-**Progress: 6 / 20 built.**
+**Progress: 7 / 20 built** (6 ✅ + 1 ⚠️).
 
 ### Ground rules for this tier
 
@@ -172,7 +172,7 @@ independent of data size — shipped with #1.)*
 
 | ☐ | Feature | Pri | What it takes |
 |---|---------|-----|---------------|
-| [ ] | **Tiered storage: hot local SSD + cold object store** (C4) | 9 | Bounded hot window on local disk; older segments in S3-compatible storage (stdlib `net/http` against the S3 REST API — no SDK), fetched lazily and cached. Dataset size stops being coupled to cluster disk, IOPS scale independently of history. |
+| [⚠️] | **Tiered storage: hot local + cold object store** (C4) | 9 | ⚠️ shipped **for history** — new `internal/tier`: `Target` interface with `DirTarget` (a NAS/bucket mount) and `S3Target` — S3 REST over `net/http` with **hand-rolled AWS Signature V4, no SDK** (streaming `UNSIGNED-PAYLOAD` PUTs, `list-type=2` with continuation tokens, path-style for MinIO/Ceph via `--endpoint`). `--tier-target dir://…|s3://…` makes **compaction archive the raw log to the cold tier before rewriting**, so local disk tracks the live dataset while PITR history lives off-box — and if the tier is unreachable, **compaction refuses** (the local log is the only copy; `TestCompactRefusesWithoutTier` proves the log is byte-identical after the refusal). `microctl tier --target <uri> [--key --out]` lists/fetches cold objects (live-verified against a dir target). Metrics: `microdb_tier_{archives,bytes}_total`. Tests: 7 (dir round-trip + path-escape rejection, URI parsing, archiver naming, SigV4 shape/scope/signed-header/payload-hash assertions against an in-process S3 stand-in, store archive + refusal). **Caveats:** (a) a live S3 bucket was not available here — the signature is pinned against AWS's specified form, not against AWS's service; (b) evicting *cold documents* out of RAM is **not** shipped — microdb's working set is resident by design, and that belongs to the workload tiering story, not the log |
 | [ ] | **Membership that survives hundreds of nodes** | 8 | Gossip is full-mesh push/pull with every peer every tick — O(N²) traffic. Move to a partial-view protocol (active + passive peer set, random-walk join), batch member lists, and pair-randomized anti-entropy instead of all-pairs so chatter stays O(1) per node. |
 | [ ] | **Topology-aware placement (rack/zone)** | 8 | `--zones` map; replicas prefer distinct failure domains, anti-entropy pairs prefer same-zone. Stops RF=3 landing all replicas on one host or rack — the classic silent availability bug. |
 | [ ] | **Multi-region replication (D6) + causal merge** | 7 | Cross-region log shipping with conflict resolution **beyond LWW**: version vectors per document + explicit resolution hooks, and hybrid logical clocks so "last" is well-defined. LWW across regions silently drops concurrent edits under clock skew. |
