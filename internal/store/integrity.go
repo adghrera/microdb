@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"hash/crc32"
 	"io"
 	"os"
@@ -33,21 +34,35 @@ func checksumHex(body []byte) string {
 // verifyRecord checks a log line's envelope. It returns the payload to
 // decode next and whether the line is intact. Lines without an
 // envelope are legacy records and pass through untouched.
-func verifyRecord(line string) (payload string, ok bool) {
+func verifyRecord(line string) (string, bool) {
 	if !strings.HasPrefix(line, crcPrefix) {
 		return line, true
 	}
+	payload, ok := verifyRecordBytes([]byte(line))
+	if !ok {
+		return line, false
+	}
+	return string(payload), true
+}
+
+// verifyRecordBytes is the streaming replay's form of the check: it
+// slices the read buffer instead of copying it, so verifying a record
+// allocates nothing.
+func verifyRecordBytes(line []byte) ([]byte, bool) {
+	if !bytes.HasPrefix(line, []byte(crcPrefix)) {
+		return line, true
+	}
 	rest := line[len(crcPrefix):]
-	i := strings.IndexByte(rest, ':')
+	i := bytes.IndexByte(rest, ':')
 	if i <= 0 {
 		return line, false // malformed envelope
 	}
 	sumHex, body := rest[:i], rest[i+1:]
-	want, err := strconv.ParseUint(sumHex, 16, 32)
+	want, err := strconv.ParseUint(string(sumHex), 16, 32)
 	if err != nil {
 		return line, false
 	}
-	if uint64(crc32.Checksum([]byte(body), castagnoli)) != want {
+	if uint64(crc32.Checksum(body, castagnoli)) != want {
 		return line, false // bytes on disk are not the bytes we wrote
 	}
 	return body, true

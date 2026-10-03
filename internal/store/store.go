@@ -5,6 +5,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -277,16 +278,42 @@ func shardOf(k string) uint32 {
 	return uint32(maphash.String(shardSeed, k)) & (numShards - 1)
 }
 
-// tailRecord reports whether recs[i] is the last non-empty record in
-// the file — i.e. whether a bad checksum there is a torn final write
-// rather than damage in the middle of the log.
-func tailRecord(recs []string, i int) bool {
-	for j := i + 1; j < len(recs); j++ {
-		if strings.TrimSpace(recs[j]) != "" {
-			return false
+// applyReplayRecord merges one decoded record (single doc or batch)
+// back into the store during log replay, taking the same index
+// shortcuts as the live write path. It works on the caller's read
+// buffer, so replaying copies nothing it does not have to keep.
+func (s *Store) applyReplayRecord(plain []byte) {
+	if bytes.HasPrefix(plain, batchPrefix) {
+		var rec struct {
+			Batch []*Doc `json:"batch"`
+		}
+		if json.Unmarshal(plain, &rec) == nil {
+			for _, d := range rec.Batch {
+				if s.merge(d) {
+					s.idx.For(d.Collection).Upsert(d.ID, indexable(d))
+				}
+			}
+		}
+		return
+	}
+	var d Doc
+	if json.Unmarshal(plain, &d) == nil {
+		if s.merge(&d) {
+			s.idx.For(d.Collection).Upsert(d.ID, indexable(&d))
 		}
 	}
-	return true
+}
+
+var batchPrefix = []byte(`{"batch":`)
+
+// decodeLogLineBytes decrypts an ENC1 record. Plaintext passes through
+// with no copy, so the streaming replay parses directly out of its
+// read buffer.
+func (s *Store) decodeLogLineBytes(line []byte) ([]byte, error) {
+	if bytes.HasPrefix(line, []byte(encPrefix)) {
+		return decryptRecord(s.key, string(line))
+	}
+	return line, nil
 }
 
 // lookup reads one document under a single shard's read lock. It never
@@ -641,74 +668,106 @@ func OpenWithKey(dir, keyHex string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Replay existing log.
-	buf := make([]byte, 0, 1<<20)
-	chunk := make([]byte, 64*1024)
+	// Replay the log by streaming it: one reusable buffer, records
+	// parsed straight out of the bytes that were read. The previous
+	// implementation kept a full copy of the file, then a full string
+	// copy of it, before parsing a single record — 11x the file size
+	// in allocations for a 2MB log (measured by
+	// TestOpenReplayBoundedMemory). Startup cost now tracks the data
+	// that has to stay resident, not the size of the file it came in.
+	br := bufio.NewReaderSize(f, 1<<20)
+	var (
+		corrupt  int64
+		lastGood int64 // end offset of the last COMPLETE record
+		off      int64
+	)
 	for {
-		n, rerr := f.Read(chunk)
-		buf = append(buf, chunk[:n]...)
-		if rerr != nil {
-			break
+		line, rerr := br.ReadSlice('\n')
+		start := off
+		off += int64(len(line))
+		if len(line) == 0 {
+			break // clean EOF (or a read error handled below)
 		}
-	}
-	recs := strings.Split(string(buf), "\n")
-	var corrupt int64
-	for i, raw := range recs {
-		line := strings.TrimSpace(raw)
-		if line == "" {
+		if rerr == bufio.ErrBufferFull {
+			// A single record larger than the read window: it cannot be
+			// a record this node ever wrote, and resynchronising
+			// mid-record would fabricate one. Skip to the next newline.
+			corrupt++
+			for {
+				chunk, e2 := br.ReadSlice('\n')
+				off += int64(len(chunk))
+				if e2 == bufio.ErrBufferFull {
+					continue
+				}
+				if len(chunk) > 0 && chunk[len(chunk)-1] == '\n' {
+					lastGood = off
+				}
+				break
+			}
+			continue
+		}
+		if rerr != nil && rerr != io.EOF {
+			f.Close()
+			return nil, fmt.Errorf("log replay: %w", rerr)
+		}
+		complete := line[len(line)-1] == '\n'
+		rec := line
+		if complete {
+			rec = rec[:len(rec)-1]
+			if len(rec) > 0 && rec[len(rec)-1] == '\r' {
+				rec = rec[:len(rec)-1]
+			}
+		}
+		if len(bytes.TrimSpace(rec)) == 0 {
+			if complete {
+				lastGood = off
+			}
+			if rerr == io.EOF {
+				break
+			}
 			continue
 		}
 		// Integrity first: a record whose CRC does not match is not
-		// data. Damage at EOF is a torn write from a crash and is
-		// tolerated exactly like a partial JSON line; damage anywhere
-		// else is skipped (counted + metered) so one bad sector cannot
-		// brick the node — anti-entropy refills it from peers.
-		payload, intact := verifyRecord(line)
-		if !intact {
-			if !tailRecord(recs, i) {
-				corrupt++
+		// data. Damage in the middle of the log is skipped (counted +
+		// metered) so one bad sector cannot brick the node — anti-
+		// entropy refills it from peers. An incomplete record at EOF is
+		// a torn write from a crash; it is dropped and the file is
+		// truncated back to the last complete record below.
+		payload, intact := verifyRecordBytes(rec)
+		if intact {
+			// Transparently decrypt ENC1 records (error = wrong/missing
+			// key: fail loudly rather than silently dropping data).
+			plain, err := s.decodeLogLineBytes(payload)
+			if err != nil {
+				f.Close()
+				return nil, fmt.Errorf("log replay: %w", err)
 			}
-			continue
+			s.applyReplayRecord(plain)
+		} else if complete {
+			corrupt++
 		}
-		// Transparently decrypt ENC1 records (error = wrong/missing
-		// key: fail loudly rather than silently dropping data).
-		line, err := s.decodeLogLine(payload)
-		if err != nil {
-			f.Close()
-			return nil, fmt.Errorf("log replay: %w", err)
+		if complete {
+			lastGood = off
 		}
-		// Batch records: {"batch":[{doc},{doc},...]}.
-		if strings.HasPrefix(line, `{"batch":`) {
-			var rec struct {
-				Batch []*Doc `json:"batch"`
-			}
-			if json.Unmarshal([]byte(line), &rec) == nil {
-				for _, d := range rec.Batch {
-					if s.merge(d) {
-						s.idx.For(d.Collection).Remove(d.ID)
-						if !d.Deleted {
-							s.idx.For(d.Collection).Add(d.ID, d.Fields)
-						}
-					}
-				}
-			}
-			continue
+		if rerr == io.EOF {
+			break
 		}
-		var d Doc
-		if json.Unmarshal([]byte(line), &d) == nil {
-			if s.merge(&d) {
-				s.idx.For(d.Collection).Remove(d.ID)
-				if !d.Deleted {
-					s.idx.For(d.Collection).Add(d.ID, d.Fields)
-				}
-			}
-		}
+		_ = start
 	}
 	if corrupt > 0 {
 		atomic.AddInt64(metrics.Default.Counter("microdb_corrupt_records_total",
 			"Corrupt log records skipped during replay"), corrupt)
 	}
-	if _, err := f.Seek(0, 2); err != nil {
+	// Self-healing tail: anything after the last complete record is a
+	// partial write from a crash. Drop it so the file starts clean
+	// (and so VerifyLog stops reporting the same torn tail forever).
+	if off > lastGood {
+		if err := f.Truncate(lastGood); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("truncate torn tail: %w", err)
+		}
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -1487,8 +1546,8 @@ func ReplayUntilKey(r io.Reader, until int64, dir, keyHex string) (*Store, int, 
 								if b, err := json.Marshal(d); err == nil {
 									if ln, lerr := s.encodeRecord(b); lerr == nil {
 										bw.Write(ln)
-								}
 									}
+								}
 								applied++
 							}
 						}
@@ -1512,8 +1571,8 @@ func ReplayUntilKey(r io.Reader, until int64, dir, keyHex string) (*Store, int, 
 							if b, err := json.Marshal(d); err == nil {
 								if ln, lerr := s.encodeRecord(b); lerr == nil {
 									bw.Write(ln)
-							}
 								}
+							}
 							applied++
 						}
 					}
