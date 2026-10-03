@@ -32,6 +32,7 @@ import (
 	"microdb/internal/api"
 	"microdb/internal/audit"
 	"microdb/internal/cluster"
+	"microdb/internal/profile"
 	"microdb/internal/secret"
 	"microdb/internal/sharedlog"
 	"microdb/internal/store"
@@ -67,6 +68,9 @@ func main() {
 	archiveDir := flag.String("archive-dir", "", "continuously archive the raw commit log here (PITR)")
 	archiveInterval := flag.Duration("archive-interval", 60*time.Second, "how often to write a raw-log archive (with --archive-dir)")
 	maxInflight := flag.Int64("max-inflight", 0, "shed load with 429 above this many concurrent requests (0 = unlimited)")
+	pprofAddr := flag.String("pprof", "", "serve net/http/pprof on its OWN listener (e.g. 127.0.0.1:6060); empty disables — a pprof endpoint can read process memory, so never put it on the public port")
+	profileDir := flag.String("profile-dir", "", "write cpu/heap profiles here on a timer (keeps the newest 10 of each) — forensics for a p99 regression, taken before the restart")
+	profileInterval := flag.Duration("profile-interval", time.Minute, "how often to snapshot cpu/heap profiles")
 	shutdownTimeout := flag.Duration("shutdown-timeout", 15*time.Second, "how long graceful shutdown waits for in-flight requests before exiting anyway")
 	sloMs := flag.Int64("slo-ms", 500, "latency objective for the SLO gauges on /metrics (milliseconds)")
 	traceSlowMs := flag.Int64("trace-slow-ms", 500, "log requests slower than this with their trace id")
@@ -341,6 +345,21 @@ func main() {
 	}()
 
 	api.SetSLO(*sloMs)
+
+	// Continuous profiling: a pprof listener on its own address (off by
+	// default — it can read process memory) and an optional sampler that
+	// keeps a rolling window of cpu/heap profiles so a latency regression
+	// can be explained with the code that was actually running.
+	if _, bound, err := profile.Start(*pprofAddr); err != nil {
+		log.Fatalf("pprof: %v", err)
+	} else if bound != "" {
+		log.Printf("pprof: http://%s/debug/pprof/ (keep this off the public port)", bound)
+	}
+	if *profileDir != "" {
+		sampler := profile.NewSampler(*profileDir, *profileInterval, 10)
+		go sampler.Run()
+		log.Printf("profiles: cpu/heap every %s into %s (newest 10 kept)", *profileInterval, *profileDir)
+	}
 	handler = api.Tracing(*traceSlowMs, handler) // outermost: every request gets a trace id
 	if tlsOpts != nil {
 		handler = api.RequireInternalTLS(handler)

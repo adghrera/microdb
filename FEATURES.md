@@ -119,12 +119,12 @@ Every row below is ☐ — **no claim is made until it is verified.**
 | 17 | P | Audit log | 8 | ✅ |
 | 18 | P | SLO metrics + error budget | 8 | ✅ |
 | 19 | P | Graceful shutdown that loses nothing | 7 | ✅ |
-| 20 | P | Continuous profiling (`pprof`) | 7 | ⬜ |
+| 20 | P | Continuous profiling (`pprof`) | 7 | ✅ |
 
 *(Plus one unplanned blocker the harness forced: making write cost
 independent of data size — shipped with #1.)*
 
-**Progress: 19 / 20 built** (16 ✅ + 3 ⚠️).
+**Progress: 20 / 20 built** (17 ✅ + 3 ⚠️) — the tier is complete; see the summary at the end of this section.
 
 ### Ground rules for this tier
 
@@ -192,7 +192,7 @@ independent of data size — shipped with #1.)*
 | [⚠️] | **Secrets & key rotation** (⚠️ TLS certs not hot-reloaded) | 8 | ⚠️ shipped — new `internal/secret`: every secret resolves **file → env → flag** (`--auth-token-file`/`--encryption-key-file`, `MICRODB_AUTH_TOKEN`/`MICRODB_ENCRYPTION_KEY`), so values stay off argv (world-readable via `ps`). `RefreshOnce` re-reads on a poll and reports **only what changed**, keeping the last good value when a file vanishes mid-rotation. **Hot reload without a restart:** Go has no portable SIGHUP (it does not exist on Windows), so microdb polls instead — live-verified: start with `--auth-token-file`, swap the file, old token → **401**, new token → accepted, `auth token reloaded` logged, connections never dropped (`api.Token` holder, rotation tested at unit level too, including that a nil token never panics). **Encryption rotation:** records now carry their key identity (`ENC2:<kid>:<base64>`, kid = first 4 bytes of sha256(key) — derived, so it cannot disagree with the file); `--encryption-key-old` (or `MICRODB_ENCRYPTION_KEY_OLD`) keeps retired keys for decryption only, `OpenWithKeyRing` installs them **before replay**, and a record naming a key you no longer have fails the open **with that key id** instead of silently dropping documents. Legacy `ENC1:` records (no id) are still opened by trying every configured key. **Caveats:** TLS cert/key files are still flag-only (not hot-reloaded); reload is a poll, not a signal. 8 tests (4 secret resolution/refresh, 2 token, 2 rotation incl. legacy ENC1) |
 | [x] | **Audit log** | 8 | ✅ shipped — new `internal/audit`: append-only JSONL (`mode 0600`) behind a package-level sink like `metrics.Default`, so disabled it is a boolean check that allocates nothing. `--audit-log <path>` turns it on (rotates at 64MB to `<path>.1`, exactly one generation — an audit log must not fill the disk it protects). **What gets recorded:** mutations (POST/PUT/DELETE on `/api/*`) centrally in `ServeHTTP` with the status they actually ended up with (response wrapper + `defer`, so every early-return path is covered — including a mutation rejected mid-flight), and **every authorization denial**: invalid bearer token (401), unknown tenant token (401), collection outside a tenant's namespace (403). Each record carries ts/kind/action/decision/status/remote/actor/tenant/collection/id/trace — the tenant is resolved from the bearer token for allowed writes, not just for denials. **Reads are deliberately not audited** (they would bury the log); asserted in the test. **Live-verified:** `PUT` → `{"kind":"mutation","decision":"allow","status":200,"collection":"users","id":"alice","actor":"bearer"}`; bad token → `{"kind":"auth","decision":"deny","status":401,"detail":"invalid bearer token"}`; authenticated GET → nothing. 4 tests (disabled no-op, JSONL shape, bounded rotation with both generations still parseable, API-level hooks). **Caveat:** audit writes are not fsynced — a crash can lose the last line |
 | [x] | **SLO metrics + error budget** | 8 | ✅ shipped — the registry grew two metric types it did not have: a real **Prometheus histogram** (`le` buckets cumulative, `+Inf`, `_sum`, `_count`, rendered sorted so scrapes are byte-stable) and **float gauges** (a percentage must not render as `0`). `Tracing` now records RED per request: `microdb_request_duration_ms_<route>` histograms over ten latency buckets (5…5000ms, resolution around the SLO), `microdb_request_errors_total` + per-route `microdb_request_errors_<route>_total` (5xx), and `microdb_requests_over_slo_total` against `--slo-ms` (default 500). Route classes are collapsed (`get_doc`/`put_doc`/`delete_doc`/`query`/`batch`/`watch`/`internal`/`health`/…) so `/metrics` stays bounded while reads, writes and queries chart separately. At scrape time `handleMetrics` derives the numbers alerts should actually watch: **`microdb_slo_violation_pct`** and **`microdb_error_pct`** (fractions of traffic, not raw counts) plus `microdb_slo_ms`. **Tested:** bucket cumulation (5/50/500/5000 → 1/3/4/+Inf, sum 5655), float rendering (`0.4` stays `0.4`), scrape stability, idempotent registration, and an API-level run asserting `over_slo_total 2` of 3 requests with `slo_violation_pct ≈ 66.7`, per-route histograms and `_sum` present. 4 metrics tests + 1 API test |
-| [ ] | **Continuous profiling** | 7 | `--pprof` behind auth (stdlib `net/http/pprof`) plus CPU/heap snapshots on a timer, for post-hoc diagnosis of p99 regressions. |
+| [x] | **Continuous profiling** (`pprof`) | 7 | ✅ shipped — new `internal/profile`, **off by default** (a pprof endpoint can read process memory, so the row's "behind auth" became "on its own listener": `--pprof 127.0.0.1:6060` binds a separate mux with the five stdlib `net/http/pprof` routes and reports the address it actually bound, so it can sit on localhost or a private interface while the API stays public). `--profile-dir` + `--profile-interval` (default 1m) write `heap-<unixms>.pprof` and `cpu-<unixms>.pprof` on a timer — CPU capped at 30s so the sampler cannot fall behind — and `Prune` keeps the newest 10 of each kind, because profiles are for forensics, not for filling a disk. The point is the profile taken *before* the restart, not the one taken after. **Live-verified:** `/debug/pprof/` and `/debug/pprof/goroutine?debug=1` both 200 on the private port while the node served API traffic, with cpu+heap files appearing every second at `--profile-interval 1s`. 4 tests (disabled-by-default + endpoints wired, heap/cpu files non-empty, pruning keeps newest, Run/Stop terminates without hanging) |
 | [x] | **Graceful shutdown that loses nothing** | 7 | ✅ shipped — SIGTERM/Ctrl-C runs a fixed sequence in `cmd/microdb`: **(1)** `cl.SetDraining(true)` flips `/ready` to 503 (load balancers stop sending) while `/health` stays 200 — a deliberate stop must not look like a crash or the supervisor kills us mid-flush; **(2)** wait for in-flight requests, counted by a new `api.Inflight()` maintained in `Tracing`, bounded by `--shutdown-timeout` (default 15s, then it logs and proceeds rather than hanging); **(3)** `store.Close()` drains the log-writer queue, fsyncs and closes the durable feed (the queue-drain was built with group commit); **(4)** `cl.Leave()` — factored out of `Decommission`, so shutdown broadcasts departure **without** the bulk data handoff (replicas already hold it) and peers rebuild their rings now instead of after the 15s TTL; **(5)** exit 0. **During the drain:** reads keep serving clients already connected, new writes get 503 (`node is decommissioning, retry elsewhere`) — a write accepted here would be served by a process closing its log file. Tests: `TestInflightTracksActiveRequests` (counter is 1 exactly while a handler runs, 0 after — shutdown must not wait forever) and `TestGracefulShutdownSequence` (ready 503 / health 200 / read 200 / write 503 / leave evicts the peer immediately). **Caveat:** the signal wiring in `main` is not exercised by a live signal in tests (not portable across platforms) — the sequence itself is what the tests drive |
 | [ ] | **Validated config file + env overrides** | 6 | The flag surface is large enough now that a single config file with env overrides, strict unknown-key rejection, and `microctl config validate` beats a 30-arg command line. |
 | [ ] | **Kubernetes operator manifests** | 6 | StatefulSet + PVC + headless Service + PodDisruptionBudget + probes wired to `/ready`/`/health`, plus a Helm chart. Upgrades docker-compose from demo to deployable. |
@@ -217,6 +217,47 @@ A row flips to ✅ only when **all four** hold:
 | **9** | Scale the coordination layer | S: membership fanout, zone awareness, anti-entropy scheduling, aggregate pushdown | O(N²) gossip/repair chatter is the first wall a real cluster hits |
 | **10** | Cost & geography | S: tiered storage, multi-region, index service, compute autoscale | Cloud economics, once the coordination layer is sound |
 | **11** | Operate it | P: SLOs, pprof, audit, backups, k8s manifests, runbook | The difference between "it runs" and "you can be on call for it" |
+
+## Where this landed — 20 / 20 built
+
+**17 ✅ shipped and verified, 3 ⚠️ shipped with the caveat written on the row**
+(tier storage = history only, backups = no scheduler/retention yet, secrets = TLS
+certs not hot-reloaded). One extra commit fixed a blocker the harness found
+before feature 1 landed.
+
+### Headline numbers (all measured, all from `bench/` or the row's own test)
+
+| Claim | Before | After |
+|-------|--------|-------|
+| Point write (10k-doc collection) | 3,181,897 ns/op | **8,017 ns/op** (397×) |
+| Write past the feed cap (allocations) | 804 KB/write | **1.6 KB/write** |
+| Durable write under concurrency | 897 µs/op serial | **115 µs/op** (7.8×, group commit) |
+| Store log passes for 160 writes | 160 (one per write) | **21** (7.6× batching) |
+| Point reads, 16 threads | 77 ns/op | **47 ns/op** (1.6×) |
+| Startup replay allocations | 13.22× the log | **3.65×** (streaming) |
+| Log size, repetitive payload | 25,140 B | **3,587 B** (86%, `--compress`) |
+| Compound-query miss over 20k docs | 16.5 ms full scan | **321 ns** (bloom, ~51,000×) |
+| 20-row window over 20k matches | 18.0 ms / 761 KB | **9.7 ms / 1.2 KB** (top-K) |
+| Query with a dead peer | ~5 s (client timeout) | **0.26 s** (shared deadline) |
+| Replicas in one AZ, 3 AZs × RF=3 | ~60% of keys | **0 of 500 keys** |
+| Anti-entropy traffic per round | O(N) peers | **3 peers** (`--ae-fanout`) |
+
+### Deliberately re-scoped rather than shipped as written
+
+- **Block/page store → streaming replay.** The working set is resident by
+  design, so a page/mmap store with a key→offset index would buy nothing here;
+  what mattered was bounded startup memory and a self-healing tail.
+- **Bloom "per segment" → scan short-circuit.** There are no disk segments;
+  the filter went where it pays (the compound-query fallback).
+- **"Scheduled" backups → verified backups.** Verification and offsite landed;
+  the scheduler and retention policy did not, and the row says so.
+
+### Genuinely still open (named on their rows, not hidden)
+
+Multi-region replication (D6) · index service (C5) · compute autoscaling (C6) ·
+k8s manifests and a DR runbook (E) · TLS cert hot-reload · backup scheduler and
+retention · partial-view membership and member-list digests · zone-local
+anti-entropy pairing · compression on the replication wire.
 
 > **Known flaky test:** `TestRangeMapHotSpotSplit` (integration) times out
 > waiting for all nodes to converge on the same range plan roughly 1 run in 10
