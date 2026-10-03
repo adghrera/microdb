@@ -14,7 +14,7 @@ func TestRequireAPIAuth(t *testing.T) {
 		w.WriteHeader(200)
 		w.Write([]byte("ok"))
 	})
-	h := api.RequireAPIAuth("s3cret", inner)
+	h := api.RequireAPIAuth(api.NewToken("s3cret"), inner)
 
 	do := func(path, auth string) int {
 		req := httptest.NewRequest("GET", path, nil)
@@ -49,7 +49,7 @@ func TestRequireAPIAuth(t *testing.T) {
 		t.Fatalf("auth middleware should not gate /internal (TLS middleware does), got %d", c)
 	}
 	// Empty token disables auth entirely.
-	open := api.RequireAPIAuth("", inner)
+	open := api.RequireAPIAuth(api.NewToken(""), inner)
 	req := httptest.NewRequest("GET", "/api/collections/x/docs", nil)
 	rec := httptest.NewRecorder()
 	open.ServeHTTP(rec, req)

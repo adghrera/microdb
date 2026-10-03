@@ -537,11 +537,44 @@ func newTraceID() string {
 	return fmt.Sprintf("%x-%x", time.Now().UnixNano(), n)
 }
 
+// Token holds the API bearer token so it can be rotated at runtime.
+// Secrets that only change on restart are secrets operators avoid
+// rotating; the holder lets a reloaded token file take effect on the
+// next request without dropping connections.
+type Token struct {
+	v atomic.Value // string
+}
+
+// NewToken returns a Token seeded with initial ("" = open API).
+func NewToken(initial string) *Token {
+	t := &Token{}
+	t.Set(initial)
+	return t
+}
+
+// Set installs a new token value ("" disables auth).
+func (t *Token) Set(v string) {
+	if t == nil {
+		return
+	}
+	t.v.Store(v)
+}
+
+// Get returns the current token.
+func (t *Token) Get() string {
+	if t == nil {
+		return ""
+	}
+	s, _ := t.v.Load().(string)
+	return s
+}
+
 // RequireAPIAuth protects /api/* with a bearer token (constant-time
 // compared). /health stays open for load balancers. Empty token
 // disables the check entirely.
-func RequireAPIAuth(token string, next http.Handler) http.Handler {
+func RequireAPIAuth(tok *Token, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := tok.Get()
 		if token == "" || !(strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/v1/api/")) {
 			next.ServeHTTP(w, r)
 			return

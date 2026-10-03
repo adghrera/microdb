@@ -29,11 +29,23 @@ import (
 
 	"microdb/internal/api"
 	"microdb/internal/cluster"
+	"microdb/internal/secret"
 	"microdb/internal/sharedlog"
 	"microdb/internal/store"
 	"microdb/internal/tenants"
 	"microdb/internal/tier"
 )
+
+// splitCSV turns a comma-separated list into trimmed, non-empty items.
+func splitCSV(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 func main() {
 	addr := flag.String("addr", ":8001", "listen address")
@@ -46,13 +58,17 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "PEM cert for TLS (enables https)")
 	tlsKey := flag.String("tls-key", "", "PEM key for TLS")
 	tlsCA := flag.String("tls-ca", "", "PEM CA bundle to verify peer certs (mutual TLS)")
-	authToken := flag.String("auth-token", "", "require this bearer token on /api/* (empty = open)")
+	authToken := flag.String("auth-token", "", "require this bearer token on /api/* (empty = open; prefer --auth-token-file, argv is world-readable)")
+	authTokenFile := flag.String("auth-token-file", "", "read the bearer token from a file (env MICRODB_AUTH_TOKEN is the fallback)")
 	rf := flag.Int("rf", 3, "replication factor (ring owners per key)")
 	archiveDir := flag.String("archive-dir", "", "continuously archive the raw commit log here (PITR)")
 	archiveInterval := flag.Duration("archive-interval", 60*time.Second, "how often to write a raw-log archive (with --archive-dir)")
 	maxInflight := flag.Int64("max-inflight", 0, "shed load with 429 above this many concurrent requests (0 = unlimited)")
 	traceSlowMs := flag.Int64("trace-slow-ms", 500, "log requests slower than this with their trace id")
-	encKey := flag.String("encryption-key", "", "64-hex-char (32-byte) AES-256-GCM key for encryption at rest")
+	encKey := flag.String("encryption-key", "", "64-hex-char (32-byte) AES-256-GCM key for encryption at rest (prefer --encryption-key-file)")
+	encKeyFile := flag.String("encryption-key-file", "", "read the encryption key from a file (env MICRODB_ENCRYPTION_KEY is the fallback)")
+	encKeyOld := flag.String("encryption-key-old", "", "comma-separated retired keys still needed to decrypt older records (rotation; env MICRODB_ENCRYPTION_KEY_OLD)")
+	secretRefresh := flag.Duration("secret-refresh", 5*time.Second, "how often to re-read secret files so rotation needs no restart (0 disables)")
 	aeFanout := flag.Int("ae-fanout", 3, "peers contacted per anti-entropy round (bounds repair traffic as the cluster grows)")
 	zone := flag.String("zone", "", "failure domain this node lives in (rack/AZ); gossiped so replicas spread across zones")
 	clusterName := flag.String("cluster-name", "", "cluster identity guard: nodes only join peers with the same name")
@@ -71,7 +87,17 @@ func main() {
 		log.SetOutput(&jsonLogWriter{w: os.Stderr})
 	}
 
-	st, err := store.OpenWithKey(*dir, *encKey)
+	// Secrets resolve file -> env -> flag, so a rotation does not need
+	// the value on the command line (argv is world-readable via ps).
+	keyVal, err := secret.Source{Flag: *encKey, File: *encKeyFile, Env: "MICRODB_ENCRYPTION_KEY"}.Get()
+	if err != nil {
+		log.Fatalf("encryption key: %v", err)
+	}
+	oldKeys := splitCSV(*encKeyOld)
+	if envOld := splitCSV(os.Getenv("MICRODB_ENCRYPTION_KEY_OLD")); len(envOld) > 0 {
+		oldKeys = append(oldKeys, envOld...)
+	}
+	st, err := store.OpenWithKeyRing(*dir, keyVal, oldKeys)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
@@ -196,7 +222,53 @@ func main() {
 
 	log.Printf("microdb node %s listening on %s (data: %s, tls=%v, rf=%d)", self, *addr, *dir, tlsOpts != nil, *rf)
 	var handler http.Handler = srv
-	handler = api.RequireAPIAuth(*authToken, handler)
+	tokVal, err := secret.Source{Flag: *authToken, File: *authTokenFile, Env: "MICRODB_AUTH_TOKEN"}.Get()
+	if err != nil {
+		log.Fatalf("auth token: %v", err)
+	}
+	tok := api.NewToken(tokVal)
+	handler = api.RequireAPIAuth(tok, handler)
+	// Hot reload: Go has no portable SIGHUP (it does not exist on
+	// Windows), so secrets are re-read on a short poll instead. Only
+	// files are watched — a value passed as a flag is not going to
+	// change under us.
+	watch := map[string]secret.Source{}
+	if *authTokenFile != "" {
+		watch["auth-token"] = secret.Source{File: *authTokenFile, Env: "MICRODB_AUTH_TOKEN"}
+	}
+	if *encKeyFile != "" {
+		watch["encryption-key"] = secret.Source{File: *encKeyFile, Env: "MICRODB_ENCRYPTION_KEY"}
+	}
+	if len(watch) > 0 && *secretRefresh > 0 {
+		last := secret.Snapshot{}
+		secret.RefreshOnce(watch, last)
+		secret.Apply(map[string]string{"auth-token": tokVal, "encryption-key": keyVal}, last)
+		go func() {
+			t := time.NewTicker(*secretRefresh)
+			defer t.Stop()
+			for range t.C {
+				changed, err := secret.RefreshOnce(watch, last)
+				if err != nil {
+					log.Printf("secret reload: %v (keeping previous values)", err)
+					continue
+				}
+				for name, v := range changed {
+					switch name {
+					case "auth-token":
+						tok.Set(v)
+						log.Printf("auth token reloaded from file")
+					case "encryption-key":
+						if err := st.SetEncryptionKey(v); err != nil {
+							log.Printf("encryption key reload rejected: %v (keeping previous)", err)
+						} else {
+							log.Printf("encryption key rotated: new records use the new key")
+						}
+					}
+				}
+				secret.Apply(changed, last)
+			}
+		}()
+	}
 	if *idemTTL > 0 {
 		srv.SetIdempotencyTTL(*idemTTL)
 	}

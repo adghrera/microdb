@@ -36,8 +36,13 @@ func TestEncryptionRoundTrip(t *testing.T) {
 	if !intact {
 		t.Fatalf("first log record failed its checksum: %.60s", firstLine)
 	}
-	if !strings.HasPrefix(payload, encPrefix) {
-		t.Fatalf("log records not in ENC1 form: %.60s", payload)
+	// New records carry the key id (ENC2:<kid>:<b64>) so rotation can
+	// look the key up instead of guessing.
+	if !strings.HasPrefix(payload, encPrefixV2) {
+		t.Fatalf("log records not in ENC2 form: %.60s", payload)
+	}
+	if kid := strings.TrimSuffix(strings.SplitN(payload[len(encPrefixV2):], ":", 2)[0], ":"); kid != keyIDOf(mustKey(t, testKey)) {
+		t.Errorf("record key id = %q, want %q", kid, keyIDOf(mustKey(t, testKey)))
 	}
 
 	// Reopen with the right key: full state recovered.
@@ -102,7 +107,7 @@ func TestEncryptionMixedLog(t *testing.T) {
 	if !strings.Contains(text, "plain-era") {
 		t.Fatal("old plaintext record vanished")
 	}
-	if !strings.Contains(text, encPrefix) {
+	if !strings.Contains(text, encPrefixV2) {
 		t.Fatal("new record not encrypted")
 	}
 	// Reopen with key: both eras readable.
@@ -209,4 +214,13 @@ func TestEncryptedBackupRestore(t *testing.T) {
 		t.Fatalf("restored wrong: %v", d)
 	}
 	_ = json.Marshal
+}
+
+func mustKey(t *testing.T, hexKey string) []byte {
+	t.Helper()
+	k, err := decodeHexKey(hexKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
 }

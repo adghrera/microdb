@@ -10,7 +10,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
@@ -68,8 +70,10 @@ type Store struct {
 	compress atomic.Bool
 	path     string // absolute path of the JSONL commit log
 	f        *os.File
-	key      []byte      // encryption-at-rest key (nil = plaintext log)
-	fsync    atomic.Bool // sync to disk on every write (durability over throughput)
+	key      []byte            // encryption-at-rest primary key (nil = plaintext log)
+	keyID    string            // stable id derived from key, stamped on records
+	prevKeys map[string][]byte // retired keys, decryption only
+	fsync    atomic.Bool       // sync to disk on every write (durability over throughput)
 	// lw owns every append to the commit log: it batches records that
 	// arrive together into one write and one fsync (group commit), then
 	// releases the waiters (see commit.go).
@@ -323,8 +327,8 @@ var batchPrefix = []byte(`{"batch":`)
 // read buffer.
 func (s *Store) decodeLogLineBytes(line []byte) ([]byte, error) {
 	out := line
-	if bytes.HasPrefix(out, []byte(encPrefix)) {
-		plain, err := decryptRecord(s.key, string(out))
+	if bytes.HasPrefix(out, []byte(encPrefix)) || bytes.HasPrefix(out, []byte(encPrefixV2)) {
+		plain, err := s.decryptLine(string(out))
 		if err != nil {
 			return nil, err
 		}
@@ -575,7 +579,104 @@ func indexable(d *Doc) map[string]interface{} {
 // NEW records going forward (a rewrite happens naturally on the next
 // compaction). A key is 32 bytes, hex-encoded (64 hex chars).
 
-const encPrefix = "ENC1:"
+const (
+	// encPrefix is the legacy record envelope: AES-256-GCM with no key
+	// identity, so opening it means trying every configured key.
+	encPrefix = "ENC1:"
+	// encPrefixV2 carries the key id: ENC2:<kid>:<base64>. Rotation
+	// then costs a lookup instead of a guess, and an operator who
+	// forgot to pass the old key is told WHICH key is missing.
+	encPrefixV2 = "ENC2:"
+)
+
+// keyIDOf derives a record's key identity from the key material
+// itself: stable across restarts, no operator bookkeeping, and it
+// cannot disagree with what is in the file.
+func keyIDOf(key []byte) string {
+	sum := sha256.Sum256(key)
+	return hex.EncodeToString(sum[:4])
+}
+
+// AddPreviousKey keeps a retired key usable for decryption after the
+// primary has rotated. It is never used to encrypt new records.
+func (s *Store) AddPreviousKey(keyHex string) error {
+	k, err := decodeHexKey(keyHex)
+	if err != nil {
+		return err
+	}
+	if s.prevKeys == nil {
+		s.prevKeys = map[string][]byte{}
+	}
+	id := keyIDOf(k)
+	if id == s.keyID {
+		return nil // already the primary
+	}
+	s.prevKeys[id] = k
+	return nil
+}
+
+// PreviousKeyIDs lists retired keys still configured (diagnostics).
+func (s *Store) PreviousKeyIDs() []string {
+	out := make([]string, 0, len(s.prevKeys))
+	for id := range s.prevKeys {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// keyFor resolves a record's key id.
+func (s *Store) keyFor(id string) []byte {
+	if id == s.keyID && s.key != nil {
+		return s.key
+	}
+	return s.prevKeys[id]
+}
+
+// allKeys returns every key that may decrypt a legacy (ENC1) record.
+func (s *Store) allKeys() [][]byte {
+	out := make([][]byte, 0, len(s.prevKeys)+1)
+	if s.key != nil {
+		out = append(out, s.key)
+	}
+	for _, k := range s.prevKeys {
+		out = append(out, k)
+	}
+	return out
+}
+
+// decryptLine opens an ENC2 or legacy ENC1 record with the key ring.
+// Plaintext passes through untouched.
+func (s *Store) decryptLine(line string) ([]byte, error) {
+	switch {
+	case strings.HasPrefix(line, encPrefixV2):
+		rest := line[len(encPrefixV2):]
+		i := strings.IndexByte(rest, ':')
+		if i < 0 {
+			return nil, fmt.Errorf("malformed %s record (missing key id)", encPrefixV2)
+		}
+		kid, body := rest[:i], rest[i+1:]
+		key := s.keyFor(kid)
+		if key == nil {
+			return nil, fmt.Errorf("record is encrypted with key id %s, which is not configured — add it with --encryption-key-old", kid)
+		}
+		return decryptRecord(key, body)
+	case strings.HasPrefix(line, encPrefix):
+		// Legacy records carry no key id: try every configured key.
+		tried := 0
+		for _, k := range s.allKeys() {
+			tried++
+			if out, err := decryptRecord(k, line); err == nil {
+				return out, nil
+			}
+		}
+		if tried == 0 {
+			return nil, fmt.Errorf("log record is encrypted but no key configured")
+		}
+		return nil, fmt.Errorf("decrypt failed with all %d configured keys", tried)
+	}
+	return []byte(line), nil
+}
 
 // SetEncryptionKey enables encryption-at-rest for all future log
 // records. keyHex is 64 hex characters (32 bytes). Must be called
@@ -586,6 +687,7 @@ func (s *Store) SetEncryptionKey(keyHex string) error {
 		return err
 	}
 	s.key = k
+	s.keyID = keyIDOf(k)
 	return nil
 }
 
@@ -680,11 +782,12 @@ func (s *Store) encodeRecord(plain []byte) ([]byte, error) {
 		}
 	}
 	if s.key != nil {
-		enc, err := encryptRecord(s.key, plain)
+		body, err := encryptRecord(s.key, plain)
 		if err != nil {
 			return nil, err
 		}
-		payload = enc
+		// Stamp the key id so rotation is a lookup, not a guess.
+		payload = []byte(encPrefixV2 + s.keyID + ":" + string(body[len(encPrefix):]))
 	}
 	out := make([]byte, 0, len(payload)+24)
 	out = append(out, crcPrefix...)
@@ -698,8 +801,8 @@ func (s *Store) encodeRecord(plain []byte) ([]byte, error) {
 // decodeLogLine turns one raw log line into plaintext JSON,
 // transparently decrypting ENC1 records.
 func (s *Store) decodeLogLine(line string) (string, error) {
-	if strings.HasPrefix(line, encPrefix) {
-		plain, err := decryptRecord(s.key, line)
+	if strings.HasPrefix(line, encPrefix) || strings.HasPrefix(line, encPrefixV2) {
+		plain, err := s.decryptLine(line)
 		if err != nil {
 			return "", err
 		}
@@ -721,6 +824,14 @@ func Open(dir string) (*Store, error) {
 // (64 hex chars) is installed BEFORE the log replay so encrypted
 // records can be read back. Empty keyHex = plaintext store.
 func OpenWithKey(dir, keyHex string) (*Store, error) {
+	return OpenWithKeyRing(dir, keyHex, nil)
+}
+
+// OpenWithKeyRing opens a store with a primary key plus the retired
+// keys still needed to decrypt older records. Every key must be
+// installed BEFORE replay — a record naming a key we do not have fails
+// the open rather than silently dropping that document.
+func OpenWithKeyRing(dir, keyHex string, previous []string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -731,6 +842,14 @@ func OpenWithKey(dir, keyHex string) (*Store, error) {
 	}
 	if keyHex != "" {
 		if err := s.SetEncryptionKey(keyHex); err != nil {
+			return nil, err
+		}
+	}
+	for _, p := range previous {
+		if p == "" {
+			continue
+		}
+		if err := s.AddPreviousKey(p); err != nil {
 			return nil, err
 		}
 	}
