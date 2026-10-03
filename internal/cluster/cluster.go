@@ -226,16 +226,28 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 // gossip from the next round on. Empty means "no topology" (default).
 func (c *Cluster) SetZone(z string) {
 	c.mu.Lock()
+	changed := c.zone != z
 	c.zone = z
 	c.mu.Unlock()
+	// The placement ring reads the zone map (self included), so changing
+	// our own zone is a placement change: rebuild now rather than waiting
+	// for the next membership event, which in a stable cluster may never
+	// come. No-op before the server wires OnPeersChanged (startup).
+	if changed && c.OnPeersChanged != nil {
+		c.OnPeersChanged(c.Peers())
+	}
 }
 
 // SetRegion records this node's region (the domain above a zone) and
 // makes it visible to gossip from the next round on.
 func (c *Cluster) SetRegion(r string) {
 	c.mu.Lock()
+	changed := c.region != r
 	c.region = r
 	c.mu.Unlock()
+	if changed && c.OnPeersChanged != nil {
+		c.OnPeersChanged(c.Peers())
+	}
 }
 
 // Region returns this node's configured region.
@@ -528,6 +540,33 @@ func (c *Cluster) seenAt(addr string, at time.Time) bool {
 		c.epoch++
 	}
 	return !had
+}
+
+// applyGossipedMeta records a peer's load and failure domains from a
+// gossip payload, reporting whether a failure domain actually CHANGED.
+// A zone or region arriving for a member we already knew is a placement
+// change even though membership did not move: the ring is built from the
+// zone/region maps, so until it is rebuilt a key can still stack two
+// replicas in one failure domain — exactly the failure zone-aware
+// placement exists to prevent. Membership churn bumps the epoch and
+// rebuilds anyway; a zone that merely *lands* after the cluster settled
+// did not, which is the bug this closes.
+func (c *Cluster) applyGossipedMeta(m Member) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if m.Load != 0 {
+		c.loads[m.Addr] = m.Load
+	}
+	changed := false
+	if m.Zone != "" && c.zones[m.Addr] != m.Zone {
+		c.zones[m.Addr] = m.Zone
+		changed = true
+	}
+	if m.Region != "" && c.regions[m.Addr] != m.Region {
+		c.regions[m.Addr] = m.Region
+		changed = true
+	}
+	return changed
 }
 
 // mergeMember folds one gossiped member in.
@@ -1062,17 +1101,9 @@ func (c *Cluster) gossipRound() {
 		if m.Addr == c.self {
 			continue
 		}
-		c.mu.Lock()
-		if m.Load != 0 {
-			c.loads[m.Addr] = m.Load
+		if c.applyGossipedMeta(m) {
+			changed = true
 		}
-		if m.Zone != "" {
-			c.zones[m.Addr] = m.Zone
-		}
-		if m.Region != "" {
-			c.regions[m.Addr] = m.Region
-		}
-		c.mu.Unlock()
 		// mergeMember, NOT seen(): relayed addresses must carry their
 		// original last-direct-contact time or every gossip round would
 		// re-validate dead members forever and the ring would keep
@@ -1651,7 +1682,7 @@ func (c *Cluster) HandleGossip(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&in)
 	c.mu.Lock()
-	c.adoptEpochLocked(in.Epoch)
+	epochChanged := c.adoptEpochLocked(in.Epoch)
 	for a, ms := range in.Left {
 		t := time.UnixMilli(ms)
 		if cur, ok := c.left[a]; !ok || t.After(cur) {
@@ -1659,23 +1690,24 @@ func (c *Cluster) HandleGossip(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	c.mu.Unlock()
+	changed := epochChanged
 	now := time.Now().UnixMilli()
 	for _, m := range in.Members {
 		if m.Addr == c.self {
 			continue
 		}
-		c.mu.Lock()
-		if m.Load != 0 {
-			c.loads[m.Addr] = m.Load
+		if c.applyGossipedMeta(m) {
+			changed = true
 		}
-		if m.Zone != "" {
-			c.zones[m.Addr] = m.Zone
+		if c.mergeMember(m, now) {
+			changed = true
 		}
-		if m.Region != "" {
-			c.regions[m.Addr] = m.Region
-		}
-		c.mu.Unlock()
-		c.mergeMember(m, now)
+	}
+	// The responder must rebuild too: a node that only ever receives
+	// gossip (never initiates a round) still has to fold a newly-learned
+	// zone into its ring, or its own placement stays wrong.
+	if changed && c.OnPeersChanged != nil {
+		c.OnPeersChanged(c.Peers())
 	}
 	writeJSON(w, 200, map[string]interface{}{"members": c.memberList(), "epoch": c.Epoch()})
 }

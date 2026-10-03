@@ -199,8 +199,31 @@ func (r *Ring) Owners(key string, n int) []string {
 }
 
 // hasZones / hasRegions report whether the topology carries that level.
-func (t Topology) hasZones() bool   { return len(t.Zones) > 0 }
-func (t Topology) hasRegions() bool { return len(t.Regions) > 0 }
+// hasZones reports whether any node has a non-empty zone. The topology
+// maps always carry an entry per known node (including self, whose zone
+// may be unset), so emptiness is decided by the VALUES, never the map
+// length — otherwise an all-empty zone map would wrongly activate the
+// zone pass and, with it, the region pass that suppresses zone
+// diversity in the first pass.
+func (t Topology) hasZones() bool {
+	for _, z := range t.Zones {
+		if z != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasRegions reports whether any node has a non-empty region (the same
+// value-based rule as hasZones).
+func (t Topology) hasRegions() bool {
+	for _, r := range t.Regions {
+		if r != "" {
+			return true
+		}
+	}
+	return false
+}
 
 // zoneOf / regionOf return a node's failure domain ("" when unknown).
 func (t Topology) zoneOf(node string) string {

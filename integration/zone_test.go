@@ -104,6 +104,62 @@ func TestZoneAwarePlacement(t *testing.T) {
 	}
 }
 
+// TestZoneAwarePlacementLateTopologyRebuild is the regression test for
+// the ring only rebuilding on membership changes. Here the cluster
+// settles with NO zones known, and only then are the zones assigned — so
+// no join, eviction, or epoch bump ever fires after the topology is
+// complete. Before the fix a node that learned a peer's zone purely by
+// gossip stored it but never rebuilt, so its placement kept stacking
+// replicas in one zone forever; the fix rebuilds when a failure-domain
+// VALUE changes, not only when the member set moves.
+func TestZoneAwarePlacementLateTopologyRebuild(t *testing.T) {
+	const rf = 2
+	// Start un-zoned: the ring forms with no failure-domain data at all.
+	n0 := startNodeRF(t, t.TempDir()+"/n0", rf)
+	n1 := startNodeRF(t, t.TempDir()+"/n1", rf)
+	n2 := startNodeRF(t, t.TempDir()+"/n2", rf)
+	n3 := startNodeRF(t, t.TempDir()+"/n3", rf)
+	for _, j := range []struct {
+		n    *node
+		seed string
+	}{{n1, n0.addr}, {n2, n1.addr}, {n3, n2.addr}} {
+		if err := j.n.cl.Join(j.seed); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}
+	eventually(t, 15*time.Second, func() bool {
+		return len(n0.cl.Peers()) == 3
+	}, "four-node cluster formed with no zones")
+
+	// NOW assign the failure domains. Setting a zone rebuilds the local
+	// ring; the peers must pick it up by gossip and rebuild theirs with no
+	// further membership change.
+	n0.cl.SetZone("az-a")
+	n1.cl.SetZone("az-a")
+	n2.cl.SetZone("az-b")
+	n3.cl.SetZone("az-b")
+
+	eventually(t, 15*time.Second, func() bool {
+		z := zonesOf(t, n0.addr)
+		return z[n0.addr] == "az-a" && z[n1.addr] == "az-a" &&
+			z[n2.addr] == "az-b" && z[n3.addr] == "az-b"
+	}, "n0 learned every peer's zone by gossip")
+
+	eventually(t, 10*time.Second, func() bool {
+		z := zonesOf(t, n0.addr)
+		for i := 0; i < 40; i++ {
+			owners := ownersOf(t, n0.addr, "z", fmt.Sprintf("k%02d", i))
+			if len(owners) != rf {
+				return false
+			}
+			if z[owners[0]] == z[owners[1]] {
+				return false // both replicas in one zone: ring is stale
+			}
+		}
+		return true
+	}, "ring rebuilt to span zones after late topology")
+}
+
 // TestZoneIsGossipedAndReported: an operator must be able to see the
 // topology the ring is using.
 func TestZoneIsGossipedAndReported(t *testing.T) {
