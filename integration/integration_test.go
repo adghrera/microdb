@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -42,6 +43,7 @@ func startNodeRF(t *testing.T, dir string, rf int) *node {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cl.SetSeedFile(filepath.Join(dir, "seeds.json"))
 	apiSrv := api.NewWithRF(addr, st, cl, rf)
 	cl.Start()
 	httpSrv := &http.Server{Handler: apiSrv}

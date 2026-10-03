@@ -181,6 +181,18 @@ type Cluster struct {
 	selfLoad   atomic.Uint64 // float64 bits
 	// OnPeersChanged is called with the live peer list whenever membership changes.
 	OnPeersChanged func(addrs []string)
+	// seedFile is where the addresses of peers we have successfully
+	// contacted are remembered, so a node that restarts (or loses its
+	// entire view to a split) can find the cluster again. seeds is the
+	// in-memory set; seedsDirty/lastSave throttle its atomic write.
+	seedFile   string
+	seeds      map[string]struct{}
+	seedsDirty bool
+	lastSave   time.Time
+	// lastReconnect throttles reconnection probes so a node whose
+	// seeds have all gone long dead costs one probe per interval, not
+	// a storm per gossip tick.
+	lastReconnect time.Time
 }
 
 func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
@@ -202,6 +214,7 @@ func New(self string, st *store.Store, tlsOpts *TLSOptions) (*Cluster, error) {
 		regions:       map[string]string{},
 		ae:            &aeSchedule{},
 		aeFanout:      defaultAEFanout,
+		seeds:         map[string]struct{}{},
 		st:            st,
 		client:        &http.Client{Timeout: 30 * time.Second},
 		stop:          make(chan struct{}),
@@ -459,6 +472,10 @@ func (c *Cluster) Join(seed string) error {
 	// tombstone for it so a restarted node is accepted cluster-wide
 	// once the seed propagates our presence.
 	c.ClearLeave(c.self)
+	// Remember the seed as a reconnection target: if this node later
+	// loses its whole view, this is an address it can still reach out
+	// to (unless that node dies too).
+	c.noteSeed(seed)
 	resp, err := c.post(seed+"/internal/join", []byte(`{"addr":"`+c.self+`"}`))
 	if err != nil {
 		return err
@@ -1024,7 +1041,12 @@ func (c *Cluster) fetchMerkleLeaves(peer, col string) ([]merkle.Leaf, error) {
 	return out.Leaves, err
 }
 
-func (c *Cluster) Stop() { c.stopOnce.Do(func() { close(c.stop) }) }
+func (c *Cluster) Stop() {
+	c.stopOnce.Do(func() {
+		c.maybeSaveSeeds(true) // persist reconnection targets before exit
+		close(c.stop)
+	})
+}
 
 func (c *Cluster) gossipRound() {
 	c.updateSelfLoad()
@@ -1036,15 +1058,65 @@ func (c *Cluster) gossipRound() {
 	if c.OnPeersChanged != nil {
 		c.OnPeersChanged(c.Peers())
 	}
+	c.maybeSaveSeeds(false)
 	peers := c.Peers()
 	if len(peers) == 0 {
+		// An empty view is a dead end for epidemic gossip: we only ever
+		// push addresses we already hold, so with nothing held there is
+		// no one to push to and the node is orphaned forever. Re-probe
+		// a historical peer instead — that is what lets a node heal
+		// after its whole mesh died, or after the cluster split into
+		// islands that no single surviving node bridged.
+		c.reconnect()
 		return
 	}
-	peer := peers[rand.Intn(len(peers))]
-	if c.isIncompatible(peer) {
-		return // known to speak an out-of-window wire version
+	c.gossipTo(peers[rand.Intn(len(peers))])
+}
+
+// reconnect re-enters the cluster by gossiping to a remembered peer,
+// trying candidates until one answers. Only runs when this node holds
+// no live peer at all, so a healthy cluster pays nothing for it.
+func (c *Cluster) reconnect() {
+	if time.Since(c.lastReconnect) < seedRetryInterval {
+		return
 	}
-	changed := false
+	c.lastReconnect = time.Now()
+	for _, seed := range c.seedCandidates() {
+		if c.gossipTo(seed) {
+			return
+		}
+	}
+}
+
+// seedCandidates returns remembered peers that are not currently live,
+// so a reconnection attempt always targets an address this node would
+// otherwise never contact again.
+func (c *Cluster) seedCandidates() []string {
+	c.mu.RLock()
+	live := make(map[string]bool, len(c.peers))
+	for a := range c.peers {
+		live[a] = true
+	}
+	out := make([]string, 0, len(c.seeds))
+	for a := range c.seeds {
+		if a == c.self || live[a] {
+			continue
+		}
+		if t, ok := c.left[a]; ok && time.Since(t) < 30*time.Second {
+			continue // gracefully departed: reconnect must not resurrect it
+		}
+		out = append(out, a)
+	}
+	c.mu.RUnlock()
+	return out
+}
+
+// gossipTo pushes our view to one peer and folds theirs in, reporting
+// whether the peer answered a complete round (200 OK).
+func (c *Cluster) gossipTo(peer string) bool {
+	if c.isIncompatible(peer) {
+		return false // known to speak an out-of-window wire version
+	}
 	// Push our view + epoch + departure tombstones, pull theirs.
 	members := c.memberList()
 	c.mu.RLock()
@@ -1056,14 +1128,14 @@ func (c *Cluster) gossipRound() {
 	body, _ := json.Marshal(map[string]interface{}{"addr": c.self, "members": members, "epoch": c.Epoch(), "left": left})
 	resp, err := c.post(peer+"/internal/gossip", body)
 	if err != nil {
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	// 505 = the peer refused our wire version (or advertised one we
 	// cannot read). The transport has already recorded it; stop here so
 	// its payload can never be merged into our membership view.
-	if resp.StatusCode == 505 || resp.StatusCode != http.StatusOK {
-		return
+	if resp.StatusCode != http.StatusOK {
+		return false
 	}
 	// The peer answered our gossip — it is alive NOW. Stamp the direct
 	// contact here, not before the attempt: a peer we happen to select
@@ -1072,16 +1144,15 @@ func (c *Cluster) gossipRound() {
 	// never evict a node that died without a graceful leave. Liveness of
 	// a live-but-slow peer is still carried by its own self-stamped
 	// LastSeen, relayed unchanged, so this cannot falsely evict it.
-	if c.seen(peer) {
-		changed = true
-	}
+	changed := c.seen(peer)
+	c.noteSeed(peer)
 	var out struct {
 		Members []Member         `json:"members"`
 		Epoch   int64            `json:"epoch"`
 		Left    map[string]int64 `json:"left"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&out) != nil {
-		return
+		return true
 	}
 	// Merge departure tombstones (keep the latest timestamp per addr)
 	// so the whole cluster refuses to resurrect a gracefully-departed
@@ -1122,6 +1193,103 @@ func (c *Cluster) gossipRound() {
 	if changed && c.OnPeersChanged != nil {
 		c.OnPeersChanged(c.Peers())
 	}
+	return true
+}
+
+const (
+	// seedRetryInterval throttles reconnection probes so a node whose
+	// remembered peers have all died long ago costs one probe per
+	// interval, not a storm of failed requests every gossip tick.
+	seedRetryInterval = 5 * time.Second
+	// maxSeeds bounds the remembered-peer set so a long-lived cluster
+	// does not grow an unbounded address list on disk.
+	maxSeeds = 256
+	// seedSaveInterval throttles the atomic seed-file write.
+	seedSaveInterval = 2 * time.Second
+)
+
+// SetSeedFile points the cluster at a file where it remembers the peer
+// addresses it has contacted, and loads any it already recorded. A node
+// that restarts into an empty view can then find the cluster by
+// reconnection instead of waiting for someone to join it.
+func (c *Cluster) SetSeedFile(path string) {
+	c.mu.Lock()
+	c.seedFile = path
+	c.mu.Unlock()
+	c.loadSeeds()
+	c.maybeSaveSeeds(true)
+}
+
+func (c *Cluster) loadSeeds() {
+	c.mu.RLock()
+	path := c.seedFile
+	c.mu.RUnlock()
+	if path == "" {
+		return
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var list []string
+	if json.Unmarshal(b, &list) != nil {
+		return
+	}
+	c.mu.Lock()
+	for _, a := range list {
+		if a != c.self && a != "" {
+			c.seeds[a] = struct{}{}
+		}
+	}
+	c.mu.Unlock()
+}
+
+// noteSeed remembers a peer we successfully reached, so it can be a
+// reconnection target later. Bounded by maxSeeds.
+func (c *Cluster) noteSeed(addr string) {
+	if addr == "" || addr == c.self {
+		return
+	}
+	c.mu.Lock()
+	if _, ok := c.seeds[addr]; !ok {
+		if len(c.seeds) >= maxSeeds {
+			for a := range c.seeds { // evict an old entry to make room
+				delete(c.seeds, a)
+				break
+			}
+		}
+		c.seeds[addr] = struct{}{}
+		c.seedsDirty = true
+	}
+	c.mu.Unlock()
+}
+
+// maybeSaveSeeds persists the seed set atomically (temp + rename), and
+// only when it changed and the throttle allows it.
+func (c *Cluster) maybeSaveSeeds(force bool) {
+	c.mu.Lock()
+	if !c.seedsDirty || c.seedFile == "" || (!force && time.Since(c.lastSave) < seedSaveInterval) {
+		c.mu.Unlock()
+		return
+	}
+	list := make([]string, 0, len(c.seeds))
+	for a := range c.seeds {
+		list = append(list, a)
+	}
+	path := c.seedFile
+	c.seedsDirty = false
+	c.lastSave = time.Now()
+	c.mu.Unlock()
+
+	b, err := json.Marshal(list)
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, b, 0o644) != nil {
+		return
+	}
+	os.Rename(tmp, path)
 }
 
 func (c *Cluster) memberList() []Member {

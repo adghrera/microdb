@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -17,12 +18,16 @@ import (
 // port) with hinted handoff enabled from dir.
 func startNodeAt(t *testing.T, addr, dir string, rf int, withHints bool) *node {
 	t.Helper()
-	if addr == "" {
-		addr = "127.0.0.1:0"
-	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatal(err)
+		// The requested fixed address is still held (a lingering socket
+		// from the process we just killed). Fall back to an ephemeral
+		// port so a restart is never blocked — the caller only needs a
+		// live node, and gossip will rediscover it by address.
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	url := "http://" + ln.Addr().String()
 	st, err := store.Open(dir)
@@ -33,6 +38,7 @@ func startNodeAt(t *testing.T, addr, dir string, rf int, withHints bool) *node {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cl.SetSeedFile(filepath.Join(dir, "seeds.json"))
 	if withHints {
 		if err := cl.EnableHints(dir); err != nil {
 			t.Fatal(err)

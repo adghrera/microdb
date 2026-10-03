@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -158,13 +159,20 @@ func TestSoakKillRestart(t *testing.T) {
 			victim.alive = false
 			kills++
 		case rnd.Intn(7) == 0:
-			// Restart a killed node on the same data directory: it must
-			// bootstrap, rejoin and re-converge.
+			// Restart a killed node on the SAME data directory AND the
+			// same address it had before: a real restart comes back on
+			// its own endpoint (a pod keeps its port), and that is what
+			// lets gossip heal — every survivor still holds that address
+			// in its member list, so the node is rediscovered the moment
+			// it answers again. Restarting on a fresh random port instead
+			// strands the node on an island: no survivor knows its new
+			// address, and it knows none of theirs either.
 			for _, s := range slots {
 				if s.alive {
 					continue
 				}
-				s.n = startNodeRF(t, s.dir, rf)
+				hostPort := strings.TrimPrefix(s.n.addr, "http://")
+				s.n = startNodeAt(t, hostPort, s.dir, rf, false)
 				s.alive = true
 				if err := s.n.cl.Join(alive()[0].n.addr); err != nil {
 					t.Errorf("rejoin after restart: %v", err)
@@ -200,6 +208,10 @@ func TestSoakKillRestart(t *testing.T) {
 		time.Sleep(250 * time.Millisecond)
 	}
 	if !converged {
+		aliveSet := map[string]bool{}
+		for _, s := range up {
+			aliveSet[s.n.addr] = true
+		}
 		for i, s := range slots {
 			if !s.alive {
 				t.Logf("slot %d: killed", i)
@@ -207,15 +219,23 @@ func TestSoakKillRestart(t *testing.T) {
 			}
 			peers := s.n.cl.Peers()
 			reachable, phantom := 0, 0
+			var missing []string
+			seen := map[string]bool{s.n.addr: true}
 			for _, p := range peers {
+				seen[p] = true
 				if probeAlive(p) {
 					reachable++
 				} else {
 					phantom++
 				}
 			}
-			t.Logf("slot %d: %d peers (%d reachable, %d phantom): %v",
-				i, len(peers), reachable, phantom, peers)
+			for a := range aliveSet {
+				if !seen[a] {
+					missing = append(missing, a)
+				}
+			}
+			t.Logf("slot %d self=%s: %d peers (%d reachable, %d phantom) missing=%v: %v",
+				i, s.n.addr, len(peers), reachable, phantom, missing, peers)
 		}
 		t.Fatalf("survivors did not converge: want each alive node to see %d live peers", want)
 	}

@@ -172,6 +172,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("cluster init: %v", err)
 	}
+	// Remember the peers we contacted in the data dir, so a node that
+	// restarts (or loses its whole view to a split) can find the cluster
+	// again by reconnection instead of waiting for someone to join it.
+	cl.SetSeedFile(filepath.Join(*dir, "seeds.json"))
 	// Hinted handoff: writes that can't reach a replica are stashed in
 	// the data dir and replayed when that node returns.
 	if err := cl.EnableHints(*dir); err != nil {
