@@ -31,6 +31,7 @@ import (
 
 	"microdb/internal/api"
 	"microdb/internal/audit"
+	"microdb/internal/backup"
 	"microdb/internal/cluster"
 	"microdb/internal/profile"
 	"microdb/internal/secret"
@@ -57,6 +58,9 @@ func main() {
 	join := flag.String("join", "", "comma-separated seed nodes, e.g. http://127.0.0.1:8002")
 	fsync := flag.Bool("fsync", false, "fsync every write to disk (durable, slower)")
 	compress := flag.Bool("compress", false, "deflate log records (CPU per write in exchange for smaller log and faster replay)")
+	backupEvery := flag.Duration("backup-every", 0, "write a verified backup to --backup-target on this interval (0 = off; use cron + microctl if you prefer)")
+	backupTarget := flag.String("backup-target", "", "where scheduled backups go (dir:///path or s3://bucket/prefix)")
+	backupKeep := flag.Int("backup-keep", 10, "scheduled backups to keep on the target (bounded offsite growth)")
 	tierTarget := flag.String("tier-target", "", "cold storage tier: archive the raw log here before each compaction (dir:///path or s3://bucket/prefix)")
 	commitWindow := flag.Duration("commit-window", 0, "group-commit window with --fsync: hold the first waiting write this long so more writes join the same fsync (0 = commit the batch as soon as it forms)")
 	tlsCert := flag.String("tls-cert", "", "PEM cert for TLS (enables https)")
@@ -235,6 +239,20 @@ func main() {
 	} else {
 		// No seed: standalone node, nothing to stream.
 		cl.MarkBootstrapped()
+	}
+
+	if *backupEvery > 0 {
+		if *backupTarget == "" {
+			log.Fatal("--backup-every requires --backup-target")
+		}
+		btgt, err := tier.Open(*backupTarget)
+		if err != nil {
+			log.Fatalf("backup target: %v", err)
+		}
+		// In-process on purpose: this handle is the one that can
+		// snapshot a store that is being written to.
+		go backup.Run(nil, *backupEvery, backup.Config{St: st, Target: btgt, Keep: *backupKeep}, log.Printf)
+		log.Printf("backup: every %s -> %s (keeping %d)", *backupEvery, btgt.Name(), *backupKeep)
 	}
 
 	log.Printf("microdb node %s listening on %s (data: %s, tls=%v, rf=%d)", self, *addr, *dir, tlsOpts != nil, *rf)

@@ -264,6 +264,30 @@ func (s *S3Target) Put(key string, r io.Reader, size int64) error {
 	return nil
 }
 
+// Delete removes one object (DeleteObject). A missing key is not an
+// error: retention counts what remains, it does not transact.
+func (s *S3Target) Delete(key string) error {
+	u, err := s.objectURL(key)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodDelete, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	s.sign(req, emptyPayloadHash)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("tier: delete %s: %w", key, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("tier: delete %s: HTTP %d: %s", key, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
 func (s *S3Target) Get(key string) (io.ReadCloser, error) {
 	u, err := s.objectURL(key)
 	if err != nil {
@@ -343,7 +367,10 @@ func (s *S3Target) List() ([]string, error) {
 			return nil, fmt.Errorf("tier: list: bad XML: %w", err)
 		}
 		for _, c := range res.Contents {
-			keys = append(keys, c.Key)
+			// ListObjectsV2 returns keys WITH the prefix; Put/Delete
+			// take keys WITHOUT it, so normalise here — otherwise every
+			// caller would double the prefix on its next request.
+			keys = append(keys, strings.TrimPrefix(c.Key, strings.Trim(s.opt.Prefix, "/")+"/"))
 		}
 		if !res.Truncated || res.NextToken == "" {
 			break

@@ -45,6 +45,9 @@ type Target interface {
 	Get(key string) (io.ReadCloser, error)
 	// List returns keys in a stable order, or an empty slice.
 	List() ([]string, error)
+	// Delete removes one key. Deleting a missing key is not an error:
+	// retention is a goal ("at most Keep remain"), not a transaction.
+	Delete(key string) error
 }
 
 // Open parses a target URI:
@@ -185,6 +188,18 @@ func (d *DirTarget) Get(key string) (io.ReadCloser, error) {
 		return nil, ErrNotFound
 	}
 	return f, err
+}
+
+// Delete removes one archived object (and is a no-op if absent).
+func (d *DirTarget) Delete(key string) error {
+	p, err := d.pathFor(key)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (d *DirTarget) List() ([]string, error) {

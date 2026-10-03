@@ -20,6 +20,7 @@ func (failingTarget) Name() string                       { return "failing://x" 
 func (failingTarget) Put(string, io.Reader, int64) error { return errors.New("network is down") }
 func (failingTarget) Get(string) (io.ReadCloser, error)  { return nil, errors.New("network is down") }
 func (failingTarget) List() ([]string, error)            { return nil, errors.New("network is down") }
+func (failingTarget) Delete(string) error                { return errors.New("network is down") }
 
 func writeHistory(t *testing.T, st *Store, n int) {
 	t.Helper()
