@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"runtime"
 	"sort"
 	"strconv"
@@ -238,6 +239,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 	s.mux.HandleFunc("GET /internal/merkle/{col}/leaf", cl.HandleMerkleLeaf)
 	s.mux.HandleFunc("POST /internal/antientropy", cl.HandleAntiEntropy)
 	s.mux.HandleFunc("POST /internal/repair", cl.HandleRepair)
+	s.mux.HandleFunc("GET /internal/agg/{col}", s.handleInternalAgg)
 	s.mux.HandleFunc("POST /internal/leave", cl.HandleLeave)
 	s.mux.HandleFunc("POST /internal/decommission", cl.HandleDecommission)
 	s.mux.HandleFunc("GET /internal/stream/{col}", cl.HandleStream)
@@ -696,6 +698,168 @@ func (t *protoStampTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		req.Header.Set(protocol.Header, protocol.String())
 	}
 	return t.base.RoundTrip(req)
+}
+
+// serveAggregate answers an aggregate query by computing it on every
+// shard (including this one) and folding the partials. Same deadline
+// rule as the document path: answer within the budget with what
+// arrived, name what did not.
+func (s *Server) serveAggregate(w http.ResponseWriter, r *http.Request, col string,
+	filter map[string]interface{}, kind, field, groupBy string, members []string, timeoutMs int) {
+	if !store.AggKinds[kind] {
+		writeJSON(w, 400, map[string]string{"error": "unknown agg (count|sum|avg|min|max)"})
+		return
+	}
+	if kind != "count" && field == "" {
+		writeJSON(w, 400, map[string]string{"error": "agg " + kind + " requires &field="})
+		return
+	}
+	filterJSON, _ := json.Marshal(filter)
+
+	type partial struct {
+		member string
+		agg    store.Aggregate
+		err    error
+	}
+	results := make(chan partial, len(members)*2)
+	var wg sync.WaitGroup
+	for _, m := range members {
+		m := m
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if m == s.self {
+				results <- partial{member: m, agg: s.st.Aggregate(col, filter, kind, field, groupBy, s.primaryOwner(col))}
+				return
+			}
+			agg, err := s.gatherAggFrom(m, col, string(filterJSON), kind, field, groupBy)
+			results <- partial{member: m, agg: agg, err: err}
+		}()
+	}
+	go func() { wg.Wait(); close(results) }()
+
+	merged := store.Aggregate{Kind: kind, Field: field}
+	var errs []string
+	answered := map[string]bool{}
+	timedOut := false
+	merge := func(p partial) {
+		answered[p.member] = true
+		if p.err != nil {
+			errs = append(errs, p.err.Error())
+			return
+		}
+		merged.Merge(p.agg)
+	}
+	deadline := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+	defer deadline.Stop()
+collect:
+	for {
+		select {
+		case p, ok := <-results:
+			if !ok {
+				break collect
+			}
+			merge(p)
+		case <-deadline.C:
+			timedOut = true
+			atomic.AddInt64(metrics.Default.Counter("microdb_query_timeouts_total",
+				"Queries that returned partial results at their deadline"), 1)
+			for {
+				select {
+				case p, ok := <-results:
+					if !ok {
+						break collect
+					}
+					merge(p)
+				default:
+					break collect
+				}
+			}
+		}
+	}
+	if timedOut {
+		for _, m := range members {
+			if !answered[m] {
+				errs = append(errs, fmt.Sprintf("timeout after %dms waiting for %s", timeoutMs, m))
+			}
+		}
+	}
+
+	resp := map[string]interface{}{
+		"aggregate":     merged.Value(),
+		"agg":           merged,
+		"count":         merged.Count,
+		"nodes_queried": len(members),
+	}
+	if groupBy != "" {
+		groups := map[string]interface{}{}
+		for _, k := range merged.SortedGroups() {
+			g := merged.Groups[k]
+			groups[k] = g.Value()
+		}
+		resp["groups"] = groups
+		resp["group_totals"] = merged.Groups
+	}
+	if len(errs) > 0 {
+		resp["partial"] = true
+		resp["errors"] = errs
+	}
+	if timedOut {
+		resp["timed_out"] = true
+		resp["timeout_ms"] = timeoutMs
+	}
+	writeJSON(w, 200, resp)
+}
+
+// primaryOwner reports whether this node is the FIRST ring owner of a
+// document — the one copy allowed to count it. Replicas must stay out
+// of the sum or every document would be counted RF times.
+func (s *Server) primaryOwner(col string) func(id string) bool {
+	return func(id string) bool {
+		owners := s.OwnerSet(col, id)
+		return len(owners) > 0 && owners[0] == s.self
+	}
+}
+
+// gatherAggFrom asks one peer to compute the same aggregate locally.
+func (s *Server) gatherAggFrom(peer, col, filterJSON, kind, field, groupBy string) (store.Aggregate, error) {
+	u := peer + "/internal/agg/" + col + "?kind=" + url.QueryEscape(kind) +
+		"&field=" + url.QueryEscape(field) + "&group_by=" + url.QueryEscape(groupBy)
+	if filterJSON != "" && filterJSON != "null" {
+		u += "&filter=" + url.QueryEscape(filterJSON)
+	}
+	resp, err := s.fwdClient.Get(u)
+	if err != nil {
+		return store.Aggregate{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return store.Aggregate{}, fmt.Errorf("%s: HTTP %d: %s", peer, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		Agg store.Aggregate `json:"agg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return store.Aggregate{}, fmt.Errorf("%s: %w", peer, err)
+	}
+	return out.Agg, nil
+}
+
+// handleInternalAgg is the shard-side aggregate worker: compute over
+// this node's data only and return the partial.
+func (s *Server) handleInternalAgg(w http.ResponseWriter, r *http.Request) {
+	col := r.PathValue("col")
+	var filter map[string]interface{}
+	if f := r.URL.Query().Get("filter"); f != "" {
+		if err := json.Unmarshal([]byte(f), &filter); err != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad filter JSON"})
+			return
+		}
+	}
+	kind := r.URL.Query().Get("kind")
+	agg := s.st.Aggregate(col, filter, kind, r.URL.Query().Get("field"), r.URL.Query().Get("group_by"), s.primaryOwner(col))
+	writeJSON(w, 200, map[string]interface{}{"agg": agg})
 }
 
 // migrateDoc returns a schema-migrated COPY of d if the collection
@@ -1211,6 +1375,16 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		timeoutMs = n
+	}
+
+	// Aggregate pushdown: count/sum/avg/min/max are computed ON each
+	// shard and merged here. The wire carries a handful of numbers
+	// instead of every matching document — O(shards) bytes instead of
+	// O(matches), and no coordinator-side sort at all.
+	if agg := r.URL.Query().Get("agg"); agg != "" {
+		s.serveAggregate(w, r, col, filter, agg, r.URL.Query().Get("field"),
+			r.URL.Query().Get("group_by"), members, timeoutMs)
+		return
 	}
 
 	type gatherResult struct {
