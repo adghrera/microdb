@@ -108,7 +108,16 @@ type Member struct {
 	Load   float64 `json:"load,omitempty"`   // recent writes/sec (EWMA)
 	Zone   string  `json:"zone,omitempty"`   // failure domain (rack/AZ)
 	Region string  `json:"region,omitempty"` // failure domain above zone
+	// LastSeen is when this member was last contacted DIRECTLY by
+	// anyone — stamped by the member itself on its own gossip and
+	// relayed unchanged by everyone else. It does not grow on hops, so
+	// a member nobody can reach stops ageing out of every list
+	// memberTTL after it died. Absent on legacy peers (see mergeMember).
+	LastSeen int64 `json:"last_seen,omitempty"`
 }
+
+// memberTTL is how long a member may go unheard before eviction.
+const memberTTL = 15 * time.Second
 
 type Cluster struct {
 	self   string
@@ -118,6 +127,10 @@ type Cluster struct {
 	st     *store.Store
 	client *http.Client
 	stop   chan struct{}
+	// stopOnce makes Stop idempotent — a node that decommissions and
+	// then shuts down, or a chaos harness that kills a node and then
+	// tears it down, must not panic on the second close.
+	stopOnce sync.Once
 	// hints is the hinted-handoff store; nil until EnableHints is called.
 	hints *hints.Store
 	// draining marks a node that has begun graceful decommission: it
@@ -461,9 +474,7 @@ func (c *Cluster) Join(seed string) error {
 	c.adoptEpochLocked(out.Epoch)
 	c.mu.Unlock()
 	for _, m := range out.Members {
-		if m.Addr != c.self && m.TTL > time.Now().UnixMilli() {
-			c.seen(m.Addr)
-		}
+		c.mergeMember(m, time.Now().UnixMilli())
 	}
 	// Seed join discovered peers — rebuild the ring immediately.
 	if c.OnPeersChanged != nil {
@@ -496,6 +507,60 @@ func (c *Cluster) seen(addr string) bool {
 		c.epoch++ // membership changed — new fencing epoch
 	}
 	return !had
+}
+
+// seenAt records a relayed sighting at the time it actually happened,
+// never moving a sighting backwards. The monotonic max matters: it
+// makes every node's view converge on the newest DIRECT contact, which
+// then freezes when the member dies — and that freeze is what lets the
+// mesh evict it instead of gossipting it back to life forever.
+func (c *Cluster) seenAt(addr string, at time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if t, ok := c.left[addr]; ok && time.Since(t) < 30*time.Second {
+		return false
+	}
+	prev, had := c.peers[addr]
+	if !had || at.After(prev) {
+		c.peers[addr] = at
+	}
+	if !had {
+		c.epoch++
+	}
+	return !had
+}
+
+// mergeMember folds one gossiped member in.
+//
+// The bug this fixes: members used to be relayed with a FRESH ttl
+// (now+15s) on every hop, so any address anybody still held kept being
+// re-validated by every gossip round, forever. A node killed without a
+// graceful leave therefore never left anyone's member list — and stayed
+// in the ring, still holding owner slots, routing keys to a corpse.
+// Relaying the original last-direct-contact timestamp instead means the
+// value stops growing the moment the member stops answering, and every
+// node evicts it memberTTL later.
+//
+// Legacy senders (no last_seen) keep the old behaviour, so a mixed
+// cluster is never MORE aggressive about eviction than the oldest
+// binary expects.
+func (c *Cluster) mergeMember(m Member, now int64) bool {
+	if m.Addr == c.self {
+		return false
+	}
+	if m.LastSeen > 0 {
+		// Anything older than the window is a stale relay: do not
+		// resurrect it. Modest forward skew (a peer with a fast clock)
+		// is tolerated.
+		if m.LastSeen <= now && time.Since(time.UnixMilli(m.LastSeen)) >= memberTTL {
+			return false
+		}
+		return c.seenAt(m.Addr, time.UnixMilli(m.LastSeen))
+	}
+	if m.TTL > now {
+		return c.seen(m.Addr)
+	}
+	return false
 }
 
 // ClearLeave removes a departure tombstone so the address may rejoin
@@ -531,7 +596,7 @@ func (c *Cluster) Peers() []string {
 	now := time.Now()
 	out := make([]string, 0, len(c.peers))
 	for a, t := range c.peers {
-		if now.Sub(t) < 15*time.Second {
+		if now.Sub(t) < memberTTL {
 			out = append(out, a)
 		}
 	}
@@ -920,7 +985,7 @@ func (c *Cluster) fetchMerkleLeaves(peer, col string) ([]merkle.Leaf, error) {
 	return out.Leaves, err
 }
 
-func (c *Cluster) Stop() { close(c.stop) }
+func (c *Cluster) Stop() { c.stopOnce.Do(func() { close(c.stop) }) }
 
 func (c *Cluster) gossipRound() {
 	c.updateSelfLoad()
@@ -941,9 +1006,6 @@ func (c *Cluster) gossipRound() {
 		return // known to speak an out-of-window wire version
 	}
 	changed := false
-	if c.seen(peer) {
-		changed = true
-	}
 	// Push our view + epoch + departure tombstones, pull theirs.
 	members := c.memberList()
 	c.mu.RLock()
@@ -963,6 +1025,16 @@ func (c *Cluster) gossipRound() {
 	// its payload can never be merged into our membership view.
 	if resp.StatusCode == 505 || resp.StatusCode != http.StatusOK {
 		return
+	}
+	// The peer answered our gossip — it is alive NOW. Stamp the direct
+	// contact here, not before the attempt: a peer we happen to select
+	// but cannot reach must keep ageing toward eviction, otherwise every
+	// tick that happens to pick a corpse refreshes it and the mesh can
+	// never evict a node that died without a graceful leave. Liveness of
+	// a live-but-slow peer is still carried by its own self-stamped
+	// LastSeen, relayed unchanged, so this cannot falsely evict it.
+	if c.seen(peer) {
+		changed = true
 	}
 	var out struct {
 		Members []Member         `json:"members"`
@@ -987,13 +1059,26 @@ func (c *Cluster) gossipRound() {
 	}
 	now := time.Now().UnixMilli()
 	for _, m := range out.Members {
-		if m.Addr != c.self && m.TTL > now {
-			c.mu.Lock()
+		if m.Addr == c.self {
+			continue
+		}
+		c.mu.Lock()
+		if m.Load != 0 {
 			c.loads[m.Addr] = m.Load
-			c.mu.Unlock()
-			if c.seen(m.Addr) {
-				changed = true
-			}
+		}
+		if m.Zone != "" {
+			c.zones[m.Addr] = m.Zone
+		}
+		if m.Region != "" {
+			c.regions[m.Addr] = m.Region
+		}
+		c.mu.Unlock()
+		// mergeMember, NOT seen(): relayed addresses must carry their
+		// original last-direct-contact time or every gossip round would
+		// re-validate dead members forever and the ring would keep
+		// handing owner slots to corpses.
+		if c.mergeMember(m, now) {
+			changed = true
 		}
 	}
 	// Adopt a higher epoch even if the member set looks identical to ours:
@@ -1010,12 +1095,30 @@ func (c *Cluster) gossipRound() {
 
 func (c *Cluster) memberList() []Member {
 	peers := c.Peers()
-	out := make([]Member, 0, len(peers)+1)
-	out = append(out, Member{Addr: c.self, TTL: time.Now().UnixMilli() + 15000,
-		Load: c.SelfLoad(), Zone: c.Zone(), Region: c.Region()})
+	now := time.Now()
+	ttl := now.UnixMilli() + int64(memberTTL/time.Millisecond)
+	// TTL stays what legacy peers expect (a fresh validity window);
+	// LastSeen carries the truth — when each member was last contacted
+	// directly. Timestamps and topology are read before the lock so
+	// Zone()/Region() are never called under it.
+	c.mu.RLock()
+	times := make(map[string]time.Time, len(peers))
 	for _, p := range peers {
-		out = append(out, Member{Addr: p, TTL: time.Now().UnixMilli() + 15000,
-			Load: c.LoadOf(p), Zone: c.ZoneOf(p), Region: c.RegionOf(p)})
+		times[p] = c.peers[p]
+	}
+	c.mu.RUnlock()
+	zone, region := c.Zone(), c.Region()
+
+	out := make([]Member, 0, len(peers)+1)
+	out = append(out, Member{
+		Addr: c.self, TTL: ttl, Load: c.SelfLoad(),
+		Zone: zone, Region: region, LastSeen: now.UnixMilli(),
+	})
+	for _, p := range peers {
+		out = append(out, Member{
+			Addr: p, TTL: ttl, Load: c.LoadOf(p),
+			Zone: c.ZoneOf(p), Region: c.RegionOf(p), LastSeen: times[p].UnixMilli(),
+		})
 	}
 	return out
 }
@@ -1127,7 +1230,7 @@ func (c *Cluster) peersLocked() []string {
 	now := time.Now()
 	out := make([]string, 0, len(c.peers))
 	for a, t := range c.peers {
-		if now.Sub(t) < 15*time.Second {
+		if now.Sub(t) < memberTTL {
 			out = append(out, a)
 		}
 	}
@@ -1558,18 +1661,21 @@ func (c *Cluster) HandleGossip(w http.ResponseWriter, r *http.Request) {
 	c.mu.Unlock()
 	now := time.Now().UnixMilli()
 	for _, m := range in.Members {
-		if m.Addr != c.self && m.TTL > now {
-			c.mu.Lock()
-			c.loads[m.Addr] = m.Load
-			if m.Zone != "" {
-				c.zones[m.Addr] = m.Zone
-			}
-			if m.Region != "" {
-				c.regions[m.Addr] = m.Region
-			}
-			c.mu.Unlock()
-			c.seen(m.Addr)
+		if m.Addr == c.self {
+			continue
 		}
+		c.mu.Lock()
+		if m.Load != 0 {
+			c.loads[m.Addr] = m.Load
+		}
+		if m.Zone != "" {
+			c.zones[m.Addr] = m.Zone
+		}
+		if m.Region != "" {
+			c.regions[m.Addr] = m.Region
+		}
+		c.mu.Unlock()
+		c.mergeMember(m, now)
 	}
 	writeJSON(w, 200, map[string]interface{}{"members": c.memberList(), "epoch": c.Epoch()})
 }

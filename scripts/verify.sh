@@ -4,6 +4,8 @@
 #   ./scripts/verify.sh          # fast gate: fmt-check, vet, build, test
 #   ./scripts/verify.sh --race   # adds -race on the concurrency-heavy packages
 #   ./scripts/verify.sh --full   # race everywhere (slow; CI / pre-release)
+#   ./scripts/verify.sh --soak   # fast gate + the chaos/soak harness
+#                                # (duration: MICRODB_SOAK=5m, default 60s)
 #
 # A non-zero exit means the tree is not shippable.
 set -uo pipefail
@@ -31,11 +33,20 @@ go build ./... || FAIL=1
 step "go test ./... -count=1"
 go test ./... -count=1 -timeout 20m || FAIL=1
 
-if [ "$MODE" != "fast" ]; then
+if [ "$MODE" = "race" ] || [ "$MODE" = "full" ]; then
   PKGS="./internal/store ./internal/cluster ./internal/api ./internal/changelog ./internal/index ./internal/bloom ./internal/ranges"
   [ "$MODE" = "full" ] && PKGS="./..."
   step "-race $PKGS"
   CC="${MICRODB_GCC:-C:\w\msys64\mingw64\bin\gcc.exe}" CGO_ENABLED=1 go test -race $PKGS -count=1 -timeout 25m || FAIL=1
+fi
+
+if [ "$MODE" = "soak" ]; then
+  # The chaos/soak harness (build tag `soak`): a seeded random workload
+  # over a cluster while nodes are killed and restarted, asserting that
+  # every quorum-acked write survives and membership converges. It is
+  # time-boxed, not test-count-boxed, so the knob is a duration.
+  step "soak / chaos harness (MICRODB_SOAK=${MICRODB_SOAK:-60s})"
+  go test ./integration/ -tags soak -run TestSoak -count=1 -timeout 30m -v || FAIL=1
 fi
 
 step "result"

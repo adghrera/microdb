@@ -253,7 +253,7 @@ before feature 1 landed.
 | 25 | Index value encode fast path | `json.Marshal` per field per write measured at 61% of replay allocations | ✅ |
 | 26 | Wire compression (internal requests + responses) | closes both "the wire still ships JSON" scope notes | ✅ |
 | 27 | Zone-local anti-entropy pairing | cross-zone repair traffic is money for no correctness gain | ✅ |
-| 28 | Soak / chaos harness | the only honest answer to "does it survive failures" | ⬜ |
+| 28 | Soak / chaos harness | the only honest answer to "does it survive failures" | ✅ |
 | 29 | Operability pack: k8s + Helm + compute autoscaling (C6) + alert rules + DR runbook | deploy, scale, alert, recover without reading the source | ⬜ |
 | 30 | Multi-region: region topology + region-spread replicas + GSI lag metrics | replicas surviving a region loss; ⚠️ until conflict resolution beyond LWW lands | ⚠️ |
 
@@ -362,6 +362,48 @@ before feature 1 landed.
   instead of paging an operator. 6 tests (probe sanity, deterministic
   disk shed, disabled/nil watermarks, heap shed, cache window, API
   contract incl. DELETE/GET exemptions).
+
+- **28 ✅** the harness that turns "production-grade" from an assertion
+  into a measurement. `integration/soak_test.go` (build tag `soak`,
+  `MICRODB_SOAK=5m ./scripts/verify.sh --soak`) runs a 4-node RF=3
+  cluster under a **seeded** random write/read workload (reproducible:
+  a soak failure replays on the same seed) while killing nodes outright
+  (listener + gossip + store all closed — a crash flushes neither) and
+  restarting them on their data directories, holding at most one node
+  down at a time. It then asserts the invariants that actually matter:
+  **every write acknowledged with a quorum is still readable on a
+  surviving node** (one node may die at any moment — the majority ack
+  is what makes that provable), **membership converges among the
+  survivors**, nothing panics, and 5xx are counted rather than hidden.
+  A transient read miss is legal (repairs are async) and logged, not
+  fatal; a phantom peer in a member list is reported as *phantom* (list
+  is stale) vs *unreachable* (list is correct) because they need
+  different fixes.
+
+  **The bug it found — and the reason it is a feature, not a test.** A
+  node killed without a graceful leave never left anyone's member list:
+  every gossip hop re-stamped a *fresh* `now+15s` TTL on the addresses
+  it relayed, so any address anybody still held was re-validated by
+  every round forever, kept its owner slots, and routed keys to a
+  corpse. Two fixes. (1) `Member.LastSeen` carries the last **direct**
+  contact — stamped by the member itself each round, relayed unchanged
+  — so the value freezes the moment a member stops answering and every
+  node evicts it `memberTTL` later; `mergeMember`/`seenAt` fold a
+  relayed sighting at the time it actually happened (monotonic max, so
+  it never moves backwards and never resurrects an out-of-window stale
+  relay). Legacy senders with no `last_seen` keep the old behaviour, so
+  a mixed cluster is never *more* aggressive than the oldest binary.
+  (2) `gossipRound` stamped `seen(peer)` **before** the contact attempt,
+  so every tick that happened to select a corpse refreshed it and the
+  mesh could never evict it — the stamp now happens only after the peer
+  answers 200, and a live-but-slow peer is still carried by its own
+  self-stamped `LastSeen`. `Stop()` is now idempotent (`stopOnce`) so a
+  kill-then-teardown or decommission-then-shutdown cannot panic on the
+  second close. **Live-verified** (12s run): 103 writes, 59 quorum-acked,
+  9 kills, 9 restarts — all 59 acknowledged writes readable on a
+  survivor, survivors converged, no panic. Membership-sensitive
+  integration tests (leave-tombstone, epoch, fencing, decommission,
+  bootstrap, zone/region) stay green.
 
 - **30 ⚠️** the placement half of multi-region is shipped, the conflict
   half is not. `ring.Topology` now carries two levels — region above zone —
