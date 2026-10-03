@@ -1144,7 +1144,8 @@ func (s *Server) forwardBytes(w http.ResponseWriter, r *http.Request, method, pa
 }
 
 // handleQuery: GET /api/collections/{col}/docs?filter=<url-encoded JSON>
-//   &sort=<field>&desc=true&limit=N&offset=M
+//
+//	&sort=<field>&desc=true&limit=N&offset=M
 //
 // Scatter-gather: the receiving node fans the query out to every live
 // cluster member (including itself), merges results by doc id keeping
@@ -1197,7 +1198,23 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		hedgeMs = n
 	}
 
+	// Shared deadline: every gather runs concurrently, and the query
+	// waits for all of them FOR AT MOST this long. Without it one
+	// unreachable peer holds the whole result hostage until the HTTP
+	// client's own timeout — and a query that answers in 3s with
+	// partial results beats one that answers in 30s with all of them.
+	timeoutMs := 2000
+	if t := r.URL.Query().Get("timeout_ms"); t != "" {
+		n, err := strconv.Atoi(t)
+		if err != nil || n < 10 || n > 60000 {
+			writeJSON(w, 400, map[string]string{"error": "bad timeout_ms (10..60000)"})
+			return
+		}
+		timeoutMs = n
+	}
+
 	type gatherResult struct {
+		member    string
 		docs      []*store.Doc
 		truncated bool
 		err       error
@@ -1222,12 +1239,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				docs, trunc := s.st.ScanTopK(col, filter,
 					func(d *store.Doc) *store.Doc { return s.migrateDoc(col, d) },
 					sortField, desc, capN)
-				return gatherResult{docs: docs, truncated: trunc}
+				return gatherResult{member: m, docs: docs, truncated: trunc}
 			}
-			return gatherResult{docs: s.migrateDocs(col, s.st.ScanIndexed(col, filter)), truncated: false}
+			return gatherResult{member: m, docs: s.migrateDocs(col, s.st.ScanIndexed(col, filter)), truncated: false}
 		}
 		docs, trunc, err := s.gatherFrom(m, col, r.URL.Query().Get("filter"), sortField, desc, capN)
-		return gatherResult{docs: docs, truncated: trunc, err: err}
+		return gatherResult{member: m, docs: docs, truncated: trunc, err: err}
 	}
 	hedged := hedgeMs > 0 && len(members) >= 2
 	results := make(chan gatherResult, len(members)*2)
@@ -1276,10 +1293,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	merged := map[string]*store.Doc{}
 	var errs []string
 	anyTruncated := false
-	for res := range results {
+	answered := map[string]bool{}
+	merge := func(res gatherResult) {
+		answered[res.member] = true
 		if res.err != nil {
 			errs = append(errs, res.err.Error())
-			continue
+			return
 		}
 		if res.truncated {
 			anyTruncated = true
@@ -1287,6 +1306,44 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		for _, d := range res.docs {
 			if cur, ok := merged[d.ID]; !ok || d.Ver > cur.Ver || (d.Ver == cur.Ver && d.TS > cur.TS) {
 				merged[d.ID] = d
+			}
+		}
+	}
+
+	deadline := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+	defer deadline.Stop()
+	timedOut := false
+collect:
+	for {
+		select {
+		case res, ok := <-results:
+			if !ok {
+				break collect
+			}
+			merge(res)
+		case <-deadline.C:
+			// Out of budget: take whatever has already arrived, report
+			// the rest as missing, and answer instead of hanging.
+			timedOut = true
+			atomic.AddInt64(metrics.Default.Counter("microdb_query_timeouts_total",
+				"Queries that returned partial results at their deadline"), 1)
+			for {
+				select {
+				case res, ok := <-results:
+					if !ok {
+						break collect
+					}
+					merge(res)
+				default:
+					break collect
+				}
+			}
+		}
+	}
+	if timedOut {
+		for _, m := range members {
+			if !answered[m] {
+				errs = append(errs, fmt.Sprintf("timeout after %dms waiting for %s", timeoutMs, m))
 			}
 		}
 	}
@@ -1332,6 +1389,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if len(errs) > 0 {
 		resp["partial"] = true
 		resp["errors"] = errs
+	}
+	if timedOut {
+		resp["timed_out"] = true
+		resp["timeout_ms"] = timeoutMs
 	}
 	writeJSON(w, 200, resp)
 }
@@ -1700,7 +1761,8 @@ func (s *Server) handleLookupGSI(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePartitionQuery: GET /api/collections/{col}/partition/{pk}
-//   ?sort_gte=A&sort_lte=B&sort_lt=..&sort_gt=..&desc=true&limit=N
+//
+//	?sort_gte=A&sort_lte=B&sort_lt=..&sort_gt=..&desc=true&limit=N
 //
 // Dynamo-style Query(): for collections with a partition_field, all
 // docs of one partition live on one shard, so this is served from a
