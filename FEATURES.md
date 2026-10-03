@@ -252,7 +252,7 @@ before feature 1 landed.
 | 24 | TLS cert/key hot-reload | expired certs are a top self-inflicted outage; closes the ⚠️ on secrets | ✅ |
 | 25 | Index value encode fast path | `json.Marshal` per field per write measured at 61% of replay allocations | ✅ |
 | 26 | Wire compression (internal requests + responses) | closes both "the wire still ships JSON" scope notes | ⬜ |
-| 27 | Zone-local anti-entropy pairing | cross-zone repair traffic is money for no correctness gain | ⬜ |
+| 27 | Zone-local anti-entropy pairing | cross-zone repair traffic is money for no correctness gain | ✅ |
 | 28 | Soak / chaos harness | the only honest answer to "does it survive failures" | ⬜ |
 | 29 | Operability pack: k8s + Helm + compute autoscaling (C6) + alert rules + DR runbook | deploy, scale, alert, recover without reading the source | ⬜ |
 | 30 | Multi-region: region topology + region-spread replicas + GSI lag metrics | replicas surviving a region loss; ⚠️ until conflict resolution beyond LWW lands | ⬜ |
@@ -293,6 +293,18 @@ before feature 1 landed.
   allocs**. Startup-replay allocations barely moved (3.65× → 3.63× of
   the log) — reported as measured, because there the cost is dominated
   by unmarshalling the payloads themselves, not by index encoding.
+
+- **27 ✅** repair now meets a same-zone peer first. `aeSchedule.nextPref`
+  orders the lap by a priority function (local failure domain first) and
+  shuffles *within* each priority run, so the very first contact of a lap is
+  a peer in our own zone whenever one exists, while coverage is unchanged —
+  a lap still visits every peer exactly once, locals before remote ones,
+  and with no zone configured the behaviour is byte-for-byte the uniform
+  shuffle it was. `microdb_ae_cross_zone_contacts_total` counts the
+  contacts that had to leave the domain (the number an operator should
+  watch when the cross-AZ bill moves). Tests: first contact is always
+  the same-zone peer across 6 fresh laps, the remainder of the lap covers
+  every other peer exactly once, and the unzoned path keeps full coverage.
 
 **Still open after these 10, by design:** conflict resolution beyond LWW
 (version vectors / CRDTs — it changes consistency semantics and deserves its own

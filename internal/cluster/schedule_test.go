@@ -106,3 +106,70 @@ func TestAEDegenerateInputs(t *testing.T) {
 		t.Errorf("want<=0 must still make progress, got %v", got)
 	}
 }
+
+func zonePref(local string) func(a, b string) bool {
+	zones := map[string]string{
+		"z1-local": "z1", "z2-a": "z2", "z2-b": "z2", "z2-c": "z2", "z3-x": "z3",
+	}
+	return func(a, b string) bool {
+		if local == "" {
+			return false
+		}
+		za, zb := zones[a] == local, zones[b] == local
+		return za && !zb
+	}
+}
+
+// TestAEPrefersLocalFailureDomain: repair should meet a same-zone peer
+// first (cross-AZ traffic costs money and buys no correctness), while
+// the lap still visits everyone — locals first, remote after.
+func TestAEPrefersLocalFailureDomain(t *testing.T) {
+	peers := []string{"z2-a", "z2-b", "z1-local", "z3-x", "z2-c"}
+	prefer := zonePref("z1")
+
+	s := &aeSchedule{}
+	first := s.nextPref(peers, 1, prefer)
+	if len(first) != 1 || first[0] != "z1-local" {
+		t.Fatalf("first contact = %v, want the same-zone peer", first)
+	}
+	// The rest of the lap still covers every other peer exactly once:
+	// the first call took slot 1, so two more calls of two cover slots
+	// 2..5 and the lap ends exactly there.
+	seen := map[string]bool{"z1-local": true}
+	for i := 0; i < 2; i++ {
+		for _, p := range s.nextPref(peers, 2, prefer) {
+			if seen[p] {
+				t.Fatalf("peer %q visited twice in one lap", p)
+			}
+			seen[p] = true
+		}
+	}
+	if len(seen) != len(peers) {
+		t.Fatalf("lap covered %d of %d peers (locals-first must not cost coverage)", len(seen), len(peers))
+	}
+
+	// Without a zone configured, behaviour is the uniform shuffle the
+	// existing tests pin (no preference, full coverage).
+	n := &aeSchedule{}
+	got := n.nextPref(peers, 5, zonePref(""))
+	seen2 := map[string]bool{}
+	for _, p := range got {
+		seen2[p] = true
+	}
+	if len(seen2) != len(peers) {
+		t.Fatalf("unzoned lap covered %d of %d", len(seen2), len(peers))
+	}
+
+	// Several same-zone peers stay shuffled within their run, so one
+	// peer is not always the repair partner.
+	counts := map[string]int{}
+	for lap := 0; lap < 6; lap++ {
+		l := &aeSchedule{}
+		c := l.nextPref(peers, 1, prefer) // only the local run is first
+		counts[c[0]]++
+	}
+	// Only the local-zone peer can be first — it is alone in its run.
+	if counts["z1-local"] != 6 {
+		t.Fatalf("first contact distribution: %v, want only z1-local", counts)
+	}
+}

@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"math/rand"
+	"sort"
 	"sync"
 )
 
@@ -25,18 +26,47 @@ type aeSchedule struct {
 	pos   int
 }
 
-// next returns up to `want` peers for this round.
+// next returns up to `want` peers for this round, in plain (uniform)
+// order.
 func (s *aeSchedule) next(peers []string, want int) []string {
+	return s.nextPref(peers, want, nil)
+}
+
+// nextPref is next with a priority function: peers for which
+// prefer(a) differs from prefer(b) are ordered by that priority, and
+// shuffling happens WITHIN each priority run. Used to keep repair
+// traffic inside a failure domain — a cross-AZ exchange costs money
+// and gains no correctness when a same-AZ peer is available — without
+// losing coverage: a lap still visits every peer exactly once, the
+// local ones first.
+func (s *aeSchedule) nextPref(peers []string, want int, prefer func(a, b string) bool) []string {
 	if want <= 0 {
 		want = 1
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.needsRebuild(peers) {
-		s.order = append([]string(nil), peers...)
-		rand.Shuffle(len(s.order), func(i, j int) {
-			s.order[i], s.order[j] = s.order[j], s.order[i]
-		})
+		order := append([]string(nil), peers...)
+		if prefer != nil {
+			// Stable order by priority, then shuffle inside each run of
+			// equal priority so no single peer is always chosen first.
+			sort.SliceStable(order, func(i, j int) bool { return prefer(order[i], order[j]) })
+			for start := 0; start < len(order); {
+				end := start + 1
+				for end < len(order) && prefer(order[start], order[end]) == prefer(order[end], order[start]) {
+					end++
+				}
+				rand.Shuffle(end-start, func(i, j int) {
+					order[start+i], order[start+j] = order[start+j], order[start+i]
+				})
+				start = end
+			}
+		} else {
+			rand.Shuffle(len(order), func(i, j int) {
+				order[i], order[j] = order[j], order[i]
+			})
+		}
+		s.order = order
 		s.pos = 0
 	}
 	if len(s.order) == 0 {

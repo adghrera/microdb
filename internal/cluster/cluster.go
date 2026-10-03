@@ -546,9 +546,24 @@ func (c *Cluster) antiEntropyAll() {
 	c.mu.RLock()
 	fanout := c.aeFanout
 	c.mu.RUnlock()
-	for _, peer := range c.ae.next(c.Peers(), fanout) {
+	myZone := c.Zone()
+	// Prefer peers in our own failure domain: a cross-AZ exchange
+	// costs money and buys no correctness when a local peer exists. A
+	// lap still covers every peer — locals first, remote after.
+	prefer := func(a, b string) bool {
+		if myZone == "" {
+			return false
+		}
+		za, zb := c.ZoneOf(a) == myZone, c.ZoneOf(b) == myZone
+		return za && !zb
+	}
+	for _, peer := range c.ae.nextPref(c.Peers(), fanout, prefer) {
 		atomic.AddInt64(metrics.Default.Counter("microdb_ae_peers_contacted_total",
 			"Peers contacted by anti-entropy rounds"), 1)
+		if myZone != "" && c.ZoneOf(peer) != myZone {
+			atomic.AddInt64(metrics.Default.Counter("microdb_ae_cross_zone_contacts_total",
+				"Anti-entropy contacts that had to cross a failure domain"), 1)
+		}
 		for _, col := range collections {
 			if err := c.syncCollection(peer, col); err != nil {
 				log.Printf("anti-entropy %s <-> %s: %v", col, peer, err)
