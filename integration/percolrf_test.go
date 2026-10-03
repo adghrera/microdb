@@ -98,8 +98,8 @@ func TestConfigValidation(t *testing.T) {
 	for _, bad := range []int{-1, 10, 99} {
 		body, _ := json.Marshal(map[string]interface{}{"rf": bad})
 		req, _ := http.NewRequest("PUT", a.addr+"/api/collections/bad/config", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}

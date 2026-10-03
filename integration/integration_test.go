@@ -16,11 +16,11 @@ import (
 )
 
 type node struct {
-	addr    string
-	st      *store.Store
-	cl      *cluster.Cluster
-	srv     *http.Server
-	apiSrv  *api.Server
+	addr   string
+	st     *store.Store
+	cl     *cluster.Cluster
+	srv    *http.Server
+	apiSrv *api.Server
 }
 
 func startNode(t *testing.T, dir string) *node {

@@ -421,3 +421,45 @@ func TestRebalanceDeterministic(t *testing.T) {
 		t.Fatal("Rebalance is not deterministic")
 	}
 }
+
+// TestRebalanceOrderIndependent is the cross-node property: every node
+// builds its input as peers-plus-self in ITS OWN order, so two nodes
+// looking at identical state must produce identical plans even though
+// their node slices are different permutations. Without this, "no
+// agreement protocol needed" would be false.
+func TestRebalanceOrderIndependent(t *testing.T) {
+	load_ := load(map[int]float64{30: 220, 90: 180, 210: 160}, 0.7)
+	nodes := []string{"a", "b", "c", "d"}
+	perms := [][]string{
+		{"a", "b", "c", "d"},
+		{"d", "c", "b", "a"},
+		{"c", "a", "d", "b"},
+	}
+	var first *Plan
+	for _, perm := range perms {
+		got := Rebalance(perm, 2, load_, 7, &fakeBase{nodes}, nil)
+		if first == nil {
+			first = got
+			continue
+		}
+		if !reflect.DeepEqual(first, got) {
+			t.Fatalf("node order %v changed the plan:\n%+v\nvs\n%+v", perm, first, got)
+		}
+	}
+	if first == nil {
+		t.Fatal("hot load should produce a plan")
+	}
+	// And with a seeded previous plan (minimal movement), the same must
+	// hold: sticky plans are still a function of the inputs, not of the
+	// order they arrived in.
+	for i, perm := range perms {
+		got := Rebalance(perm, 2, load_, 8, &fakeBase{nodes}, first)
+		if i == 0 {
+			first = got
+			continue
+		}
+		if !reflect.DeepEqual(first, got) {
+			t.Fatalf("with prev plan, node order %v changed the result", perm)
+		}
+	}
+}

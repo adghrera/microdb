@@ -313,7 +313,7 @@ func splitRanges(bucketLoad []float64, total, fair float64) []Range {
 		return append(split(lo, mid, leftLoad, depth-1, true), split(mid, hi, load-leftLoad, depth-1, true)...)
 	}
 	maxDepth := 0
-	for (1<<maxDepth) < MaxRanges {
+	for (1 << maxDepth) < MaxRanges {
 		maxDepth++
 	}
 	return split(0, Buckets, total, maxDepth, false)

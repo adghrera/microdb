@@ -69,8 +69,8 @@ type QueryResult struct {
 	// TotalExact reports whether Total is the exact match count.
 	// With sort/limit pushdown a truncated shard makes Total a lower
 	// bound (TotalExact=false); the returned window is always exact.
-	TotalExact bool  `json:"total_exact"`
-	Partial    bool  `json:"partial,omitempty"`
+	TotalExact bool `json:"total_exact"`
+	Partial    bool `json:"partial,omitempty"`
 }
 
 // Event is a change-feed event.

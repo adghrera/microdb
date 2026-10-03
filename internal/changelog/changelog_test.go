@@ -176,8 +176,8 @@ func TestDurableRetentionTrimOnOpen(t *testing.T) {
 	old := time.Now().Add(-2 * time.Hour).UnixMilli()
 	fresh := time.Now().UnixMilli()
 	os.WriteFile(path, []byte(
-		`{"seq":1,"ts":`+strconv.FormatInt(old,10)+`,"collection":"c","id":"old","kind":"upsert"}`+"\n"+
-			`{"seq":2,"ts":`+strconv.FormatInt(fresh,10)+`,"collection":"c","id":"new","kind":"upsert"}`+"\n"), 0o644)
+		`{"seq":1,"ts":`+strconv.FormatInt(old, 10)+`,"collection":"c","id":"old","kind":"upsert"}`+"\n"+
+			`{"seq":2,"ts":`+strconv.FormatInt(fresh, 10)+`,"collection":"c","id":"new","kind":"upsert"}`+"\n"), 0o644)
 	l, err := Open(path, 1000, time.Hour)
 	if err != nil {
 		t.Fatal(err)

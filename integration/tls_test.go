@@ -34,7 +34,7 @@ func genTLS(t *testing.T, dir string) (string, string, string) {
 		Subject:               pkix.Name{CommonName: "microdb-test-ca"},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
-		IsCA:                true,
+		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 	}
@@ -55,7 +55,7 @@ func genTLS(t *testing.T, dir string) (string, string, string) {
 		SerialNumber: big.NewInt(2),
 		Subject:      pkix.Name{CommonName: "microdb-node"},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:   time.Now().Add(24 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},

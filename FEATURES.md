@@ -242,6 +242,26 @@ before feature 1 landed.
 | Replicas in one AZ, 3 AZs × RF=3 | ~60% of keys | **0 of 500 keys** |
 | Anti-entropy traffic per round | O(N) peers | **3 peers** (`--ae-fanout`) |
 
+### Next 10 — the remaining production-grade gap (tracked)
+
+| # | Feature | Why it matters | Status |
+|---|---------|----------------|--------|
+| 21 | CI verification gate + fix the flaky test | every claim above rests on a suite that must be runnable in one command and must not flap | ⬜ |
+| 22 | Capacity watermarks + admission (`microctl capacity`) | OOM and ENOSPC are the two ways databases die quietly | ⬜ |
+| 23 | Backup scheduler + retention | closes the ⚠️ on backups: RPO automation and bounded offsite growth | ⬜ |
+| 24 | TLS cert/key hot-reload | expired certs are a top self-inflicted outage; closes the ⚠️ on secrets | ⬜ |
+| 25 | Index value encode fast path | `json.Marshal` per field per write measured at 61% of replay allocations | ⬜ |
+| 26 | Wire compression (internal requests + responses) | closes both "the wire still ships JSON" scope notes | ⬜ |
+| 27 | Zone-local anti-entropy pairing | cross-zone repair traffic is money for no correctness gain | ⬜ |
+| 28 | Soak / chaos harness | the only honest answer to "does it survive failures" | ⬜ |
+| 29 | Operability pack: k8s + Helm + compute autoscaling (C6) + alert rules + DR runbook | deploy, scale, alert, recover without reading the source | ⬜ |
+| 30 | Multi-region: region topology + region-spread replicas + GSI lag metrics | replicas surviving a region loss; ⚠️ until conflict resolution beyond LWW lands | ⬜ |
+
+**Still open after these 10, by design:** conflict resolution beyond LWW
+(version vectors / CRDTs — it changes consistency semantics and deserves its own
+design pass), spill-to-disk query execution, partial-view membership and
+member-list digests, and splitting the index service into its own tier.
+
 ### Deliberately re-scoped rather than shipped as written
 
 - **Block/page store → streaming replay.** The working set is resident by

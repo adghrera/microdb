@@ -22,11 +22,11 @@ import (
 
 // Tenant is one tenant's admission policy.
 type Tenant struct {
-	Name      string  `json:"name"`
-	Token     string  `json:"token"`
-	RateRPS   float64 `json:"rate_rps"`  // sustained requests/sec (0 = unlimited)
-	Burst     int     `json:"burst"`     // bucket size (default 2x rate)
-	MaxDocs   int64   `json:"max_docs"`  // live docs under prefix (0 = unlimited)
+	Name    string  `json:"name"`
+	Token   string  `json:"token"`
+	RateRPS float64 `json:"rate_rps"` // sustained requests/sec (0 = unlimited)
+	Burst   int     `json:"burst"`    // bucket size (default 2x rate)
+	MaxDocs int64   `json:"max_docs"` // live docs under prefix (0 = unlimited)
 }
 
 // Registry holds tenants and their live limiters.

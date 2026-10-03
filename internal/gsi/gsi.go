@@ -44,12 +44,12 @@ type Def struct {
 
 // Manager maintains all GSIs for one node.
 type Manager struct {
-	st      *store.Store
-	worker  chan changelog.Event
-	stop    chan struct{}
+	st        *store.Store
+	worker    chan changelog.Event
+	stop      chan struct{}
 	processed atomic.Int64 // last change-feed seq applied to indexes
-	running bool
-	mu      sync.Mutex
+	running   bool
+	mu        sync.Mutex
 }
 
 // NewManager starts the async maintenance worker.
@@ -96,7 +96,7 @@ func (m *Manager) loop() {
 func (m *Manager) Lag() (processed, head int64, age time.Duration) {
 	head = m.st.ChangeLog().Head()
 	processed = m.processed.Load()
-	return processed, head, time.Duration(head-processed)
+	return processed, head, time.Duration(head - processed)
 }
 
 // --- definitions -------------------------------------------------

@@ -36,14 +36,14 @@ type Event struct {
 var DurableWriteErrors int64
 
 type Log struct {
-	mu       sync.Mutex
-	seq      int64
-	events   []Event
-	maxAge   time.Duration
-	maxSize  int
-	signal   chan struct{} // closed+replaced on every append
-	f        *os.File      // durable feed file (nil = in-memory only)
-	fbuf     *bufio.Writer
+	mu      sync.Mutex
+	seq     int64
+	events  []Event
+	maxAge  time.Duration
+	maxSize int
+	signal  chan struct{} // closed+replaced on every append
+	f       *os.File      // durable feed file (nil = in-memory only)
+	fbuf    *bufio.Writer
 	// onAppend callbacks are invoked synchronously on every Append
 	// (under the log lock). Used by the read cache to invalidate on
 	// every local mutation — writes AND replicated applies — without

@@ -129,7 +129,7 @@ func TestMatchesOperators(t *testing.T) {
 		{map[string]interface{}{"missing": map[string]interface{}{"$exists": true}}, false},
 		{map[string]interface{}{"name": map[string]interface{}{"$regex": "^a[lc]"}}, true},
 		{map[string]interface{}{"name": map[string]interface{}{"$regex": "^b"}}, false},
-		{map[string]interface{}{"age": map[string]interface{}{"$regex": "x"}}, false}, // non-string
+		{map[string]interface{}{"age": map[string]interface{}{"$regex": "x"}}, false},  // non-string
 		{map[string]interface{}{"name": map[string]interface{}{"$regex": "["}}, false}, // bad pattern
 		// compound: both conditions must hold
 		{map[string]interface{}{"age": map[string]interface{}{"$gte": float64(20), "$lte": float64(30)}}, true},

@@ -164,7 +164,7 @@ func TestHedgedQuery(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Count int             `json:"count"`
+		Count int              `json:"count"`
 		Docs  []map[string]any `json:"docs"`
 	}
 	json.NewDecoder(resp.Body).Decode(&out)

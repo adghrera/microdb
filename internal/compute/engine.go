@@ -35,12 +35,12 @@ import (
 
 // Engine is a stateless compute node.
 type Engine struct {
-	mu       sync.RWMutex
-	ring     *ring.Ring
-	nodes    []string // storage nodes, sorted for determinism
-	stores   map[string]*storage.Remote
-	self     string // this engine's advertised address (for /health only)
-	refresh  time.Time
+	mu      sync.RWMutex
+	ring    *ring.Ring
+	nodes   []string // storage nodes, sorted for determinism
+	stores  map[string]*storage.Remote
+	self    string // this engine's advertised address (for /health only)
+	refresh time.Time
 }
 
 // New creates an engine seeded with storage node addresses.

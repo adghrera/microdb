@@ -40,7 +40,7 @@ func TestScatterGatherQuery(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Count        int                      `json:"count"`
+		Count      int                      `json:"count"`
 		Docs       []map[string]interface{} `json:"docs"`
 		NodesQuery int                      `json:"nodes_queried"`
 		Partial    bool                     `json:"partial"`

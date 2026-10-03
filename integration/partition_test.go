@@ -70,7 +70,7 @@ func TestPartitionedLocality(t *testing.T) {
 		t.Fatal(err)
 	}
 	var qout struct {
-		Count         int                      `json:"count"`
+		Count       int                      `json:"count"`
 		ShardsQuery int                      `json:"shards_queried"`
 		Docs        []map[string]interface{} `json:"docs"`
 	}

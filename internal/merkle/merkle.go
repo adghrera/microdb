@@ -79,8 +79,8 @@ func Build(leaves []Leaf) *Tree {
 	return &Tree{leaves: s, levels: levels, depth: len(levels) - 1}
 }
 
-func (t *Tree) Root() string          { return t.levels[0][0] }
-func (t *Tree) Depth() int           { return t.depth }
+func (t *Tree) Root() string               { return t.levels[0][0] }
+func (t *Tree) Depth() int                 { return t.depth }
 func (t *Tree) HashAt(lvl, idx int) string { return t.levels[lvl][idx] }
 
 // LeafAt maps a padded leaf index back to a leaf; ok=false for padding.
@@ -185,8 +185,8 @@ func NewRemoteTree(root string, depth int,
 	return &RemoteTree{root: root, depth: depth, fetchHash: fetchHash, fetchLeaf: fetchLeaf}
 }
 
-func (r *RemoteTree) Root() string { return r.root }
-func (r *RemoteTree) Depth() int   { return r.depth }
+func (r *RemoteTree) Root() string                          { return r.root }
+func (r *RemoteTree) Depth() int                            { return r.depth }
 func (r *RemoteTree) Hash(level, index int) (string, error) { return r.fetchHash(level, index) }
 func (r *RemoteTree) Leaf(index int) (Leaf, bool, error)    { return r.fetchLeaf(index) }
 
