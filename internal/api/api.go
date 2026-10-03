@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"microdb/internal/audit"
+	"microdb/internal/capacity"
 	"microdb/internal/changelog"
 	"microdb/internal/cluster"
 	"microdb/internal/gsi"
@@ -56,6 +57,7 @@ type Server struct {
 	rcache    *readcache.Cache
 	rec       *storage.Local // storage-tier record boundary (fenced)
 	gsi       *gsi.Manager
+	cap       *capacity.Checker // watermarks: refuse work we cannot afford
 	// Range map (load-adaptive contiguous ownership): nil until
 	// EnableRangeMap. rangeBuckets counts writes per token high
 	// byte; rangeEWMA is the smoothed writes/sec; rangePlan is the
@@ -65,6 +67,10 @@ type Server struct {
 	rangeEWMA    []float64
 	rangePlan    *ranges.Plan
 }
+
+// SetCapacity installs the admission-control watermarks (nil disables
+// them). Evaluated against a cache, never per write.
+func (s *Server) SetCapacity(c *capacity.Checker) { s.cap = c }
 
 // EnableGSI starts the async global-secondary-index service: a
 // background worker subscribed to the change feed maintains index
@@ -224,6 +230,7 @@ func NewWithRF(self string, st *store.Store, cl *cluster.Cluster, rf int) *Serve
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/gsi", s.handleListGSI)
 		s.mux.HandleFunc("GET "+prefix+"/collections/{col}/gsi/{name}", s.handleLookupGSI)
 		s.mux.HandleFunc("GET "+prefix+"/cluster", s.handleCluster)
+		s.mux.HandleFunc("GET "+prefix+"/capacity", s.handleCapacity)
 	}
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("GET /api/stats/collections", s.handleCollectionStats)
@@ -308,6 +315,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			audit.Default.Log(e)
 		}()
+	}
+
+	// Admission control: OOM and a full disk are the two quiet ways a
+	// database dies, and both are visible seconds earlier than the
+	// crash. Only NEW writes are shed — DELETE frees the very space the
+	// disk watermark is about, and reads cost nothing extra — and the
+	// 507 lands in the audit log because the wrapper above is already
+	// watching this path.
+	if s.cap != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) &&
+		(strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/v1/api/")) {
+		if reason := s.cap.ShedReason(); reason != "" {
+			atomic.AddInt64(metrics.Default.Counter("microdb_write_sheds_total",
+				"Client writes refused by capacity watermarks"), 1)
+			writeJSON(w, 507, map[string]interface{}{
+				"error":  "insufficient capacity: " + reason,
+				"reason": reason,
+			})
+			return
+		}
 	}
 
 	// Wire-protocol negotiation (rolling upgrades). Internal traffic
@@ -2352,6 +2378,21 @@ func (s *Server) colOp(col, kind string) {
 // ops + live docs (isolation observability).
 func (s *Server) handleCollectionStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"collections": s.st.AllColStats()})
+}
+
+// handleCapacity reports headroom: disk against its watermark, heap
+// against its limit, and whether the node is currently shedding
+// writes — what an operator (or an autoscaler) asks before adding data.
+func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
+	snap := s.cap.Snap()
+	snap.Docs = s.st.DocCount()
+	writeJSON(w, 200, map[string]interface{}{
+		"capacity":    snap,
+		"ready":       !s.cl.Draining() && !s.cl.Streaming() && snap.ShedReason == "",
+		"shed_reason": snap.ShedReason,
+		"inflight":    Inflight(),
+		"node":        s.self,
+	})
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {

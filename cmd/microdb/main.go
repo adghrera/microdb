@@ -32,6 +32,7 @@ import (
 	"microdb/internal/api"
 	"microdb/internal/audit"
 	"microdb/internal/backup"
+	"microdb/internal/capacity"
 	"microdb/internal/cluster"
 	"microdb/internal/profile"
 	"microdb/internal/secret"
@@ -82,6 +83,8 @@ func main() {
 	encKeyFile := flag.String("encryption-key-file", "", "read the encryption key from a file (env MICRODB_ENCRYPTION_KEY is the fallback)")
 	encKeyOld := flag.String("encryption-key-old", "", "comma-separated retired keys still needed to decrypt older records (rotation; env MICRODB_ENCRYPTION_KEY_OLD)")
 	secretRefresh := flag.Duration("secret-refresh", 5*time.Second, "how often to re-read secret files so rotation needs no restart (0 disables)")
+	diskFreePct := flag.Float64("disk-free-pct", 5, "refuse new client writes when free disk drops below this percent (0 disables)")
+	heapLimitMB := flag.Int64("heap-limit-mb", 0, "refuse new client writes once the live heap exceeds this many MB (0 disables; size it to the container limit")
 	aeFanout := flag.Int("ae-fanout", 3, "peers contacted per anti-entropy round (bounds repair traffic as the cluster grows)")
 	zone := flag.String("zone", "", "failure domain this node lives in (rack/AZ); gossiped so replicas spread across zones")
 	clusterName := flag.String("cluster-name", "", "cluster identity guard: nodes only join peers with the same name")
@@ -181,6 +184,15 @@ func main() {
 	}
 	cl.SetAEFanout(*aeFanout)
 	srv := api.NewWithRF(self, st, cl, *rf)
+	if *diskFreePct > 0 || *heapLimitMB > 0 {
+		srv.SetCapacity(&capacity.Checker{
+			Path:           *dir,
+			MinFreePct:     *diskFreePct,
+			HeapLimitBytes: uint64(*heapLimitMB) << 20,
+		})
+		log.Printf("admission: free disk >= %.1f%%, heap <= %d MB (see GET /api/capacity)",
+			*diskFreePct, *heapLimitMB)
+	}
 	cl.Start()
 	defer cl.Stop()
 

@@ -122,6 +122,59 @@ func main() {
 		fmt.Printf("restored %d docs into %s\n", n, *dir)
 	case "status":
 		printStatus(*url)
+	case "capacity":
+		// Headroom report: is this node shedding writes, and why?
+		resp, err := httpGet(*url + "/api/capacity")
+		if err != nil {
+			fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		var out struct {
+			Capacity struct {
+				Disk struct {
+					TotalBytes uint64  `json:"total_bytes"`
+					FreeBytes  uint64  `json:"free_bytes"`
+					UsedPct    float64 `json:"used_pct"`
+					Err        string  `json:"error"`
+				} `json:"disk"`
+				MinFreePct     float64 `json:"min_free_pct"`
+				HeapBytes      uint64  `json:"heap_bytes"`
+				HeapLimitBytes uint64  `json:"heap_limit_bytes"`
+				Docs           int     `json:"docs"`
+				ShedReason     string  `json:"shed_reason"`
+			} `json:"capacity"`
+			Ready bool   `json:"ready"`
+			Shed  string `json:"shed_reason"`
+			Node  string `json:"node"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			fatal(fmt.Errorf("decode capacity: %w (%s)", err, body))
+		}
+		c := out.Capacity
+		state := " (ready)"
+		if !out.Ready {
+			state = " (NOT ready)"
+		}
+		fmt.Printf("node      %s%s\n", out.Node, state)
+		diskState := ""
+		if c.Disk.Err != "" {
+			diskState = "  [unknown: " + c.Disk.Err + "]"
+		}
+		fmt.Printf("disk      %.1f GB total, %.1f GB free (%.1f%% used)%s\n",
+			float64(c.Disk.TotalBytes)/1e9, float64(c.Disk.FreeBytes)/1e9, c.Disk.UsedPct, diskState)
+		fmt.Printf("watermark refuse below %.1f%% free\n", c.MinFreePct)
+		heapLimit := "unlimited"
+		if c.HeapLimitBytes != 0 {
+			heapLimit = fmt.Sprintf("%.0f MB", float64(c.HeapLimitBytes)/1e6)
+		}
+		fmt.Printf("heap      %.1f MB / limit %s\n", float64(c.HeapBytes)/1e6, heapLimit)
+		fmt.Printf("docs      %d\n", c.Docs)
+		if out.Shed != "" {
+			fmt.Printf("SHEDDING  %s\n", out.Shed)
+			os.Exit(1)
+		}
+		fmt.Println("shedding  no")
 	case "tier":
 		// List or fetch what the cold tier holds. This is the recovery
 		// path for history that compaction archived off the local disk.
@@ -360,7 +413,8 @@ func usage() {
 commands:
   backup  --dir <data-dir> --out <file>    snapshot current state to JSONL
   restore --dir <data-dir> --in <file>     apply a JSONL backup (LWW merge)
-  status  --url <node-url>                health + cluster view\n  tier     --target <uri> [--key <k> --out <f>]  list/fetch cold-tier archives
+  status  --url <node-url>                health + cluster view
+  capacity --url <node-url>               headroom: disk/heap watermarks, shedding (exit 1 when shedding)\n  tier     --target <uri> [--key <k> --out <f>]  list/fetch cold-tier archives
   verify  --dir <data-dir>                check every log record's CRC32C (exit 1 on damage)\n  repair  --url <node-url>                force anti-entropy now: re-fetch anything this node lost
   hints   --url <node-url>                hinted-handoff debt (pending/delivered/dropped)
   decommission --url <node-url>          drain a node: hand off data + broadcast leave`)

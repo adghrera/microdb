@@ -247,7 +247,7 @@ before feature 1 landed.
 | # | Feature | Why it matters | Status |
 |---|---------|----------------|--------|
 | 21 | CI verification gate + fix the flaky test | every claim above rests on a suite that must be runnable in one command and must not flap | ⬜ |
-| 22 | Capacity watermarks + admission (`microctl capacity`) | OOM and ENOSPC are the two ways databases die quietly | ⬜ |
+| 22 | Capacity watermarks + admission (`microctl capacity`) | OOM and ENOSPC are the two ways databases die quietly | ✅ |
 | 23 | Backup scheduler + retention | closes the ⚠️ on backups: RPO automation and bounded offsite growth | ✅ |
 | 24 | TLS cert/key hot-reload | expired certs are a top self-inflicted outage; closes the ⚠️ on secrets | ✅ |
 | 25 | Index value encode fast path | `json.Marshal` per field per write measured at 61% of replay allocations | ✅ |
@@ -342,6 +342,26 @@ before feature 1 landed.
   one passed `microctl verify --backup` with a matching digest. 4 tests
   (round-trip verify, retention, publish-nothing-on-failure, scheduler
   recovery after a failing target).
+
+- **22 ✅** admission control for the two quiet deaths. `internal/capacity`
+  probes the filesystem behind build tags — `syscall.Statfs` on unix,
+  `GetDiskFreeSpaceExW` via `kernel32` on Windows, still stdlib-only — and
+  evaluates **watermarks on a cache** (default refresh 2s): a statfs per
+  write would double the write path and `ReadMemStats` is stop-the-world,
+  while a watermark two seconds stale is still years earlier than the
+  crash. `--disk-free-pct` (default 5) and `--heap-limit-mb` install it;
+  **only new writes are shed** (507 + `microdb_write_sheds_total`, and the
+  507 is captured by the audit wrapper): `DELETE` frees the very space the
+  disk watermark is about, and reads cost nothing. `GET /api/capacity` and
+  `microctl capacity` report disk/heap against their limits plus the shed
+  reason — the live run shows a healthy node (`exit 0`) beside a node
+  forced below its watermark (`NOT ready`, `SHEDDING disk free 57.5%
+  below the 101.0% watermark`, `exit 1`, usable as a probe). Shedding
+  deliberately does **not** flip `/ready`: a restart cannot free disk
+  space, and a readiness-gated orchestrator would restart-loop the pod
+  instead of paging an operator. 6 tests (probe sanity, deterministic
+  disk shed, disabled/nil watermarks, heap shed, cache window, API
+  contract incl. DELETE/GET exemptions).
 
 **Still open after these 10, by design:** conflict resolution beyond LWW
 (version vectors / CRDTs — it changes consistency semantics and deserves its own
